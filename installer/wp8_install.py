@@ -34,9 +34,18 @@ TOOLING        = Path(__file__).resolve().parent.parent      # repo root
 DEFAULT_BASE   = Path.home() / ".local/share/wordperfect"
 DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"   # engine fallback
 
-# morpher typing-crash patch: NOP the dead OOB `call strcpy` in mor_read_entry.
-# file offset, original bytes (guard), replacement. Only patches an exact match.
-MORPH_PATCH = (0x1e8dda, bytes.fromhex("e82997e1ff"), bytes.fromhex("9090909090"))
+# morpher typing-crash patch: NOP the dead OOB `call strcpy` in mor_read_entry
+# (the unguarded `byte & 0x7f` index into the 43-entry particle table). Each
+# entry is (file offset, original bytes guard, NOP replacement) for one known
+# xwp build; every entry is byte-guarded, so only the matching build is touched.
+# Add a line here when a new build's signature is located. Find it by: locate
+# the particle-table base (pointers to "about"/"above"/…/"without"), find the
+# three `mov TABLE(,%eax,4),%eax` sites, and patch the one whose index is NOT
+# preceded by `cmp $0x2a; jg` and which feeds `strcpy` (the other two guard + strcat).
+MORPH_PATCHES = [
+    (0x1e8dda, bytes.fromhex("e82997e1ff"), bytes.fromhex("9090909090")),  # 8.16MB static-X build
+    (0x211cff, bytes.fromhex("e8fc53dfff"), bytes.fromhex("9090909090")),  # 8.0.0076 dynamic-X build
+]
 
 
 @dataclass
@@ -322,20 +331,28 @@ class Engine:
     def patches(self):
         out = []
         xwp = self.target / "wpbin/xwp"
-        off, exp, new = MORPH_PATCH
         if not xwp.is_file():
             return ["xwp not found - skipped morph patch"]
         b = bytearray(xwp.read_bytes())
-        cur = bytes(b[off:off + len(exp)])
-        if cur == new:
-            out.append("morph patch: already applied")
-        elif cur == exp:
-            b[off:off + len(new)] = new
+        applied = already = 0
+        for off, exp, new in MORPH_PATCHES:
+            if off + len(exp) > len(b):
+                continue
+            cur = bytes(b[off:off + len(exp)])
+            if cur == new:
+                already += 1
+            elif cur == exp:
+                b[off:off + len(new)] = new
+                applied += 1
+                out.append(f"morph patch: APPLIED at 0x{off:x} "
+                           f"(NOP dead OOB strcpy in mor_read_entry)")
+        if applied:
             xwp.write_bytes(b)
-            out.append("morph patch: APPLIED (NOP dead OOB strcpy in mor_read_entry)")
+        elif already:
+            out.append("morph patch: already applied")
         else:
-            out.append(f"morph patch: SKIPPED - xwp bytes at 0x{off:x} = {cur.hex()} "
-                       f"do not match the original buggy build (safe: left untouched)")
+            out.append("morph patch: no known buggy signature matched "
+                       "(safe: xwp left untouched)")
         return out
 
     def _is_system_install(self) -> bool:
