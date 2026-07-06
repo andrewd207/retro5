@@ -58,6 +58,7 @@ DT_NEEDED    libm.so.5           ->  libm.so.6
 | `hidesym.py`           | mark a `.dynsym` symbol `STV_HIDDEN` (same-length edit) |
 | `apply-patches.sh`     | byte-guarded runtime bug fixes for the WordPerfect binaries |
 | `collect-imports.sh`   | union of all undefined libc symbols across a tree (what the shim must provide) |
+| `check-symbols.py`     | scan a tree/binaries and report libc5 symbols `retro5.so` does **not** yet export (with a reference `libc.so.5` for precise scoping); run it after adding a new program to confirm coverage |
 | `detect-static-x11.sh` | flag binaries that statically embed ancient X11 transport code |
 | `build-tree.sh`        | decompress + retarget a whole WordPerfect suite into a root |
 
