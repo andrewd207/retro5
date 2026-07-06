@@ -42,6 +42,28 @@ DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"   # engine fallback
 # the particle-table base (pointers to "about"/"above"/…/"without"), find the
 # three `mov TABLE(,%eax,4),%eax` sites, and patch the one whose index is NOT
 # preceded by `cmp $0x2a; jg` and which feeds `strcpy` (the other two guard + strcat).
+#
+# WHY IT'S FATAL ON THE PORT BUT WAS LATENT ON 1998 libc5 (best-guess root cause):
+# This is a data-dependent out-of-bounds *read*, not a write. For idx > 0x2a,
+# table[idx] fetches 4 bytes from the buffer sitting just past the table and
+# hands them to strcpy AS THE SOURCE POINTER. The crash we caught had
+# src = 0x64646464 = "dddd" — the user's own keystrokes reinterpreted as an
+# address. Whether strcpy faults therefore depends solely on whether that stray
+# pointer happens to point at mapped, readable memory:
+#   * Original static-libc5 binary (fixed Linux-2.0 address space, one malloc,
+#     no ASLR): the adjacent slot dereferenced to readable memory, so the errant
+#     strcpy copied a few bytes of garbage into a *dead* stack buffer and nothing
+#     ever faulted -> the bug shipped invisibly and survived ~25 years.
+#   * Modern glibc + retro5: different heap/arena placement, different mmap base
+#     + ASLR, and different adjacent buffer contents, so the stray pointer now
+#     lands on an unmapped page -> SIGSEGV the moment the as-you-type morphology
+#     path runs on a triggering word.
+# It is NOT a shim defect: we verified the .mor `fread` is byte-identical to the
+# file, so the index values are unchanged — only the memory environment the
+# stray pointer is interpreted against changed, which is exactly what a
+# libc5->glibc port changes. The strcpy dst is write-only dead code, so NOPing
+# the call is behavior-neutral. Classic latent memory-safety bug, unmasked by
+# the port rather than introduced by it.
 MORPH_PATCHES = [
     (0x1e8dda, bytes.fromhex("e82997e1ff"), bytes.fromhex("9090909090")),  # 8.16MB static-X build
     (0x211cff, bytes.fromhex("e8fc53dfff"), bytes.fromhex("9090909090")),  # 8.0.0076 dynamic-X build
