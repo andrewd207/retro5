@@ -86,7 +86,9 @@ python3 installer/wp8_installer.py
 ```
 retro5/       the libc5 -> glibc shim + retargeting tools  (the core of this repo)
 installer/    Corel WordPerfect 8 installer (GTK wizard + CLI engine)
-tools/        wpdecom2.c — decompressor for Corel's \xffWPC LZSS format
+tools/        retarget.py (retarget any libc5 ELF32 -> retro5, self-contained),
+              wpdecom2.c (Corel \xffWPC LZSS decompressor),
+              verify-regnum.py (verify-only registration-number checker)
 docs/         technical notes (incl. the registration-key scheme)
 ```
 
