@@ -1,48 +1,58 @@
-# WordPerfect 8 for Linux — modern-glibc revival
+# retro5 — run 1990s libc5 Linux binaries on a modern glibc system
 
-Run **Corel® WordPerfect® 8 for Linux** (1998) — a 32-bit, statically-`libc5`
-application — on a present-day glibc / X11 system, with **no recompilation of
-the original binaries**. This repository contains two independent pieces of
-original work:
+`retro5.so` is a **libc5 → glibc compatibility shim**. It lets a 32-bit ELF
+program that was linked against the ancient Linux `libc.so.5` (roughly
+1995–1998) run unchanged on a present-day glibc system — **no recompilation,
+no source**. The original binaries are *retargeted in place*: a handful of
+same-length byte edits swap `libc.so.5 → retro5.so`, `libm.so.5 → libm.so.6`,
+and the ELF interpreter `ld-linux.so.1 → ld-linux.so.2`; nothing in the binary
+moves, so even the fragile ancient `.hash` table stays intact.
 
-- **`retro5/`** — a **libc5 → glibc compatibility shim** (`retro5.so`). It
-  reimplements the parts of the 1996-era Linux `libc.so.5` ABI that modern
-  glibc changed (stdio `FILE` layout, `struct stat`, `errno`, directory
-  reading, startup) and forwards everything else. The original binaries are
-  *retargeted in place* — a handful of same-length byte edits swap
-  `libc.so.5 → retro5.so`, `libm.so.5 → libm.so.6`, and the ELF interpreter
-  `ld-linux.so.1 → ld-linux.so.2`; nothing in the binary moves. Although it was
-  built for WordPerfect, the shim is generic and can retarget **any** old
-  libc5 ELF32 program.
+The shim reimplements the parts of the libc5 ABI that glibc changed — the
+`FILE` layout (old code inlines `getc`/`putc` and reads `FILE` fields
+directly), `struct stat`, directory reading, `errno` (libc5's plain global vs
+glibc's thread-local), and process startup — and forwards everything else
+(~200+ symbols) straight to glibc via `dlsym(RTLD_NEXT, …)`.
 
-- **`installer/`** — a zero-to-installed installer (GTK wizard + CLI) that lays
-  down a working WordPerfect 8 tree from **your own** original Corel media,
-  builds and installs the shim, applies the runtime fixes, and creates
-  launchers / menu entries.
+See **`retro5/README.md`** for how it works in detail.
+
+## Flagship use case: Corel WordPerfect 8 for Linux (and the whole suite)
+
+retro5 was built to revive **Corel® WordPerfect® 8 for Linux** (1998), a
+statically-`libc5` X11/Motif application, on modern Linux — and it does: the
+real editor runs, renders, and takes input on a 2020s X server. Because the
+shim and its `retarget.sh --scan` are entirely binary-agnostic, the *same*
+approach revives the rest of the **Corel Linux office suite** shipped in the
+same era — every libc5 ELF32 in the tree can be retargeted in one pass.
+
+The **`installer/`** directory contains a zero-to-installed installer (GTK
+wizard + CLI) that lays down a working WordPerfect 8 tree from **your own**
+original Corel media, builds and installs the shim, applies the runtime fixes,
+and creates launchers / menu entries.
 
 ## ⚠️ What this repository does *not* contain
 
-This project ships **none of Corel's software**. To use it you must supply your
-own legally-obtained copy of the WordPerfect 8 for Linux media. Specifically,
-**not** included here (and never to be committed — see `.gitignore`):
+This project ships **none of Corel's software.** To install WordPerfect you must
+supply your own legally-obtained copy of the media. Never included here (and
+blocked by `.gitignore`):
 
-- WordPerfect program binaries, `.drs`/`.lrs` resources, fonts, or any other
-  Corel media files;
+- WordPerfect / suite program binaries, `.drs`/`.lrs` resources, fonts, or any
+  other Corel media files;
 - any decompiled or disassembled output derived from those binaries;
 - reverse-engineering data (string tables, call graphs, symbol databases)
   extracted from the copyrighted binaries;
 - any registration-key generator.
 
 `docs/registration-key-scheme.md` describes, for historical/technical purposes,
-how the installer's registration check worked; it is documentation, not a
-key generator, and it does not remove your obligation to hold a valid license.
+how the installer's registration check worked; it is documentation, not a key
+generator, and it does not remove your obligation to hold a valid license.
 
 ## Requirements
 
-- A 32-bit-capable Linux system (`i386` multiarch libraries).
+- A 32-bit-capable Linux system (`i386` multiarch libraries: `libc6:i386`,
+  `libx11-6:i386`, `libxt6:i386`, `libxpm4:i386`).
 - `gcc` with `-m32` support, `binutils`, `python3`, and (for the GUI installer)
   GTK 4 / PyGObject.
-- Your original Corel WordPerfect 8 for Linux media.
 
 ## Quick start
 
@@ -53,10 +63,16 @@ cd retro5
 make            # produces retro5.so (32-bit)
 ```
 
-Install WordPerfect from your media (CLI):
+Retarget any old libc5 binary to run on glibc:
 
 ```sh
-python3 installer/wp8_install.py --target ~/.local/share/wordperfect8 --media /path/to/wp8-media
+./retro5/retarget.sh /path/to/some/libc5/program      # in-place, reversible from a backup
+```
+
+Install WordPerfect 8 from your media (CLI):
+
+```sh
+python3 installer/wp8_install.py --target ~/.local/share/wordperfect8 --media /path/to/wp8.iso
 ```
 
 …or run the GTK wizard:
@@ -65,15 +81,11 @@ python3 installer/wp8_install.py --target ~/.local/share/wordperfect8 --media /p
 python3 installer/wp8_installer.py
 ```
 
-See `installer/README.md` for the full installer story (system-wide install,
-uninstall, single-instance / document opening) and `retro5/README.md` for how
-the shim works.
-
 ## Repository layout
 
 ```
-retro5/       libc5 -> glibc shim + retargeting tools
-installer/    WordPerfect 8 installer (GTK wizard + CLI engine)
+retro5/       the libc5 -> glibc shim + retargeting tools  (the core of this repo)
+installer/    Corel WordPerfect 8 installer (GTK wizard + CLI engine)
 tools/        wpdecom2.c — decompressor for Corel's \xffWPC LZSS format
 docs/         technical notes (incl. the registration-key scheme)
 ```
@@ -82,7 +94,7 @@ docs/         technical notes (incl. the registration-key scheme)
 
 WordPerfect and Corel are trademarks of their respective owners. This is an
 independent, unaffiliated interoperability and preservation project; it is not
-sponsored, endorsed by, or associated with Corel. "WordPerfect" is used only
+sponsored, endorsed by, or associated with Corel. Product names are used only
 descriptively, to identify the software this tooling interoperates with.
 
 All original code in this repository is licensed under the MIT License
