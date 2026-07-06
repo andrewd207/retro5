@@ -177,6 +177,22 @@ FWD(int,    strncmp, (const char *a, const char *b, size_t c), (a, b, c))
 FWD(int,    strcasecmp,(const char *a, const char *b),   (a, b))
 FWD(char *, strchr,  (const char *a, int b),             (a, b))
 FWD(char *, strrchr, (const char *a, int b),             (a, b))
+/* Additional libc5 symbols used by the WordPerfect 8.1 suite filters
+ * (inww8/outwp6/cvt/cjpeg/djpeg/FLEXlm) but not by the 8.0 disc — found by
+ * scanning all 52 suite binaries against the bundled libc.so.5.4.46. */
+FWD(void *, memchr,   (const void *a, int b, size_t c),  (a, b, c))
+FWD(char *, strerror, (int a),                           (a))
+FWD(char *, realpath, (const char *a, char *b),          (a, b))
+FWD(void *, gmtime,   (const void *a),                   (a))
+/* __write: libc5 alias of write; forward straight to glibc's write. */
+long __write(int a, const void *b, size_t c) {
+    static long (*fn)(int, const void *, size_t);
+    if (!fn) fn = (long (*)(int, const void *, size_t)) dlsym(RTLD_NEXT, "write");
+    PRE_ERRNO();
+    long _r = fn(a, b, c);
+    SYNC_ERRNO();
+    return _r;
+}
 FWD(char *, strstr,  (const char *a, const char *b),     (a, b))
 FWD(char *, strpbrk, (const char *a, const char *b),     (a, b))
 FWD(char *, strtok,  (char *a, const char *b),           (a, b))
