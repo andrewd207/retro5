@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.so
+*.a
+retro5/build/
+tools/wpdecom2
+__pycache__/
+*.pyc
+
+# Retargeted / installed trees (may contain copyrighted Corel material) — NEVER commit
+build/
+dist/
+install-root/
+media/
+*.wpd
+
+# Editor/OS cruft
+*~
+.DS_Store

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install WordPerfect 8
+GenericName=WordPerfect 8 Installer
+Comment=Install WordPerfect 8 for Linux from the Corel media (user-local or system-wide)
+Exec=python3 /home/andrew/Programming/Projects/wordperfect-8-lin/installer/wp8_installer.py
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+Keywords=WordPerfect;WP8;install;office;
