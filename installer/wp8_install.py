@@ -460,6 +460,50 @@ class Engine:
                 shutil.copyfile(s, insdir / name); os.chmod(insdir / name, 0o755); copied += 1
         if copied:
             out.append(f"embedded installer/uninstaller ({copied} scripts) in {insdir}")
+        out += self._ensure_runtime_resources()
+        return out
+
+    def _ensure_runtime_resources(self):
+        """Fill in runtime resource files some editions/packagings omit, so WP
+        doesn't die on a missing file at startup."""
+        out = []
+        shlib = self.target / "shlib10"
+        # (1) passpost.prs: WP's factory PostScript printer resource. Some discs
+        # ship only default.prs/pssave.prs, but WP defaults its printer to
+        # "passpost" and errors "File not found ... passpost.prs". Give it a
+        # valid .prs (a copy of the generic default) so the default printer opens.
+        pp = shlib / "passpost.prs"
+        if not pp.exists():
+            for cand in ("default.prs", "pssave.prs"):
+                src = shlib / cand
+                if src.is_file():
+                    shutil.copyfile(src, pp); os.chmod(pp, 0o644)
+                    out.append(f"created shlib10/passpost.prs from {cand} "
+                               "(WP's default printer resource)")
+                    break
+        # (2) wp.drs: the display-resource file. The Corel Linux OS .deb ships
+        # only wp.lrs, not wp.drs, so a .deb install has no display resource and
+        # WP errors at startup. We can't redistribute Corel's wp.drs, but a
+        # side-by-side WordPerfect install has a (compatible, compressed) one —
+        # borrow it. Otherwise warn clearly.
+        drs = shlib / "wp.drs"
+        if not drs.exists():
+            found = None
+            base = self.target.parent
+            if base.is_dir():
+                for sib in sorted(base.iterdir()):
+                    cand = sib / "shlib10/wp.drs"
+                    if cand.is_file() and cand.resolve() != drs.resolve():
+                        found = cand; break
+            if found:
+                shutil.copyfile(found, drs); os.chmod(drs, 0o644)
+                out.append(f"wp.drs was missing (this packaging omits it) — "
+                           f"copied it from {found}")
+            else:
+                out.append("WARNING: wp.drs is missing and no sibling WordPerfect "
+                           "install has one to copy. WP will error at startup. "
+                           "Install a native WP disc alongside (its wp.drs will be "
+                           "reused), or place a compressed wp.drs in shlib10.")
         return out
 
     # ---- step 7: launcher -----------------------------------------------
