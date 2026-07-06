@@ -20,6 +20,24 @@ Because the helper was not stripped, its verification routine
 directly in a decompiler. No cryptography is involved — it is a self-check on
 the digits of the number.
 
+## The rules changed between 8.0 and 8.1
+
+The check was **tightened** across releases (confirmed by reverse-engineering
+the shipped `veruxkey` binaries):
+
+- **WordPerfect 8.0** (`veruxkey` 8.0.0076) validates a registration number by
+  **format only**: the `LW8XR` prefix (an optional dash) followed by exactly ten
+  characters of *any* content. There is no checksum — that binary imports only
+  `printf`/`exit` (no `atoi`/`sprintf`/`strncmp`), so it physically cannot
+  compute one. `LW8XR-!!!!!!!!!!` is accepted.
+- **WordPerfect 8.1** (a later `veruxkey`) adds the two real rules below (the
+  `A × B` checksum and the single check-letter). A number accepted by 8.0 is
+  frequently rejected by 8.1.
+
+The rest of this document describes the **8.1** (hardened) rules. The separate
+`-a` "additional license key" scheme (prefix `LW8XW`) has its own real
+validation in both releases and is not documented here.
+
 ## Structure of a number
 
 A registration number is the fixed prefix `LW8XR-` followed by a **10-character
