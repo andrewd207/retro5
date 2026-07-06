@@ -18,7 +18,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Gio, Gdk, GObject
 
-from wp8_install import Engine, Step, DEFAULT_MEDIA, DEFAULT_TARGET
+from wp8_install import Engine, Step, DEFAULT_TARGET
+import media as mediamod
 
 
 CSS = b"""
@@ -145,7 +146,7 @@ class Installer(Gtk.Application):
                 "uninstall", "Uninstalled (elevated)" if ok else "Uninstall failed", 1.0,
                 ok=ok, detail="" if ok else (p.stderr or "cancelled/denied").strip()[:300], log=log))
         else:
-            eng = Engine(target=Path(target))
+            eng = Engine(Path(target), target=Path(target))   # media unused for uninstall
             try:
                 log = eng.uninstall(Path(target))
                 GLib.idle_add(self._on_step, Step("uninstall", "Uninstalled", 1.0, ok=True, log=log))
@@ -160,12 +161,21 @@ class Installer(Gtk.Application):
         b = self._page("options")
         self._heading(b, "Options", "Confirm the source media and where to install.")
         grid = Gtk.Grid(row_spacing=10, column_spacing=10)
-        self.media_entry = Gtk.Entry(text=str(DEFAULT_MEDIA), hexpand=True)
+        self.media_entry = Gtk.Entry(hexpand=True)
+        self.media_entry.set_placeholder_text("an ISO, an extracted tree, or a folder of ISOs")
+        detect = Gtk.Button(label="Detect versions")
+        detect.connect("clicked", self._on_detect)
+        self.version_dd = Gtk.DropDown.new_from_strings(["(press Detect versions)"])
+        self.version_dd.set_sensitive(False)
+        self._candidates = []          # installable media.Candidate objects
         self.target_entry = Gtk.Entry(text=str(DEFAULT_TARGET), hexpand=True)
         grid.attach(Gtk.Label(label="Install media:", xalign=0), 0, 0, 1, 1)
         grid.attach(self.media_entry, 1, 0, 1, 1)
-        grid.attach(Gtk.Label(label="Install to:", xalign=0), 0, 1, 1, 1)
-        grid.attach(self.target_entry, 1, 1, 1, 1)
+        grid.attach(detect, 2, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Version:", xalign=0), 0, 1, 1, 1)
+        grid.attach(self.version_dd, 1, 1, 2, 1)
+        grid.attach(Gtk.Label(label="Install to:", xalign=0), 0, 2, 1, 1)
+        grid.attach(self.target_entry, 1, 2, 2, 1)
         b.append(grid)
         self.launcher_chk = Gtk.CheckButton(label="Create launcher (~/.local/bin/xwp)", active=True)
         b.append(self.launcher_chk)
@@ -219,20 +229,60 @@ class Installer(Gtk.Application):
         else:
             self.target_entry.set_text(getattr(self, "_user_target", str(DEFAULT_TARGET)))
 
+    def _on_detect(self, _btn):
+        path = self.media_entry.get_text().strip()
+        if not path:
+            self.opt_status.set_text("⚠  Enter a path to an ISO or a folder of ISOs first.")
+            return
+        self.opt_status.set_text("Scanning media…")
+        threading.Thread(target=self._detect_worker, args=(path,), daemon=True).start()
+
+    def _detect_worker(self, path):
+        try:
+            cands = mediamod.discover([Path(path)])
+        except Exception as e:  # noqa
+            GLib.idle_add(self._populate_versions, [], str(e)); return
+        GLib.idle_add(self._populate_versions,
+                      [c for c in cands if c.installable], None)
+
+    def _populate_versions(self, installable, err):
+        self._candidates = installable
+        if err:
+            self.version_dd.set_sensitive(False)
+            self.opt_status.set_text(f"⚠  {err}")
+            return
+        if not installable:
+            self.version_dd.set_model(Gtk.StringList.new(["(no WordPerfect media found)"]))
+            self.version_dd.set_sensitive(False)
+            self.opt_status.set_text("No installable WordPerfect-for-Linux media found there.")
+            return
+        self.version_dd.set_model(Gtk.StringList.new([c.label for c in installable]))
+        self.version_dd.set_sensitive(True)
+        self.opt_status.set_text(f"Found {len(installable)} installable version(s).")
+
     def _start_install(self, _btn):
-        media = Path(self.media_entry.get_text().strip())
         target = Path(self.target_entry.get_text().strip())
-        if not (media / "shared/ship").is_file():
-            self.opt_status.set_text(f"⚠  No install media at {media} (missing shared/ship).")
+        if not self._candidates:
+            self.opt_status.set_text("⚠  Press “Detect versions” and choose a version first.")
+            return
+        idx = self.version_dd.get_selected()
+        if idx < 0 or idx >= len(self._candidates):
+            self.opt_status.set_text("⚠  Choose a version to install.")
+            return
+        chosen = self._candidates[idx]
+        if chosen.kind == mediamod.DEB:
+            self.opt_status.set_text("⚠  This is a Debian-packaged version (WordPerfect 8.1 / "
+                                     "the suite); that install path isn't wired up yet. Pick a "
+                                     "native-tree disc/ISO.")
             return
         self.stack.set_visible_child_name("progress")
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
-                         args=(media, target, self.system_chk.get_active(),
+                         args=(chosen, target, self.system_chk.get_active(),
                                self.launcher_chk.get_active(), make_desktop),
                          daemon=True).start()
 
-    def _worker(self, media, target, system, make_launcher, make_desktop):
+    def _worker(self, chosen, target, system, make_launcher, make_desktop):
         ok = True; stats = {}
         if system:
             # System-wide: elevate the WHOLE install with pkexec (desktop-standard
@@ -242,7 +292,9 @@ class Installer(Gtk.Application):
             GLib.idle_add(self._on_step,
                           Step("elevate", "Requesting admin access (pkexec)...", 0.02, ok=True))
             engine_py = str(Path(__file__).with_name("wp8_install.py"))
-            cmd = ["pkexec", sys.executable, engine_py, "--media", str(media), "--target", str(target)]
+            # the elevated CLI does its own discovery/resolution of this exact path
+            cmd = ["pkexec", sys.executable, engine_py, "--media", str(chosen.path),
+                   "--target", str(target)]
             if not make_launcher:
                 cmd.append("--no-launcher")
             if not make_desktop:
@@ -261,12 +313,19 @@ class Installer(Gtk.Application):
             GLib.idle_add(self._on_finish, ok, {"install": str(target)}, target)
             return
         else:
-            eng = Engine(media, target, make_launcher=make_launcher, make_desktop=make_desktop)
-            for step in eng.run():
-                GLib.idle_add(self._on_step, step)
-                stats = eng.stats
-                if not step.ok:
-                    ok = False; break
+            try:
+                with mediamod.resolve(chosen.path) as rm:
+                    eng = Engine(rm.root, target, make_launcher=make_launcher,
+                                 make_desktop=make_desktop)
+                    for step in eng.run():
+                        GLib.idle_add(self._on_step, step)
+                        stats = eng.stats
+                        if not step.ok:
+                            ok = False; break
+            except mediamod.MediaError as e:
+                GLib.idle_add(self._on_step, Step("media", "Could not read media", 0.05,
+                                                  ok=False, detail=str(e)))
+                ok = False
         GLib.idle_add(self._on_finish, ok, stats, target)
 
     def _on_step(self, step):

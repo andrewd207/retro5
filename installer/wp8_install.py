@@ -27,7 +27,9 @@ import os, re, shutil, stat, struct, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_MEDIA  = Path("/home/andrew/Programming/Projects/wordperfect-8-lin")
+# This repo ships the tooling (shim + decompressor); the *media* is the user's
+# own Corel disc/ISO and is kept strictly separate from it.
+TOOLING        = Path(__file__).resolve().parent.parent      # repo root
 DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"
 
 # morpher typing-crash patch: NOP the dead OOB `call strcpy` in mor_read_entry.
@@ -50,13 +52,15 @@ class InstallError(Exception):
 
 
 class Engine:
-    def __init__(self, media: Path = DEFAULT_MEDIA, target: Path = DEFAULT_TARGET,
+    def __init__(self, media: Path, target: Path = DEFAULT_TARGET,
                  make_launcher: bool = True, make_desktop: bool = True,
-                 tree_only: bool = False):
-        self.media = Path(media)
+                 tree_only: bool = False, tooling: Path = TOOLING):
+        self.media = Path(media)            # a resolved native tree (dir)
         self.target = Path(target)
-        self.compat = self.media / "retro5"
-        self.wpdecom = self.media / "wpdecom2"          # built in step 1
+        self.tooling = Path(tooling)
+        self.compat = self.tooling / "retro5"           # shim source (this repo)
+        self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
+        self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
         self.retro5 = self.compat / "retro5.so"         # prebuilt or built
         self.make_launcher = make_launcher
         self.make_desktop = make_desktop                # app-menu entry (optional)
@@ -95,8 +99,10 @@ class Engine:
         if not (self.wpdecom.exists() and os.access(self.wpdecom, os.X_OK)):
             if not shutil.which("gcc"):
                 raise InstallError("gcc not found (needed to build wpdecom2)")
+            if not self.wpdecom_src.is_file():
+                raise InstallError(f"decompressor source missing: {self.wpdecom_src}")
             r = self._run(["gcc", "-O2", "-w", "-o", str(self.wpdecom),
-                           str(self.media / "wpdecom2.c")])
+                           str(self.wpdecom_src)])
             if r.returncode != 0:
                 raise InstallError("failed to build wpdecom2:\n" + r.stderr)
             log.append("built wpdecom2")
@@ -634,11 +640,52 @@ exec "$ROOT/wpbin/xwp" "$@"
 
 
 # ---- CLI (also lets the GUI reuse the same engine) ----------------------
+def _load_media():
+    """Import the sibling media module regardless of how we're invoked."""
+    try:
+        from . import media as m           # package import
+        return m
+    except (ImportError, ValueError):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import media as m
+        return m
+
+
+def _run_install(eng, target):
+    ok = True
+    for s in eng.run():
+        mark = "OK " if s.ok else "FAIL"
+        print(f"[{mark}] {int(s.fraction*100):3d}%  {s.title}")
+        for l in s.log:
+            print(f"        - {l}")
+        if not s.ok:
+            print(f"        ! {s.detail}"); ok = False
+    if ok:
+        lp = getattr(eng, "launcher_path", None)
+        if lp:
+            print(f"\nDone. Launch with:  {lp}")
+        else:
+            print(f"\nDone. Installed to {target} (no launcher created).")
+        print("Tip: add -fontSize 20 for bigger menus on HiDPI.")
+        print("File locking works through the shim, so no need to disable it "
+              "(only turn it off in Preferences > File Locking if ~ is on NFS "
+              "and you hit spurious 'file in use' dialogs).")
+    return 0 if ok else 1
+
+
 def main(argv):
     import argparse
-    ap = argparse.ArgumentParser(description="WordPerfect 8 user-local installer")
-    ap.add_argument("--media", default=str(DEFAULT_MEDIA))
+    ap = argparse.ArgumentParser(description="WordPerfect 8 installer (modern glibc)")
+    ap.add_argument("--media", metavar="PATH",
+                    help="Corel media to install from: an ISO, an extracted "
+                         "native tree, or a folder containing ISOs")
     ap.add_argument("--target", default=str(DEFAULT_TARGET))
+    ap.add_argument("--list", action="store_true",
+                    help="list installable WordPerfect media found under --media "
+                         "and exit")
+    ap.add_argument("--pick", type=int, metavar="N",
+                    help="when several versions are found, install candidate N "
+                         "(indices from --list)")
     ap.add_argument("--no-launcher", action="store_true")
     ap.add_argument("--no-desktop", action="store_true",
                     help="do not add an application-menu entry")
@@ -654,10 +701,11 @@ def main(argv):
     ap.add_argument("--remove-profile", action="store_true",
                     help="with --uninstall, also delete ~/.wprc")
     a = ap.parse_args(argv)
-    eng = Engine(Path(a.media), Path(a.target), make_launcher=not a.no_launcher,
-                 make_desktop=not a.no_desktop, tree_only=a.tree_only)
+
+    # --- repair / uninstall operate on an installed ROOT, no media needed ---
     if a.complete:
         try:
+            eng = Engine(a.complete, a.target)
             for line in eng.complete(a.complete):
                 print(f"  - {line}")
             print(f"\nCompleted {a.complete}.")
@@ -666,31 +714,60 @@ def main(argv):
             print(f"FAIL: {e}"); return 1
     if a.uninstall:
         try:
+            eng = Engine(a.uninstall, a.target)
             for line in eng.uninstall(a.uninstall, remove_profile=a.remove_profile):
                 print(f"  - {line}")
             print(f"\nUninstalled {a.uninstall}.")
             return 0
         except InstallError as e:
             print(f"FAIL: {e}"); return 1
-    ok = True
-    for s in eng.run():
-        mark = "OK " if s.ok else "FAIL"
-        print(f"[{mark}] {int(s.fraction*100):3d}%  {s.title}")
-        for l in s.log:
-            print(f"        - {l}")
-        if not s.ok:
-            print(f"        ! {s.detail}"); ok = False
-    if ok:
-        lp = getattr(eng, "launcher_path", None)
-        if lp:
-            print(f"\nDone. Launch with:  {lp}")
-        else:
-            print(f"\nDone. Installed to {a.target} (no launcher created).")
-        print("Tip: add -fontSize 20 for bigger menus on HiDPI.")
-        print("File locking works through the shim, so no need to disable it "
-              "(only turn it off in Preferences > File Locking if ~ is on NFS "
-              "and you hit spurious 'file in use' dialogs).")
-    return 0 if ok else 1
+
+    # --- fresh install: discover + resolve media (ISO / dir / folder-of-ISOs) ---
+    if not a.media:
+        ap.error("--media is required (an ISO, a native tree, or a folder of ISOs)")
+    media = _load_media()
+    cands = media.discover([Path(a.media)])
+    installable = [c for c in cands if c.installable]
+
+    if a.list or not installable:
+        print("Media found:")
+        for i, c in enumerate(cands):
+            tag = "INSTALL" if c.installable else "skip"
+            print(f"  [{i}] ({tag:7}) {c.label}")
+        if not installable:
+            print("\nNo installable WordPerfect-for-Linux media found here.")
+            return 1
+        if a.list:
+            return 0
+
+    if a.pick is not None:
+        if not (0 <= a.pick < len(cands)) or not cands[a.pick].installable:
+            ap.error(f"--pick {a.pick} is not an installable candidate (see --list)")
+        chosen = cands[a.pick]
+    elif len(installable) == 1:
+        chosen = installable[0]
+    else:
+        print("Several installable versions found — choose one with --pick N:")
+        for i, c in enumerate(cands):
+            if c.installable:
+                print(f"  --pick {i}   {c.label}")
+        return 2
+
+    if chosen.kind == media.DEB:
+        print(f"Selected: {chosen.label}")
+        print("This is a Debian-packaged install (WordPerfect 8.1 / the Corel "
+              "suite). The .deb install path is not wired up yet — for now point "
+              "--media at a native-tree disc or ISO.")
+        return 3
+
+    try:
+        with media.resolve(chosen.path) as rm:
+            print(f"Installing: {chosen.label}")
+            eng = Engine(rm.root, a.target, make_launcher=not a.no_launcher,
+                         make_desktop=not a.no_desktop, tree_only=a.tree_only)
+            return _run_install(eng, a.target)
+    except media.MediaError as e:
+        print(f"FAIL: {e}"); return 1
 
 
 if __name__ == "__main__":

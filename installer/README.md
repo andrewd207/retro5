@@ -1,7 +1,28 @@
 # WordPerfect 8 — zero-to-installed installer
 
-User-local, **no root**. Installs WP8 from the original Corel media using the
-`retro5.so` libc5→glibc shim, and fixes every gap we hit by hand.
+User-local, **no root**. Installs WordPerfect 8 from **your own** original Corel
+media using the `retro5.so` libc5→glibc shim, and fixes every gap we hit by hand.
+
+## Media
+
+Point the installer at your Corel media — it accepts:
+
+- an **ISO image** (read without root via `7z`/`bsdtar`/`fuseiso`, whatever is
+  installed);
+- an already-**extracted native tree** (a directory with `shared/ship` + `linux/`);
+- a **folder full of ISOs** — it scans them all and lists the installable ones.
+
+The installer **discovers and labels** what it finds and skips anything that
+isn't WordPerfect-for-Linux (Windows discs, unrelated ISOs). Two Linux
+packagings exist in the wild:
+
+- **native tree** — the standalone WordPerfect 8 for Linux disc *(fully
+  supported)*;
+- **`.deb` packages** — WordPerfect 8.1 and the wider suite shipped inside Corel
+  Linux OS *(detected and labeled; install path is a work in progress)*.
+
+The shim and tooling ship **with this repo** and are kept separate from your
+media — nothing is written back to the disc/ISO.
 
 ## Run
 
@@ -12,18 +33,26 @@ python3 wp8_installer.py
 sh install-desktop.sh      # add "Install WordPerfect 8" to your app menu
 ```
 
-The Options page has an **"Install for all users (system-wide)"** checkbox — it
-targets `/opt/wordperfect8` and elevates the **whole** install with **`pkexec`** (the
-desktop-standard polkit password prompt). As root it lays down a world-readable tree,
-a system launcher `/usr/local/bin/xwp`, and a menu entry in
-`/usr/share/applications/`; each user's `~/.wprc` self-seeds on first run. Unchecked =
-user-local under `~/.local`, no root. (The engine auto-detects system vs user from the
-target path.)
+On the Options page: type a path (ISO or a folder of ISOs), press **Detect
+versions**, pick one from the dropdown, and install. The **"Install for all
+users (system-wide)"** checkbox targets `/opt/wordperfect8` and elevates the
+**whole** install with **`pkexec`** (the polkit password prompt); as root it
+lays down a world-readable tree, a system launcher `/usr/local/bin/xwp`, and a
+menu entry in `/usr/share/applications/`; each user's `~/.wprc` self-seeds on
+first run. Unchecked = user-local under `~/.local`, no root.
 
 CLI (same engine, scriptable):
 
 ```sh
-python3 wp8_install.py --target ~/.local/share/wordperfect8   # full user install
+# list the WordPerfect versions found in a folder of ISOs
+python3 wp8_install.py --media "/path/to/ISO Images" --list
+
+# install from a single ISO (auto-picks when there's one version)
+python3 wp8_install.py --media /path/to/wp8.iso --target ~/.local/share/wordperfect8
+
+# when several versions are found, pick one by its --list index
+python3 wp8_install.py --media "/path/to/ISO Images" --pick 3
+
 python3 wp8_install.py --complete /usr/wplinux                # repair an existing tree
 python3 wp8_install.py --tree-only --target /opt/wordperfect8 # root half of a system install
 python3 wp8_install.py --help
