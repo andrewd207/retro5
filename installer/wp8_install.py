@@ -30,7 +30,9 @@ from pathlib import Path
 # This repo ships the tooling (shim + decompressor); the *media* is the user's
 # own Corel disc/ISO and is kept strictly separate from it.
 TOOLING        = Path(__file__).resolve().parent.parent      # repo root
-DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"
+# side-by-side installs live under a base dir + a version subdir (8.0 / 8.1)
+DEFAULT_BASE   = Path.home() / ".local/share/wordperfect"
+DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"   # engine fallback
 
 # morpher typing-crash patch: NOP the dead OOB `call strcpy` in mor_read_entry.
 # file offset, original bytes (guard), replacement. Only patches an exact match.
@@ -54,10 +56,13 @@ class InstallError(Exception):
 class Engine:
     def __init__(self, media: Path, target: Path = DEFAULT_TARGET,
                  make_launcher: bool = True, make_desktop: bool = True,
-                 tree_only: bool = False, tooling: Path = TOOLING):
-        self.media = Path(media)            # a resolved native tree (dir)
+                 tree_only: bool = False, tooling: Path = TOOLING,
+                 version: str = "8", source_kind: str = "native"):
+        self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
+        self.version = str(version)         # "8.0" / "8.1" — side-by-side installs
+        self.source_kind = source_kind      # "native" (ship manifest) or "deb"
         self.compat = self.tooling / "retro5"           # shim source (this repo)
         self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
         self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
@@ -381,11 +386,34 @@ class Engine:
         buf[ih] = 0x02; struct.pack_into("<H", buf, ih + 2, 1); buf[ih + 15] = 0x01
         return bytes(buf)
 
-    def runtime_config(self):
+    # trusted 32-bit multiarch dir ld.so searches by default (no LD_LIBRARY_PATH)
+    SYSTEM_SHIM_DIR = Path("/usr/lib/i386-linux-gnu")
+
+    def install_shim(self):
+        """Place retro5.so where the dynamic loader finds it.
+
+        System install: into /usr/lib/i386-linux-gnu (a default search dir) and
+        run ldconfig — one copy serves every versioned tree, and no launcher
+        LD_LIBRARY_PATH is needed. User install (no root): into <target>/shbin10,
+        and the launcher adds just that one dir to LD_LIBRARY_PATH.
+        """
         out = []
-        shbin = self.target / "shbin10"; shbin.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.retro5, shbin / "retro5.so")
-        out.append("installed retro5.so into shbin10")
+        if self._is_system_install():
+            self.SYSTEM_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+            dst = self.SYSTEM_SHIM_DIR / "retro5.so"
+            shutil.copyfile(self.retro5, dst); os.chmod(dst, 0o644)
+            self._run(["ldconfig"])
+            self._shim_ldpath = None                # loader finds it by default
+            out.append(f"installed retro5.so -> {dst} + ldconfig (no LD_LIBRARY_PATH)")
+        else:
+            shbin = self.target / "shbin10"; shbin.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.retro5, shbin / "retro5.so")
+            self._shim_ldpath = '$ROOT/shbin10'     # one dir, not the old hack
+            out.append("installed retro5.so into shbin10")
+        return out
+
+    def runtime_config(self):
+        out = self.install_shim()
         shlib = self.target / "shlib10"; shlib.mkdir(parents=True, exist_ok=True)
         cfgmode = 0o644 if self._is_system_install() else 0o600
         # VALID empty .wpc.admin (build-tree.sh wrote a 0-byte one -> File IO Error).
@@ -429,8 +457,7 @@ if [ ! -e "$HOME/.wprc/.wpc8x.set" ] && [ -f "$ROOT/shlib10/.wpc8x.set" ]; then
     chmod 0600 "$HOME/.wprc/.wpc8x.set" 2>/dev/null
 fi
 xhost +local: >/dev/null 2>&1
-export LD_LIBRARY_PATH="$ROOT/shbin10:/lib/i386-linux-gnu"
-export WPC="$ROOT"
+{ldlib}export WPC="$ROOT"
 # point the ancient statically-linked Xlib at the modern X locale dir
 export XLOCALEDIR=/usr/share/X11/locale
 export WPIPEDELAY=60
@@ -452,8 +479,12 @@ exec "$ROOT/wpbin/xwp" "$@"
         else:
             bindir = Path.home() / ".local/bin"; appdir = Path.home() / ".local/share/applications"
         bindir.mkdir(parents=True, exist_ok=True)
-        lp = bindir / "xwp"
-        lp.write_text(self.LAUNCHER.format(root=self.target))
+        # version-suffixed launcher so 8.0 and 8.1 install side by side
+        vsuffix = "" if self.version in ("", "8") else f"-{self.version}"
+        ldlib = "" if not getattr(self, "_shim_ldpath", None) \
+                else f'export LD_LIBRARY_PATH="{self._shim_ldpath}"\n'
+        lp = bindir / f"xwp{vsuffix}"
+        lp.write_text(self.LAUNCHER.format(root=self.target, ldlib=ldlib))
         os.chmod(lp, 0o755)
         self.launcher_path = lp
         out.append(f"launcher: {lp}")
@@ -462,19 +493,21 @@ exec "$ROOT/wpbin/xwp" "$@"
             # install the real WP icon and point the entry at it (absolute path;
             # gdk-pixbuf/GNOME render XPM fine). Fall back to a themed name.
             icon = "x-office-document"
-            src_icon = self.media / "linux/link/wp.xpm"
-            if src_icon.is_file():
+            # native disc: linux/link/wp.xpm; .deb suite: usr/X11R6/share/icons/*.xpm
+            src_icon = self._find_icon()
+            if src_icon:
                 icondir = self.target / "icon"; icondir.mkdir(parents=True, exist_ok=True)
                 dxpm = icondir / "wp.xpm"
                 shutil.copyfile(src_icon, dxpm); os.chmod(dxpm, 0o644)
                 icon = str(dxpm)
                 out.append(f"installed icon: {dxpm}")
-            dp = appdir / "wordperfect8.desktop"
+            name = f"WordPerfect {self.version}" if self.version not in ("", "8") else "WordPerfect 8"
+            dp = appdir / f"wordperfect{self.version}.desktop"
             # StartupWMClass lets GNOME/Mutter bind xwp's window (static Xlib sets a
             # classic WM_CLASS) to this entry, so it shows this icon and doesn't
             # spawn a duplicate dash icon.
             dp.write_text(
-                "[Desktop Entry]\nType=Application\nName=WordPerfect 8\n"
+                f"[Desktop Entry]\nType=Application\nName={name}\n"
                 f"Exec={lp} %f\nTerminal=false\nCategories=Office;WordProcessor;\n"
                 f"Icon={icon}\nKeywords=WordPerfect;WP;word;\n"
                 "StartupNotify=false\nStartupWMClass=XWp\n"
@@ -487,9 +520,9 @@ exec "$ROOT/wpbin/xwp" "$@"
             out.append(f"desktop entry: {dp} (+ New Document action)")
             # matching uninstall entry -> launches the embedded wizard in uninstall mode
             insui = self.target / "installer" / "wp8_installer.py"
-            up = appdir / "wordperfect8-uninstall.desktop"
+            up = appdir / f"wordperfect{self.version}-uninstall.desktop"
             up.write_text(
-                "[Desktop Entry]\nType=Application\nName=Uninstall WordPerfect 8\n"
+                f"[Desktop Entry]\nType=Application\nName=Uninstall {name}\n"
                 f"Exec=python3 {insui} --uninstall\nTerminal=false\n"
                 "Icon=edit-delete\nCategories=System;\nNoDisplay=false\n")
             os.chmod(up, 0o644)
@@ -611,6 +644,68 @@ exec "$ROOT/wpbin/xwp" "$@"
             out.append("kept your ~/.wprc profile and documents")
         return out
 
+    def _find_icon(self):
+        """Locate a WordPerfect .xpm icon in the source media (native or .deb)."""
+        native = self.media / "linux/link/wp.xpm"
+        if native.is_file():
+            return native
+        # .deb suite ships icons under usr/X11R6/share/icons — search up from the
+        # wp tree (media is .../usr/lib/wp8; icons are .../usr/X11R6/...).
+        p = self.media
+        for _ in range(5):
+            icodir = p / "usr/X11R6/share/icons"
+            if icodir.is_dir():
+                wp = [x for x in icodir.glob("*.xpm") if "wp" in x.name.lower()]
+                if wp:
+                    return wp[0]
+                anyx = sorted(icodir.glob("*.xpm"))
+                if anyx:
+                    return anyx[0]
+            p = p.parent
+        return None
+
+    # ---- .deb (suite) install path --------------------------------------
+    def prereqs_deb(self) -> list[str]:
+        log = []
+        if not (self.media / "wpbin/xwp").is_file():
+            raise InstallError(f"no WordPerfect tree (wpbin/xwp) at {self.media}")
+        if not Path("/lib/ld-linux.so.2").exists():
+            raise InstallError("32-bit loader /lib/ld-linux.so.2 missing "
+                               "(install libc6:i386)")
+        if not self.retro5.exists():                 # build the shim if needed
+            alt = self.compat / "build/retro5.so"
+            if alt.exists():
+                self.retro5 = alt
+            elif (self.compat / "Makefile").exists():
+                r = self._run(["make", "-C", str(self.compat)])
+                if r.returncode != 0 or not self.retro5.exists():
+                    raise InstallError("failed to build retro5.so:\n" + r.stderr)
+                log.append("built retro5.so")
+            else:
+                raise InstallError("retro5.so not found and cannot build it")
+        log.append(f"shim: {self.retro5}")
+        return log
+
+    def install_tree_deb(self) -> list[str]:
+        # a .deb already holds an installed, uncompressed tree (binaries, .drs in
+        # runtime form, fonts) — just copy it into the versioned target.
+        self.target.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for item in sorted(self.media.iterdir()):
+            dst = self.target / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+            n += 1
+        # drop the bundled ancient libc5/libm5 — the retarget points every binary
+        # at retro5.so + glibc, so these would only be a foot-gun if ever found.
+        for pat in ("libc.so.5*", "libm.so.5*"):
+            for f in (self.target / "wpbin").glob(pat):
+                f.unlink()
+        return [f"copied WordPerfect {self.version} suite tree "
+                f"({n} entries) to {self.target}"]
+
     # ---- orchestration ---------------------------------------------------
     STEPS = [
         ("prereqs",        "Checking prerequisites",  0.05, "prereqs"),
@@ -622,9 +717,19 @@ exec "$ROOT/wpbin/xwp" "$@"
         ("launcher",       "Creating launcher",       0.95, "launcher"),
         ("user_setup",     "Per-user setup",          1.00, "user_setup"),
     ]
+    DEB_STEPS = [
+        ("prereqs",        "Checking prerequisites",  0.05, "prereqs_deb"),
+        ("install_tree",   "Installing suite files",  0.45, "install_tree_deb"),
+        ("retarget",       "Retargeting binaries",    0.70, "retarget"),
+        ("patches",        "Applying patches",        0.76, "patches"),
+        ("fix_perms",      "Setting permissions",     0.84, "fix_perms"),
+        ("runtime_config", "Installing runtime",      0.90, "runtime_config"),
+        ("launcher",       "Creating launcher",       0.95, "launcher"),
+        ("user_setup",     "Per-user setup",          1.00, "user_setup"),
+    ]
 
     def run(self):
-        steps = self.STEPS
+        steps = self.DEB_STEPS if self.source_kind == "deb" else self.STEPS
         if self.tree_only:
             steps = [s for s in steps if s[0] not in ("launcher", "user_setup")]
         for key, title, frac, meth in steps:
@@ -679,7 +784,9 @@ def main(argv):
     ap.add_argument("--media", metavar="PATH",
                     help="Corel media to install from: an ISO, an extracted "
                          "native tree, or a folder containing ISOs")
-    ap.add_argument("--target", default=str(DEFAULT_TARGET))
+    ap.add_argument("--target", default=None,
+                    help="install dir (default: ~/.local/share/wordperfect/<version> "
+                         "so 8.0 and 8.1 sit side by side)")
     ap.add_argument("--list", action="store_true",
                     help="list installable WordPerfect media found under --media "
                          "and exit")
@@ -705,7 +812,7 @@ def main(argv):
     # --- repair / uninstall operate on an installed ROOT, no media needed ---
     if a.complete:
         try:
-            eng = Engine(a.complete, a.target)
+            eng = Engine(a.complete, a.target or DEFAULT_TARGET)
             for line in eng.complete(a.complete):
                 print(f"  - {line}")
             print(f"\nCompleted {a.complete}.")
@@ -714,7 +821,7 @@ def main(argv):
             print(f"FAIL: {e}"); return 1
     if a.uninstall:
         try:
-            eng = Engine(a.uninstall, a.target)
+            eng = Engine(a.uninstall, a.target or DEFAULT_TARGET)
             for line in eng.uninstall(a.uninstall, remove_profile=a.remove_profile):
                 print(f"  - {line}")
             print(f"\nUninstalled {a.uninstall}.")
@@ -753,19 +860,15 @@ def main(argv):
                 print(f"  --pick {i}   {c.label}")
         return 2
 
-    if chosen.kind == media.DEB:
-        print(f"Selected: {chosen.label}")
-        print("This is a Debian-packaged install (WordPerfect 8.1 / the Corel "
-              "suite). The .deb install path is not wired up yet — for now point "
-              "--media at a native-tree disc or ISO.")
-        return 3
-
     try:
         with media.resolve(chosen.path) as rm:
-            print(f"Installing: {chosen.label}")
-            eng = Engine(rm.root, a.target, make_launcher=not a.no_launcher,
-                         make_desktop=not a.no_desktop, tree_only=a.tree_only)
-            return _run_install(eng, a.target)
+            target = Path(a.target) if a.target else DEFAULT_BASE / rm.version
+            kind = "deb" if rm.kind == media.DEB else "native"
+            print(f"Installing: {chosen.label}\n  -> {target}")
+            eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
+                         make_desktop=not a.no_desktop, tree_only=a.tree_only,
+                         version=rm.version, source_kind=kind)
+            return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1
 

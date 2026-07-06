@@ -167,6 +167,7 @@ class Installer(Gtk.Application):
         detect.connect("clicked", self._on_detect)
         self.version_dd = Gtk.DropDown.new_from_strings(["(press Detect versions)"])
         self.version_dd.set_sensitive(False)
+        self.version_dd.connect("notify::selected", self._on_version_changed)
         self._candidates = []          # installable media.Candidate objects
         self.target_entry = Gtk.Entry(text=str(DEFAULT_TARGET), hexpand=True)
         grid.attach(Gtk.Label(label="Install media:", xalign=0), 0, 0, 1, 1)
@@ -223,9 +224,12 @@ class Installer(Gtk.Application):
 
     # ---- run -------------------------------------------------------------
     def _on_system_toggled(self, chk):
-        if chk.get_active():
+        # re-version the target under the right base (/opt vs ~/.local)
+        if self._candidates and 0 <= self.version_dd.get_selected() < len(self._candidates):
+            self._on_version_changed()
+        elif chk.get_active():
             self._user_target = self.target_entry.get_text()
-            self.target_entry.set_text("/opt/wordperfect8")
+            self.target_entry.set_text("/opt/wordperfect")
         else:
             self.target_entry.set_text(getattr(self, "_user_target", str(DEFAULT_TARGET)))
 
@@ -260,6 +264,17 @@ class Installer(Gtk.Application):
         self.version_dd.set_sensitive(True)
         self.opt_status.set_text(f"Found {len(installable)} installable version(s).")
 
+    def _version_base(self):
+        return Path("/opt/wordperfect") if self.system_chk.get_active() \
+            else Path.home() / ".local/share/wordperfect"
+
+    def _on_version_changed(self, *_):
+        # keep the target dir versioned (side-by-side 8.0 / 8.1)
+        idx = self.version_dd.get_selected()
+        if 0 <= idx < len(self._candidates):
+            v = self._candidates[idx].version
+            self.target_entry.set_text(str(self._version_base() / v))
+
     def _start_install(self, _btn):
         target = Path(self.target_entry.get_text().strip())
         if not self._candidates:
@@ -270,11 +285,6 @@ class Installer(Gtk.Application):
             self.opt_status.set_text("⚠  Choose a version to install.")
             return
         chosen = self._candidates[idx]
-        if chosen.kind == mediamod.DEB:
-            self.opt_status.set_text("⚠  This is a Debian-packaged version (WordPerfect 8.1 / "
-                                     "the suite); that install path isn't wired up yet. Pick a "
-                                     "native-tree disc/ISO.")
-            return
         self.stack.set_visible_child_name("progress")
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
@@ -315,8 +325,10 @@ class Installer(Gtk.Application):
         else:
             try:
                 with mediamod.resolve(chosen.path) as rm:
+                    kind = "deb" if rm.kind == mediamod.DEB else "native"
                     eng = Engine(rm.root, target, make_launcher=make_launcher,
-                                 make_desktop=make_desktop)
+                                 make_desktop=make_desktop,
+                                 version=rm.version, source_kind=kind)
                     for step in eng.run():
                         GLib.idle_add(self._on_step, step)
                         stats = eng.stats

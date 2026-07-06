@@ -183,6 +183,7 @@ class Candidate:
     path: Path                 # the ISO file or directory the user pointed at
     kind: str                  # NATIVE / DEB / WINDOWS / UNKNOWN
     label: str                 # human label ("WordPerfect 8.0 (ISO)")
+    version: str = "8"         # "8.0" / "8.1" — used for side-by-side install dirs
     deb_members: list[str] = field(default_factory=list)
 
     @property
@@ -190,20 +191,23 @@ class Candidate:
         return self.kind in (NATIVE, DEB)
 
 
-def _label_for(path: Path, kind: str, debs: list[str]) -> str:
+def _deb_version(debs: list[str]) -> str:
+    """wp-full_8.1-12_i386.deb -> '8.1'."""
+    for d in debs:
+        b = os.path.basename(d)
+        if b.startswith("wp-full") or b.startswith("wordperfect"):
+            parts = b.split("_")
+            if len(parts) > 1:
+                return parts[1].split("-")[0]
+    return "8.1"
+
+
+def _label_for(path: Path, kind: str, version: str) -> str:
     name = path.name
     if kind == NATIVE:
-        return f"WordPerfect 8 (native tree) — {name}"
+        return f"WordPerfect {version} (native disc) — {name}"
     if kind == DEB:
-        ver = ""
-        for d in debs:
-            b = os.path.basename(d)
-            if b.startswith("wp-full"):
-                # wp-full_8.1-12_i386.deb -> 8.1
-                parts = b.split("_")
-                if len(parts) > 1:
-                    ver = parts[1].split("-")[0]
-        return f"WordPerfect {ver or '(suite)'} — Debian packages — {name}"
+        return f"WordPerfect {version} suite (Debian packages) — {name}"
     if kind == WINDOWS:
         return f"Corel (Windows product, not installable) — {name}"
     return f"Unrecognized media — {name}"
@@ -214,17 +218,21 @@ def classify(path: Path) -> Candidate:
     path = Path(path)
     if path.is_dir():
         if _find_native_root(path):
-            return Candidate(path, NATIVE, _label_for(path, NATIVE, []))
+            return Candidate(path, NATIVE, _label_for(path, NATIVE, "8.0"), "8.0")
         debs = [str(p) for p in path.rglob("*.deb")
                 if any(g in p.name for g in _DEB_GLOBS)]
         if debs:
-            return Candidate(path, DEB, _label_for(path, DEB, debs), debs)
-        return Candidate(path, UNKNOWN, _label_for(path, UNKNOWN, []))
+            v = _deb_version(debs)
+            return Candidate(path, DEB, _label_for(path, DEB, v), v, debs)
+        return Candidate(path, UNKNOWN, _label_for(path, UNKNOWN, "8"))
     if path.suffix.lower() == ".iso":
         names = _iso_list(path)
         kind, debs = _classify_names(names)
-        return Candidate(path, kind, _label_for(path, kind, debs), debs)
-    return Candidate(path, UNKNOWN, _label_for(path, UNKNOWN, []))
+        # the standalone WordPerfect-for-Linux disc is 8.0; the Corel Linux OS
+        # packages are 8.1 (read from the .deb filename).
+        version = _deb_version(debs) if kind == DEB else ("8.0" if kind == NATIVE else "8")
+        return Candidate(path, kind, _label_for(path, kind, version), version, debs)
+    return Candidate(path, UNKNOWN, _label_for(path, UNKNOWN, "8"))
 
 
 def discover(paths: list[Path]) -> list[Candidate]:
@@ -252,6 +260,7 @@ class ResolvedMedia:
     root: Path                 # directory the engine installs from
     kind: str
     label: str
+    version: str = "8"         # "8.0" / "8.1"
     _tmp: str | None = None    # temp dir to clean up, if any
 
     def close(self) -> None:
@@ -278,7 +287,7 @@ def resolve(path: Path, workdir: Path | None = None) -> ResolvedMedia:
 
     if cand.kind == NATIVE and Path(path).is_dir():
         root = _find_native_root(Path(path))
-        return ResolvedMedia(root, NATIVE, cand.label)
+        return ResolvedMedia(root, NATIVE, cand.label, cand.version)
 
     tmp = tempfile.mkdtemp(prefix="wpmedia-", dir=str(workdir) if workdir else None)
 
@@ -288,7 +297,7 @@ def resolve(path: Path, workdir: Path | None = None) -> ResolvedMedia:
         if not root:
             shutil.rmtree(tmp, ignore_errors=True)
             raise MediaError(f"native tree not found after extracting {path}")
-        return ResolvedMedia(root, NATIVE, cand.label, tmp)
+        return ResolvedMedia(root, NATIVE, cand.label, cand.version, tmp)
 
     # DEB: pull the packages out (from ISO or dir) and dpkg-deb -x them.
     debroot = Path(tmp) / "root"
@@ -299,7 +308,26 @@ def resolve(path: Path, workdir: Path | None = None) -> ResolvedMedia:
         raise MediaError(f"no WordPerfect .deb packages extracted from {path}")
     for deb in debs:
         _deb_extract(deb, debroot)
-    return ResolvedMedia(debroot, DEB, cand.label, tmp)
+    # the packages install to e.g. usr/lib/wp8/ — hand the engine that tree, the
+    # dir that actually holds wpbin/xwp + shbin10.
+    wproot = _find_deb_wproot(debroot)
+    if not wproot:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise MediaError(f"WordPerfect tree (wpbin/xwp) not found in {cand.label}")
+    return ResolvedMedia(wproot, DEB, cand.label, cand.version, tmp)
+
+
+def _find_deb_wproot(debroot: Path, max_depth: int = 6) -> Path | None:
+    """Find the installed WP tree inside an unpacked .deb (holds wpbin/xwp)."""
+    base_depth = len(debroot.parts)
+    for dirpath, dirnames, _files in os.walk(debroot):
+        p = Path(dirpath)
+        if len(p.parts) - base_depth > max_depth:
+            dirnames[:] = []
+            continue
+        if (p / "wpbin/xwp").exists() and (p / "shbin10").is_dir():
+            return p
+    return None
 
 
 def _stage_debs(path: Path, cand: Candidate, tmp: Path) -> list[Path]:
