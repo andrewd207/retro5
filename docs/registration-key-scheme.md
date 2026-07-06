@@ -66,3 +66,8 @@ this repository has to interoperate with, and it is of historical interest as a
 period example of an offline "registration number" self-check. It is recorded
 here as documentation only. This repository intentionally does **not** ship the
 original `veruxkey` binary, nor any script that produces numbers.
+
+`tools/verify-regnum.py` is a heavily-commented, **verify-only** companion to
+this document: it reports whether a number you already have satisfies the two
+rules above. It cannot generate numbers, and it does not remove your obligation
+to hold a valid license.

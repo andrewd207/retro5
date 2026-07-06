@@ -24,7 +24,11 @@ OBJ       := $(SRC_C:.c=.o) $(SRC_S:.S=.o)
 # retarget config (override on the command line)
 WPBIN     ?= ../linux/ins/wpinstg
 GLIBC_LD  ?= /lib/ld-linux.so.2
-INSTALL_DIR ?= /usr/local/lib/wp8
+# install retro5.so where the 32-bit dynamic loader looks by DEFAULT (a trusted
+# multiarch dir) so retargeted binaries need no LD_LIBRARY_PATH. Override LIBDIR
+# for a non-multiarch layout, or DESTDIR for staged/packaged installs.
+DESTDIR   ?=
+LIBDIR    ?= /usr/lib/i386-linux-gnu
 
 all: $(TARGET)
 
@@ -64,12 +68,21 @@ open(f,'wb').write(d); print('patched (in-place, same-length)')"
 	@readelf -l build/$(notdir $(WPBIN)) 2>/dev/null | grep -i interpreter
 	@readelf -d build/$(notdir $(WPBIN)) 2>/dev/null | awk -F'[][]' '/NEEDED/{print "  "$$2}'
 
+# install the shim into a loader-default 32-bit dir + refresh the cache.
+# Run as root (sudo make install). One copy serves every retargeted binary.
 install: $(TARGET)
-	install -d $(INSTALL_DIR)
-	install -m755 $(TARGET) $(INSTALL_DIR)/
+	install -d $(DESTDIR)$(LIBDIR)
+	install -m644 $(TARGET) $(DESTDIR)$(LIBDIR)/$(TARGET)
+	-ldconfig
+	@echo "== installed $(TARGET) -> $(DESTDIR)$(LIBDIR)/ (no LD_LIBRARY_PATH needed) =="
+
+uninstall:
+	rm -f $(DESTDIR)$(LIBDIR)/$(TARGET)
+	-ldconfig
+	@echo "== removed $(LIBDIR)/$(TARGET) =="
 
 clean:
 	rm -f $(OBJ) $(TARGET)
 	rm -rf build
 
-.PHONY: all check patch install clean
+.PHONY: all check patch install uninstall clean

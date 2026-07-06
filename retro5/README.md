@@ -61,11 +61,52 @@ DT_NEEDED    libm.so.5           ->  libm.so.6
 | `detect-static-x11.sh` | flag binaries that statically embed ancient X11 transport code |
 | `build-tree.sh`        | decompress + retarget a whole WordPerfect suite into a root |
 
-## Build
+## Requirements
+
+`retro5.so` is a **32-bit (i386)** shared object, so you need a 32-bit
+toolchain and 32-bit runtime libraries even on an x86-64 host.
+
+**Build** (Debian/Ubuntu package names):
+
+| need | package |
+|------|---------|
+| 32-bit gcc / libc headers | `gcc-multilib` (pulls `libc6-dev-i386`) |
+| linker / `readelf` / `objcopy` | `binutils` |
+| `make` | `make` |
 
 ```sh
-make            # -> retro5.so
-readelf -d retro5.so | grep -i soname   # SONAME: retro5.so
+sudo apt install gcc-multilib binutils make
 ```
 
-Requires a 32-bit toolchain (`gcc -m32`).
+Fedora/RHEL equivalents: `glibc-devel.i686`, `libgcc.i686`, `binutils`, `make`.
+
+**Runtime** (to actually *run* retargeted binaries): the 32-bit loader and the
+libraries the binaries still link by their modern sonames —
+
+```sh
+sudo dpkg --add-architecture i386 && sudo apt update
+sudo apt install libc6:i386 libm6:i386        # (libm is part of libc6)
+# for X11/Motif apps such as WordPerfect:
+sudo apt install libx11-6:i386 libxt6:i386 libxpm4:i386 libxext6:i386
+```
+
+## Build & install
+
+```sh
+make                     # -> retro5.so (32-bit); prints SONAME + export count
+sudo make install        # -> /usr/lib/i386-linux-gnu/retro5.so + ldconfig
+```
+
+`make install` drops the shim in a directory the 32-bit loader searches by
+**default**, so retargeted binaries find it with **no `LD_LIBRARY_PATH`**. One
+copy serves every retargeted program on the system. Overridables:
+
+```sh
+sudo make install LIBDIR=/some/other/libdir   # non-multiarch layout
+make install DESTDIR=/tmp/stage               # staged/packaged build (no ldconfig effect)
+sudo make uninstall                           # remove it again
+```
+
+For a throwaway or unprivileged setup you can skip `make install` and instead
+put `retro5.so` on `LD_LIBRARY_PATH` yourself, but the installed path is the
+clean way.
