@@ -42,8 +42,11 @@ typedef struct _lc5_FILE {
     signed char   _vtable_offset;/*70*/
     char   _shortbuf[1];      /* 71 */
     void  *_lock;             /* 72 */
-    /* trailing pad so our allocation is never smaller than libc5's FILE */
-    char   _pad[64];
+    /* pad to libc5's exact FILE size (84 bytes). Matching it silences the
+     * loader's "_IO_stderr_ has different size in shared object" copy-relocation
+     * warning: the WP binaries copy-relocate _IO_stderr_ and record its libc5
+     * size (84); an oversized definition here triggers the mismatch check. */
+    char   _pad[8];           /* 76 -> 84 */
 } LC5_FILE;
 
 /* _flags bits we care about (libio) */
