@@ -551,6 +551,13 @@ if [ ! -e "$HOME/.wprc/.wpc8x.set" ] && [ -f "$ROOT/shlib10/.wpc8x.set" ]; then
     cp "$ROOT/shlib10/.wpc8x.set" "$HOME/.wprc/.wpc8x.set" 2>/dev/null
     chmod 0600 "$HOME/.wprc/.wpc8x.set" 2>/dev/null
 fi
+# self-heal WP's default printer resource: WP defaults its printer to "passpost"
+# and errors "File not found ... passpost.prs" if it's absent. Repairs trees from
+# installs that predate the install-time heal (user installs; system trees are
+# handled at install time and this no-ops harmlessly if unwritable).
+if [ ! -e "$ROOT/shlib10/passpost.prs" ] && [ -f "$ROOT/shlib10/default.prs" ]; then
+    cp "$ROOT/shlib10/default.prs" "$ROOT/shlib10/passpost.prs" 2>/dev/null
+fi
 xhost +local: >/dev/null 2>&1
 {ldlib}export WPC="$ROOT"
 # point the ancient statically-linked Xlib at the modern X locale dir
