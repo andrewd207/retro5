@@ -526,6 +526,18 @@ class Engine:
                            "install has one to copy. WP will error at startup. "
                            "Install a native WP disc alongside (its wp.drs will be "
                            "reused), or place a compressed wp.drs in shlib10.")
+        # (3) XKeysymDB: WP's bundled 1998 libX11 resolves Motif virtual keysyms
+        # (osfDelete/osfLeft/...) used by dialog text-field translations through
+        # this file. Modern X dropped it, so without it Delete/BackSpace/arrow
+        # keys self-insert garbage in entry fields. Ship our copy; the launcher
+        # points XKEYSYMDB at it. (Standard MIT-licensed X11 keysym data.)
+        xkdb = shlib / "XKeysymDB"
+        if not xkdb.exists():
+            src = Path(__file__).resolve().parent / "XKeysymDB"
+            if src.is_file():
+                shutil.copyfile(src, xkdb); os.chmod(xkdb, 0o644)
+                out.append("installed shlib10/XKeysymDB (OSF virtual keysyms so "
+                           "Delete/arrows work in dialog text fields)")
         return out
 
     # ---- step 7: launcher -----------------------------------------------
@@ -543,6 +555,10 @@ xhost +local: >/dev/null 2>&1
 {ldlib}export WPC="$ROOT"
 # point the ancient statically-linked Xlib at the modern X locale dir
 export XLOCALEDIR=/usr/share/X11/locale
+# supply the OSF virtual keysyms WP's 1998 libX11 needs (modern X dropped the
+# XKeysymDB file); without it Delete/BackSpace/arrow keys self-insert garbage
+# in dialog text fields (e.g. the Save As filename box)
+[ -f "$ROOT/shlib10/XKeysymDB" ] && export XKEYSYMDB="$ROOT/shlib10/XKeysymDB"
 export WPIPEDELAY=60
 : "${{DISPLAY:=:0}}"; export DISPLAY
 # NB: do NOT set WPLANG (sends xwp down a broken admintxt path)

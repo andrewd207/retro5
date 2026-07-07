@@ -1,0 +1,46 @@
+! XKeysymDB - vendor virtual keysym definitions (Motif/OSF).
+!
+! Standard MIT-licensed X11 keysym data, recreated for retro5 / WordPerfect 8.
+! WP's bundled 1998 libX11 resolves Motif virtual keysyms (osfXXX) used by its
+! text-field translation tables through this file. Modern X no longer ships it
+! (it was dropped from x11-common), so on a current system XStringToKeysym()
+! cannot resolve "osfDelete"/"osfLeft"/... -> the entry-field translations for
+! Delete, BackSpace and the arrow keys never install and those keys fall through
+! to self-insert (garbage glyphs). Point WP's libX11 at this file with
+! XKEYSYMDB=<path> to restore normal editing in dialog text fields.
+!
+! OSF (Motif) keysyms
+osfBackSpace		:1004FF08
+osfInsert		:1004FF63
+osfDelete		:1004FFFF
+osfClear		:1004FF0B
+osfCopy			:1004FF02
+osfCut			:1004FF03
+osfPaste		:1004FF04
+osfAddMode		:1004FF31
+osfPrimaryPaste		:1004FF32
+osfQuickPaste		:1004FF33
+osfPageLeft		:1004FF40
+osfPageUp		:1004FF41
+osfPageDown		:1004FF42
+osfPageRight		:1004FF43
+osfActivate		:1004FF44
+osfMenuBar		:1004FF45
+osfLeft			:1004FF51
+osfUp			:1004FF52
+osfRight		:1004FF53
+osfDown			:1004FF54
+osfPrior		:1004FF55
+osfNext			:1004FF56
+osfEndLine		:1004FF57
+osfBeginLine		:1004FF58
+osfSelect		:1004FF60
+osfUndo			:1004FF65
+osfMenu			:1004FF67
+osfCancel		:1004FF69
+osfHelp			:1004FF6A
+osfSelectAll		:1004FF71
+osfDeselectAll		:1004FF72
+osfReselect		:1004FF73
+osfExtend		:1004FF74
+osfRestore		:1004FF78
