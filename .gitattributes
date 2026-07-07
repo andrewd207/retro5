@@ -1,0 +1,12 @@
+# Keep line endings sane everywhere. These are Linux tools: shell scripts, the
+# XKeysymDB, and Python must be checked out with LF even on Windows (autocrlf)
+# and in generated zip/tar archives, or the scripts break under /bin/sh
+# ("Syntax error: newline unexpected" / "bad interpreter") on the target system.
+* text=auto eol=lf
+
+# Never touch binaries.
+*.so   binary
+*.png  binary
+*.wpd  binary
+*.prs  binary
+*.drs  binary
