@@ -42,6 +42,12 @@ static long write_all(int fd, const char *p, long n) {
     return done;
 }
 
+/* write() whose result we deliberately discard (best-effort diagnostics). */
+static void iwrite(int fd, const void *p, size_t n) {
+    ssize_t r = write(fd, p, n);
+    (void)r;
+}
+
 static LC5_FILE *new_file(int fd, int writing) {
     LC5_FILE *fp = (LC5_FILE *)__libc_malloc(sizeof(LC5_FILE));
     char *buf = (char *)__libc_malloc(BUFSZ);
@@ -80,7 +86,7 @@ int __uflow(LC5_FILE *fp) {
 
 int __overflow(LC5_FILE *fp, int c) {
     if (fp->_IO_write_base == 0) {          /* unbuffered (e.g. copy-reloc'd stderr) */
-        if (c != LC5_EOF) { char ch = (char)c; write(fp->_fileno, &ch, 1); }
+        if (c != LC5_EOF) { char ch = (char)c; iwrite(fp->_fileno, &ch, 1); }
         return c & 0xff;
     }
     long n = fp->_IO_write_ptr - fp->_IO_write_base;
@@ -191,9 +197,9 @@ extern char *strerror(int);
 extern int _errno;
 void perror(const char *s) {
     char *e = strerror(_errno);
-    if (s && *s) { write(2, s, __builtin_strlen(s)); write(2, ": ", 2); }
-    if (e) write(2, e, __builtin_strlen(e));
-    write(2, "\n", 1);
+    if (s && *s) { iwrite(2, s, __builtin_strlen(s)); iwrite(2, ": ", 2); }
+    if (e) iwrite(2, e, __builtin_strlen(e));
+    iwrite(2, "\n", 1);
 }
 
 void rewind(LC5_FILE *fp) {
@@ -349,7 +355,7 @@ int __printf_chk(int flag, const char *fmt, ...) {
 extern int vsscanf(const char *, const char *, va_list);
 extern int getpid(void);
 extern int unlink(const char *);
-extern int pipe(int *);
+extern int pipe(int[2]);
 extern int fork(void);
 extern int dup2(int, int);
 extern void _exit(int);
@@ -375,7 +381,8 @@ LC5_FILE *fdopen(int fd, const char *mode) {
 
 int vfprintf(LC5_FILE *fp, const char *fmt, va_list ap) {
     char buf[4096]; int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    if (n < 0) return n; if ((size_t)n > sizeof(buf)) n = sizeof(buf);
+    if (n < 0) return n;
+    if ((size_t)n > sizeof(buf)) n = sizeof(buf);
     fwrite(buf, 1, n, fp); return n;
 }
 /* Forward to glibc's real vsprintf. Do NOT use vsnprintf(s,(size_t)-1,...):
@@ -397,8 +404,12 @@ int fscanf(LC5_FILE *fp, const char *fmt, ...) {          /* line-based best eff
 }
 char *gets(char *s) {
     int i = 0; char c;
-    for (;;) { long n = read(0, &c, 1); if (n <= 0) { if (i == 0) return 0; break; }
-               if (c == '\n') break; s[i++] = c; }
+    for (;;) {
+        long n = read(0, &c, 1);
+        if (n <= 0) { if (i == 0) return 0; break; }
+        if (c == '\n') break;
+        s[i++] = c;
+    }
     s[i] = '\0'; return s;
 }
 

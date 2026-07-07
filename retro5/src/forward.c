@@ -206,7 +206,14 @@ int atoi(const char *a) {
 FWD(long,   __strtol_internal, (const char *a, char **b, int c, int d), (a, b, c, d))
 
 /* ---- process / misc ------------------------------------------------------- */
-FWDV(abort,  (void), ())
+/* abort() is declared noreturn; forward then mark unreachable so GCC agrees. */
+void abort(void) {
+    static void (*fn)(void);
+    if (!fn) fn = (void (*)(void)) dlsym(RTLD_NEXT, "abort");
+    PRE_ERRNO();
+    fn();
+    __builtin_unreachable();
+}
 /* exit: glibc's exit runs _IO_cleanup (flush all glibc streams), which
  * segfaults given our interposed/libc5-layout FILEs. Run the registered
  * atexit/__cxa_atexit handlers ourselves, then _exit — skipping the crash. */
@@ -515,7 +522,14 @@ FWD(int, sigaddset,(void*a,int b),(a,b))
 FWD(int, sigemptyset,(void*a),(a))
 FWD(int, sigprocmask,(int a,const void*b,void*c),(a,b,c))
 FWD(int, __sigjmp_save,(void*a,int b),(a,b))
-FWDV(siglongjmp,(void*a,int b),(a,b))
+/* siglongjmp() is declared noreturn; forward then mark unreachable. */
+void siglongjmp(void *a, int b) {
+    static void (*fn)(void *, int);
+    if (!fn) fn = (void (*)(void *, int)) dlsym(RTLD_NEXT, "siglongjmp");
+    PRE_ERRNO();
+    fn(a, b);
+    __builtin_unreachable();
+}
 /* termios (struct differs; forward, revisit) */
 FWD(int, cfgetospeed,(const void*a),(a))
 FWD(int, tcflush,(int a,int b),(a,b))
