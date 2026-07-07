@@ -89,11 +89,61 @@ LICENSE            MIT
 
 ## Requirements
 
-- A 64-bit Linux system with **32-bit runtime libraries** installed:
-  - Debian/Ubuntu: `sudo dpkg --add-architecture i386 && sudo apt install libc6:i386 libx11-6:i386` (X is linked statically in most editions, so `libc6:i386` + `libm` is usually enough).
-  - Fedora: `sudo dnf install glibc.i686 libgcc.i686`
-- `python3` (for `retarget.py` / the installer).
-- Root for the system-wide steps.
+WordPerfect is a **32-bit (i386)** program, so on a 64-bit system you must
+install the **32-bit runtime libraries** — this is the single most common reason
+a freshly-retargeted `xwp` won't start (`No such file or directory` on the
+loader, or a silent exit). You also need `python3` for `retarget.py` / the
+installer, and root for the system-wide steps.
+
+**What's actually needed depends on the edition:**
+
+| Edition | 32-bit libraries required |
+|---|---|
+| WP 8.1 (Corel `.deb`), wplinux8 — **static X** | `libc.so.6` **only** (bundles libm + the `ld-linux.so.2` loader) |
+| WP 8.0.0076 — **dynamic X** | the above **plus** `libX11.so.6`, `libXt.so.6`, `libXpm.so.4` |
+
+If you don't know which you have, install the X libs too — they're small and
+harmless. Their own 32-bit dependencies (`libXext`, `libSM`, `libICE`, `libxcb`)
+are pulled in automatically.
+
+### Debian / Ubuntu / Linux Mint (and derivatives) — `apt`
+
+```bash
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install libc6:i386                                 # required, all editions
+# dynamic-X edition (WP 8.0.0076) also needs the 32-bit X libs:
+sudo apt install libx11-6:i386 libxpm4:i386 libxt6:i386
+```
+
+> On **Ubuntu 24.04+ / Debian 13 (trixie)** the time_t transition renamed some
+> packages: if `libxt6:i386` isn't found, use **`libxt6t64:i386`**. `libc6:i386`
+> and `libx11-6:i386` keep their names.
+
+### Fedora / RHEL / derivatives — `dnf`
+
+```bash
+sudo dnf install glibc.i686                                 # required, all editions
+sudo dnf install libX11.i686 libXpm.i686 libXt.i686         # dynamic-X edition
+```
+
+### Arch / Manjaro — `pacman` (enable the `[multilib]` repo first)
+
+```bash
+# uncomment the [multilib] section in /etc/pacman.conf, then:
+sudo pacman -S lib32-glibc                                  # required, all editions
+sudo pacman -S lib32-libx11 lib32-libxpm lib32-libxt        # dynamic-X edition
+```
+
+### openSUSE — `zypper`
+
+```bash
+sudo zypper install glibc-32bit                             # required, all editions
+sudo zypper install libX11-6-32bit libXpm4-32bit libXt6-32bit   # dynamic-X edition
+```
+
+`retro5-setup.sh` checks for the 32-bit loader (`/lib/ld-linux.so.2`) and stops
+with the right hint if it's missing, so you'll know before WP fails to launch.
 
 ## The fixes, in one place
 

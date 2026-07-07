@@ -32,6 +32,18 @@ die(){ echo "error: $*" >&2; exit 1; }
 [ -f "$HERE/retarget.py" ] || die "retarget.py must sit next to this script"
 command -v python3 >/dev/null || die "python3 is required"
 
+# 32-bit runtime check: retargeting points xwp at /lib/ld-linux.so.2, so WP needs
+# the i386 glibc. Warn early (with the fix) rather than let WP fail to launch.
+if [ ! -e /lib/ld-linux.so.2 ] && [ ! -e /lib/i386-linux-gnu/ld-linux.so.2 ]; then
+    echo "warning: the 32-bit loader /lib/ld-linux.so.2 is not installed — WordPerfect"
+    echo "         will not start until you add the i386 glibc. On Debian/Ubuntu/Mint:"
+    echo "           sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386"
+    echo "         (Fedora: glibc.i686 · Arch: lib32-glibc · openSUSE: glibc-32bit)"
+    echo "         The WP 8.0.0076 dynamic-X build also needs libx11-6/libxpm4/libxt6 :i386."
+    echo "         See the README 'Requirements' section. Continuing the conversion anyway."
+    echo
+fi
+
 echo "==> retro5 setup for WordPerfect at: $ROOT"
 
 # 1. Retarget every libc5 ELF32 in the tree: libc.so.5->retro5.so,
