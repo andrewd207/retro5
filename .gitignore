@@ -17,3 +17,6 @@ media/
 # Editor/OS cruft
 *~
 .DS_Store
+
+# release build artifacts (built shim + tarballs)
+release/dist/
