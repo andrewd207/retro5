@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Andrew Haines
 #
@@ -20,9 +20,9 @@
 # the 32-bit runtime libraries WP needs — the i386 glibc plus the 32-bit X libs
 # (some bundled binaries link X even in the "static-X" editions) — then continues.
 #
-set -euo pipefail
+set -eu
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 LIBDIR="/usr/lib/i386-linux-gnu"           # trusted dir the 32-bit loader searches
 XKDB_SYS="/usr/X11R6/lib/X11/XKeysymDB"    # the path WP's bundled libX11 hardcodes
 
@@ -37,16 +37,17 @@ U
 }
 
 INSTALL_DEPS=0
-ARGS=()
-for a in "$@"; do
-    case "$a" in
+ROOT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --install-deps) INSTALL_DEPS=1 ;;
         -h|--help) usage; exit 0 ;;
-        -*) die "unknown option: $a (see --help)" ;;
-        *) ARGS+=("$a") ;;
+        -*) die "unknown option: $1 (see --help)" ;;
+        *) [ -z "$ROOT" ] || die "unexpected extra argument: $1"; ROOT="$1" ;;
     esac
+    shift
 done
-ROOT="${ARGS[0]:-/usr/lib/wp8}"
+ROOT="${ROOT:-/usr/lib/wp8}"
 
 # Install the 32-bit runtime: the i386 glibc (always) PLUS the 32-bit X libs.
 # The X libs are installed unconditionally because WP editions vary — the 8.0
@@ -80,7 +81,7 @@ command -v python3 >/dev/null || die "python3 is required"
 [ -f "$HERE/retro5.so" ]   || die "retro5.so must sit next to this script"
 [ -f "$HERE/retarget.py" ] || die "retarget.py must sit next to this script"
 
-[ "$INSTALL_DEPS" = 1 ] && install_deps
+if [ "$INSTALL_DEPS" = 1 ]; then install_deps; fi
 
 [ -d "$ROOT" ]            || die "WP root '$ROOT' not found — pass yours as the first argument"
 [ -e "$ROOT/wpbin/xwp" ] || die "'$ROOT/wpbin/xwp' missing — '$ROOT' doesn't look like a WP8 tree"
