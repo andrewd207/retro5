@@ -12,10 +12,20 @@
 #include <unistd.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include "libc5.h"
 
 extern void *__libc_malloc(size_t);
 extern void  __libc_free(void *);
+
+/* WP reads its own copy-relocated `_errno` (non-TLS), but glibc's stat() sets
+ * glibc's TLS errno. WP's file-open pre-check (fileop_precheck_errno @0x08513170)
+ * does `_xstat(); if (errno != ENOENT) fail`, so a stat that fails with ENOENT
+ * (e.g. saving a file that doesn't exist yet) MUST leave WP's _errno == ENOENT.
+ * Without this sync WP sees a stale _errno (0) != 2 and spuriously aborts the
+ * save with "An error occurred opening the file". */
+extern int _errno;
+#define SYNC_ERRNO() (_errno = errno)
 
 /* ---- stat family: modern struct stat -> libc5 struct lc5_stat ------------- */
 static void xlate_stat(const struct stat *s, struct lc5_stat *b) {
@@ -37,17 +47,17 @@ static void xlate_stat(const struct stat *s, struct lc5_stat *b) {
 
 int _xstat(int ver, const char *path, struct lc5_stat *b) {
     (void)ver; struct stat s;
-    if (stat(path, &s) < 0) return -1;
+    if (stat(path, &s) < 0) { SYNC_ERRNO(); return -1; }
     xlate_stat(&s, b); return 0;
 }
 int _lxstat(int ver, const char *path, struct lc5_stat *b) {
     (void)ver; struct stat s;
-    if (lstat(path, &s) < 0) return -1;
+    if (lstat(path, &s) < 0) { SYNC_ERRNO(); return -1; }
     xlate_stat(&s, b); return 0;
 }
 int _fxstat(int ver, int fd, struct lc5_stat *b) {
     (void)ver; struct stat s;
-    if (fstat(fd, &s) < 0) return -1;
+    if (fstat(fd, &s) < 0) { SYNC_ERRNO(); return -1; }
     xlate_stat(&s, b); return 0;
 }
 
