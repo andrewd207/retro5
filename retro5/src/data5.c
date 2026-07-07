@@ -32,12 +32,15 @@ const int *__ctype_tolower = _tolow + 128;
 const int *__ctype_toupper = _toup + 128;
 
 /* __ctype_b: libc5's char-classification table (384 entries, index -128..255),
- * a `const unsigned short *`. glibc no longer exports a libc5-LAYOUT table --
- * its compat __ctype_b uses glibc's _ISxxx bit layout, which is INCOMPATIBLE
- * with the libc5 macros -- so we build one with libc5's classic bit values:
- *   _U=0x01(upper) _L=0x02(lower) _N=0x04(digit) _S=0x08(space)
- *   _P=0x10(punct) _C=0x20(cntrl) _X=0x40(hex A-F/a-f) _B=0x80(blank ' ')
- * (Found missing by retro5/check-symbols.py on the 8.0.0076 build.) */
+ * a `const unsigned short *`. CRUCIAL: libc5 uses the SAME 16-bit bit layout as
+ * glibc's _ISxxx -- that is exactly why glibc still ships a compatible compat
+ * __ctype_b -- NOT the classic BSD `_ctype[]` 0x01..0x80 layout. Building it the
+ * BSD way makes isdigit('0') false, so a display string like ":0" won't parse
+ * and XOpenDisplay returns NULL. The correct 16-bit masks (verified against
+ * glibc: '0'->0xd808, 'A'->0xd508, ' '->0x6001):
+ *   _ISupper=0x0100 _ISlower=0x0200 _ISalpha=0x0400 _ISdigit=0x0800
+ *   _ISxdigit=0x1000 _ISspace=0x2000 _ISprint=0x4000 _ISgraph=0x8000
+ *   _ISblank=0x0001 _IScntrl=0x0002 _ISpunct=0x0004 _ISalnum=0x0008           */
 static unsigned short _ctb[384];
 const unsigned short *__ctype_b = _ctb + 128;
 
@@ -48,17 +51,27 @@ static void init_ctype(void) {
     for (i = 0; i < 256; i++) {
         _tolow[i + 128] = (i >= 'A' && i <= 'Z') ? i + 32 : i;
         _toup[i + 128] = (i >= 'a' && i <= 'z') ? i - 32 : i;
+        int up = (i>='A'&&i<='Z'), lo = (i>='a'&&i<='z'), dig = (i>='0'&&i<='9');
+        int hex = dig || (i>='a'&&i<='f') || (i>='A'&&i<='F');
+        int sp = (i==' '||i=='\t'||i=='\n'||i=='\v'||i=='\f'||i=='\r');
+        int blank = (i==' '||i=='\t');
+        int cntrl = (i < 0x20 || i == 0x7f);
+        int graph = (i >= 0x21 && i <= 0x7e);
+        int print = (i >= 0x20 && i <= 0x7e);
+        int alpha = up || lo, alnum = alpha || dig, punct = graph && !alnum;
         unsigned short v = 0;
-        if (i >= 'A' && i <= 'Z') v |= 0x01;                 /* _U */
-        if (i >= 'a' && i <= 'z') v |= 0x02;                 /* _L */
-        if (i >= '0' && i <= '9') v |= 0x04;                 /* _N */
-        if (i==' '||i=='\t'||i=='\n'||i=='\v'||i=='\f'||i=='\r') v |= 0x08; /* _S */
-        if (i < 0x20 || i == 0x7f) v |= 0x20;                /* _C control */
-        if ((i>='A'&&i<='F') || (i>='a'&&i<='f')) v |= 0x40; /* _X hex letters */
-        if (i == ' ') v |= 0x80;                             /* _B blank */
-        if (i >= 0x21 && i <= 0x7e &&                        /* _P punctuation */
-            !((i>='A'&&i<='Z')||(i>='a'&&i<='z')||(i>='0'&&i<='9')))
-            v |= 0x10;
+        if (up)    v |= 0x0100;      /* _ISupper  */
+        if (lo)    v |= 0x0200;      /* _ISlower  */
+        if (alpha) v |= 0x0400;      /* _ISalpha  */
+        if (dig)   v |= 0x0800;      /* _ISdigit  */
+        if (hex)   v |= 0x1000;      /* _ISxdigit */
+        if (sp)    v |= 0x2000;      /* _ISspace  */
+        if (print) v |= 0x4000;      /* _ISprint  */
+        if (graph) v |= 0x8000;      /* _ISgraph  */
+        if (blank) v |= 0x0001;      /* _ISblank  */
+        if (cntrl) v |= 0x0002;      /* _IScntrl  */
+        if (punct) v |= 0x0004;      /* _ISpunct  */
+        if (alnum) v |= 0x0008;      /* _ISalnum  */
         _ctb[i + 128] = v;
     }
     /* negative indices (-128..-1) stay 0 (static zero-init) */
