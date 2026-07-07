@@ -75,6 +75,12 @@ int __uflow(LC5_FILE *fp) {
     if (fp->_IO_read_ptr < fp->_IO_read_end)
         return (unsigned char)*fp->_IO_read_ptr++;
     long n;
+    if (fp->_IO_buf_base == 0) {         /* unbuffered (e.g. copy-reloc'd stdin) */
+        unsigned char ch;
+        do { n = read(fp->_fileno, &ch, 1); } while (n < 0 && errno == EINTR);
+        if (n <= 0) { fp->_flags |= LC5_EOF_SEEN; return LC5_EOF; }
+        return ch;
+    }
     do { n = read(fp->_fileno, fp->_IO_buf_base, BUFSZ); }
     while (n < 0 && errno == EINTR);
     if (n <= 0) { fp->_flags |= LC5_EOF_SEEN; return LC5_EOF; }
@@ -289,22 +295,15 @@ int fputs(const char *s, LC5_FILE *fp) {
 }
 
 /* ---- formatted output ----------------------------------------------------- */
-static LC5_FILE g_stdout;   /* fd 1, lazily buffered */
-static int g_stdout_init;
+/* stdout/stdin are the copy-relocatable, UNBUFFERED libc5 structs (data5.c), so
+ * our own printf/scanf and the program's inlined putchar/getchar share one
+ * consistent stream each -- fwrite's unbuffered path writes each chunk with a
+ * single write(), so this is not slow. */
+extern LC5_FILE _IO_stdout_;
+extern LC5_FILE _IO_stdin_;
 
 LC5_FILE *lc5_stdout(void) {
-    if (!g_stdout_init) {
-        char *buf = (char *)__libc_malloc(BUFSZ);
-        __builtin_memset(&g_stdout, 0, sizeof(g_stdout));
-        g_stdout._fileno = 1;
-        g_stdout._IO_buf_base = buf;
-        g_stdout._IO_buf_end  = buf + BUFSZ;
-        g_stdout._IO_write_base = buf;
-        g_stdout._IO_write_ptr  = buf;
-        g_stdout._IO_write_end  = buf + BUFSZ;
-        g_stdout_init = 1;
-    }
-    return &g_stdout;
+    return &_IO_stdout_;
 }
 
 int fprintf(LC5_FILE *fp, const char *fmt, ...) {

@@ -4,7 +4,6 @@
 
 /* data5.c - libc5 DATA symbols that WP binaries copy-relocate (R_386_COPY)
  * and modern glibc no longer exports in a libc5-compatible form.
- *   _IO_stdin_      -> provided by glibc (not here)
  *   widget classes  -> provided by modern libXt (not here)
  * So the shim only supplies the few below.
  */
@@ -21,6 +20,17 @@ unsigned short __fpu_control = 0x137f;
  * each byte straight to fd 2, so no pre-main buffer setup is needed (the
  * struct is copy-relocated into wpinstg's .bss before our constructors run). */
 LC5_FILE _IO_stderr_ = { ._fileno = 2 };
+
+/* libc5 stdout/stdin FILE, UNBUFFERED like _IO_stderr_ (_IO_write_base and
+ * _IO_buf_base stay 0). Unbuffered is ESSENTIAL for a copy-relocated stream:
+ * the program gets its OWN copy of the struct, and with no shared buffer there
+ * is nothing to desync -- both copies read/write fd 0/1 directly. (A buffered
+ * copy-relocated stdin/stdout would corrupt as the two copies' read/write
+ * pointers diverge.) Providing these -- not letting them fall through to glibc's
+ * incompatible _IO_2_1_ layout -- is what makes inlined putchar()/getchar() in a
+ * console libc5 program touch the correct libc5 field offsets. */
+LC5_FILE _IO_stdout_ = { ._fileno = 1 };
+LC5_FILE _IO_stdin_  = { ._fileno = 0 };
 
 /* __ctype_tolower / __ctype_toupper: pointers into 384-entry tables
  * (index range -128..255). glibc keeps the tables internal now, so we build
