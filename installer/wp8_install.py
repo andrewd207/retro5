@@ -88,12 +88,14 @@ class Engine:
     def __init__(self, media: Path, target: Path = DEFAULT_TARGET,
                  make_launcher: bool = True, make_desktop: bool = True,
                  tree_only: bool = False, tooling: Path = TOOLING,
-                 version: str = "8", source_kind: str = "native"):
+                 version: str = "8", source_kind: str = "native",
+                 install_deps: bool = False):
         self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
         self.version = str(version)         # "8.0" / "8.1" — side-by-side installs
         self.source_kind = source_kind      # "native" (ship manifest) or "deb"
+        self.install_deps = install_deps    # --install-deps: pull the 32-bit runtime
         self.compat = self.tooling / "retro5"           # shim source (this repo)
         self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
         self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
@@ -121,9 +123,54 @@ class Engine:
         except Exception:
             return False
 
+    # ---- 32-bit runtime deps (optional, --install-deps) -----------------
+    def _install_deps(self) -> list[str]:
+        """Detect the system package manager and install the 32-bit runtime
+        libraries WordPerfect needs: the i386 glibc (always) plus the 32-bit X
+        libs — some bundled binaries link X dynamically even in the 'static-X'
+        editions, so we install them too. Requires root."""
+        if os.geteuid() != 0:
+            raise InstallError("--install-deps installs system packages; re-run as root (sudo)")
+        apt = shutil.which("apt-get"); dnf = shutil.which("dnf")
+        pac = shutil.which("pacman");  zyp = shutil.which("zypper")
+
+        def run(cmd, fatal=True):
+            r = self._run(cmd)
+            if r.returncode != 0 and fatal:
+                raise InstallError("package install failed: " + " ".join(cmd) +
+                                   "\n" + (r.stderr or ""))
+            return r.returncode
+
+        if apt:
+            run(["dpkg", "--add-architecture", "i386"])
+            run(["apt-get", "update"])
+            run(["apt-get", "install", "-y", "libc6:i386"])
+            # libxt6 was renamed libxt6t64 on Ubuntu 24.04+/Debian 13 (time_t)
+            if run(["apt-get", "install", "-y",
+                    "libx11-6:i386", "libxpm4:i386", "libxt6:i386"], fatal=False) != 0:
+                run(["apt-get", "install", "-y",
+                     "libx11-6:i386", "libxpm4:i386", "libxt6t64:i386"])
+            return ["installed 32-bit runtime via apt (libc6 + libX11/libXpm/libXt)"]
+        if dnf:
+            run(["dnf", "install", "-y", "glibc.i686",
+                 "libX11.i686", "libXpm.i686", "libXt.i686"])
+            return ["installed 32-bit runtime via dnf"]
+        if pac:
+            run(["pacman", "-S", "--needed", "--noconfirm",
+                 "lib32-glibc", "lib32-libx11", "lib32-libxpm", "lib32-libxt"])
+            return ["installed 32-bit runtime via pacman (needs [multilib] enabled)"]
+        if zyp:
+            run(["zypper", "--non-interactive", "install", "glibc-32bit",
+                 "libX11-6-32bit", "libXpm4-32bit", "libXt6-32bit"])
+            return ["installed 32-bit runtime via zypper"]
+        raise InstallError("no supported package manager (apt/dnf/pacman/zypper) found; "
+                           "install the 32-bit libs manually (see the README)")
+
     # ---- step 1: prerequisites ------------------------------------------
     def prereqs(self) -> list[str]:
         log = []
+        if self.install_deps:
+            log += self._install_deps()
         if not (self.media / "shared/ship").is_file():
             raise InstallError(f"install media not found (no shared/ship) at {self.media}")
         if not (self.media / "linux/bin").is_dir():
@@ -773,6 +820,8 @@ exec "$ROOT/wpbin/xwp" "$@"
     # ---- .deb (suite) install path --------------------------------------
     def prereqs_deb(self) -> list[str]:
         log = []
+        if self.install_deps:
+            log += self._install_deps()
         if not (self.media / "wpbin/xwp").is_file():
             raise InstallError(f"no WordPerfect tree (wpbin/xwp) at {self.media}")
         if not Path("/lib/ld-linux.so.2").exists():
@@ -899,6 +948,9 @@ def main(argv):
     ap.add_argument("--pick", type=int, metavar="N",
                     help="when several versions are found, install candidate N "
                          "(indices from --list)")
+    ap.add_argument("--install-deps", action="store_true",
+                    help="detect the package manager (apt/dnf/pacman/zypper) and "
+                         "install the 32-bit runtime libraries WP needs before installing")
     ap.add_argument("--no-launcher", action="store_true")
     ap.add_argument("--no-desktop", action="store_true",
                     help="do not add an application-menu entry")
@@ -973,7 +1025,8 @@ def main(argv):
             print(f"Installing: {chosen.label}\n  -> {target}")
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
-                         version=rm.version, source_kind=kind)
+                         version=rm.version, source_kind=kind,
+                         install_deps=a.install_deps)
             return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1

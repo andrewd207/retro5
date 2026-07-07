@@ -14,32 +14,85 @@
 # Idempotent and safe to re-run. Needs root (writes under the WP tree and into
 # the system 32-bit library dir).
 #
-#   sudo ./retro5-setup.sh [WP_ROOT]        # WP_ROOT defaults to /usr/lib/wp8
+#   sudo ./retro5-setup.sh [--install-deps] [WP_ROOT]   # WP_ROOT defaults to /usr/lib/wp8
+#
+# --install-deps detects the package manager (apt/dnf/pacman/zypper) and installs
+# the 32-bit runtime libraries WP needs — the i386 glibc plus the 32-bit X libs
+# (some bundled binaries link X even in the "static-X" editions) — then continues.
 #
 set -euo pipefail
 
-ROOT="${1:-/usr/lib/wp8}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIBDIR="/usr/lib/i386-linux-gnu"           # trusted dir the 32-bit loader searches
 XKDB_SYS="/usr/X11R6/lib/X11/XKeysymDB"    # the path WP's bundled libX11 hardcodes
 
 die(){ echo "error: $*" >&2; exit 1; }
+usage(){ cat <<U
+usage: sudo $0 [--install-deps] [WP_ROOT]
 
-[ "$(id -u)" = 0 ]        || die "run me with sudo (I write to $ROOT and $LIBDIR)"
+  --install-deps   detect the package manager (apt/dnf/pacman/zypper) and
+                   install the 32-bit runtime libraries WP needs, then convert.
+  WP_ROOT          WordPerfect tree to convert (default /usr/lib/wp8).
+U
+}
+
+INSTALL_DEPS=0
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --install-deps) INSTALL_DEPS=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "unknown option: $a (see --help)" ;;
+        *) ARGS+=("$a") ;;
+    esac
+done
+ROOT="${ARGS[0]:-/usr/lib/wp8}"
+
+# Install the 32-bit runtime: the i386 glibc (always) PLUS the 32-bit X libs.
+# The X libs are installed unconditionally because WP editions vary — the 8.0
+# build's xwp needs them, and in the other editions some bundled/helper binaries
+# link X dynamically (not everything is static-X). They're small and harmless.
+install_deps(){
+    echo "==> installing 32-bit runtime libraries (glibc + X libs)"
+    if command -v apt-get >/dev/null 2>&1; then
+        dpkg --add-architecture i386
+        apt-get update
+        apt-get install -y libc6:i386
+        # libxt6 was renamed libxt6t64 on Ubuntu 24.04+/Debian 13 (time_t transition)
+        apt-get install -y libx11-6:i386 libxpm4:i386 libxt6:i386 \
+          || apt-get install -y libx11-6:i386 libxpm4:i386 libxt6t64:i386
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y glibc.i686 libX11.i686 libXpm.i686 libXt.i686
+    elif command -v pacman >/dev/null 2>&1; then
+        grep -q '^\[multilib\]' /etc/pacman.conf 2>/dev/null \
+          || echo "note: if this fails, enable the [multilib] repo in /etc/pacman.conf first"
+        pacman -S --needed --noconfirm lib32-glibc lib32-libx11 lib32-libxpm lib32-libxt
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install glibc-32bit libX11-6-32bit libXpm4-32bit libXt6-32bit
+    else
+        die "no supported package manager (apt/dnf/pacman/zypper) found — install the 32-bit libs by hand (see README)"
+    fi
+    echo "==> 32-bit runtime libraries installed"; echo
+}
+
+[ "$(id -u)" = 0 ]         || die "run me with sudo (I write to $ROOT and $LIBDIR)"
+command -v python3 >/dev/null || die "python3 is required"
+[ -f "$HERE/retro5.so" ]   || die "retro5.so must sit next to this script"
+[ -f "$HERE/retarget.py" ] || die "retarget.py must sit next to this script"
+
+[ "$INSTALL_DEPS" = 1 ] && install_deps
+
 [ -d "$ROOT" ]            || die "WP root '$ROOT' not found — pass yours as the first argument"
 [ -e "$ROOT/wpbin/xwp" ] || die "'$ROOT/wpbin/xwp' missing — '$ROOT' doesn't look like a WP8 tree"
-[ -f "$HERE/retro5.so" ] || die "retro5.so must sit next to this script"
-[ -f "$HERE/retarget.py" ] || die "retarget.py must sit next to this script"
-command -v python3 >/dev/null || die "python3 is required"
 
 # 32-bit runtime check: retargeting points xwp at /lib/ld-linux.so.2, so WP needs
 # the i386 glibc. Warn early (with the fix) rather than let WP fail to launch.
 if [ ! -e /lib/ld-linux.so.2 ] && [ ! -e /lib/i386-linux-gnu/ld-linux.so.2 ]; then
     echo "warning: the 32-bit loader /lib/ld-linux.so.2 is not installed — WordPerfect"
-    echo "         will not start until you add the i386 glibc. On Debian/Ubuntu/Mint:"
+    echo "         will not start until you add the i386 glibc. Re-run me with"
+    echo "         --install-deps to do it automatically, or on Debian/Ubuntu/Mint:"
     echo "           sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386"
     echo "         (Fedora: glibc.i686 · Arch: lib32-glibc · openSUSE: glibc-32bit)"
-    echo "         The WP 8.0.0076 dynamic-X build also needs libx11-6/libxpm4/libxt6 :i386."
     echo "         See the README 'Requirements' section. Continuing the conversion anyway."
     echo
 fi

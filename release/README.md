@@ -40,9 +40,15 @@ Both apply the *same* set of fixes (below); they differ only in whether they
 For a tree already on disk (default root `/usr/lib/wp8`):
 
 ```bash
-sudo ./retro5-setup.sh                # defaults to /usr/lib/wp8
-sudo ./retro5-setup.sh /path/to/wp    # or point it at your tree
+sudo ./retro5-setup.sh                     # defaults to /usr/lib/wp8
+sudo ./retro5-setup.sh /path/to/wp         # or point it at your tree
+sudo ./retro5-setup.sh --install-deps      # also install the 32-bit runtime libs first
 ```
+
+With `--install-deps` it detects your package manager (apt / dnf / pacman /
+zypper), installs the 32-bit runtime libraries (the i386 glibc **and** the X
+libs — some bundled binaries link X even in the "static-X" editions), and then
+does the conversion.
 
 It is idempotent — safe to re-run (e.g. after dropping in a newer `retro5.so`).
 It does **not** install or download WordPerfect; it operates on the tree you
@@ -95,16 +101,17 @@ a freshly-retargeted `xwp` won't start (`No such file or directory` on the
 loader, or a silent exit). You also need `python3` for `retarget.py` / the
 installer, and root for the system-wide steps.
 
-**What's actually needed depends on the edition:**
+**Two tiers of 32-bit libraries:**
 
-| Edition | 32-bit libraries required |
+| Tier | 32-bit libraries |
 |---|---|
-| WP 8.1 (Corel `.deb`), wplinux8 — **static X** | `libc.so.6` **only** (bundles libm + the `ld-linux.so.2` loader) |
-| WP 8.0.0076 — **dynamic X** | the above **plus** `libX11.so.6`, `libXt.so.6`, `libXpm.so.4` |
+| **Required — always** | `libc.so.6` (32-bit glibc; it bundles `libm.so.6` and the `ld-linux.so.2` loader). This alone runs the core static-X editor. |
+| **Recommended — usually needed** | `libX11.so.6`, `libXt.so.6`, `libXpm.so.4`. The WP 8.0.0076 editor needs them, **and not every binary in the other editions is statically linked** — several bundled/helper programs pull the X libs dynamically, so most installs want these too. |
 
-If you don't know which you have, install the X libs too — they're small and
-harmless. Their own 32-bit dependencies (`libXext`, `libSM`, `libICE`, `libxcb`)
-are pulled in automatically.
+Install **both** tiers unless you're certain you only ever run the core static-X
+`xwp`. The X libs' own dependencies (`libXext`, `libSM`, `libICE`, `libxcb`) are
+pulled in automatically. Or just let the script do it: `retro5-setup.sh
+--install-deps` installs both tiers for you (detecting your package manager).
 
 ### Debian / Ubuntu / Linux Mint (and derivatives) — `apt`
 
