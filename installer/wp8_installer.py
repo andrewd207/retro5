@@ -9,10 +9,61 @@ The engine runs in a worker thread; steps stream back to the UI.
 
 Run:  python3 wp8_installer.py
 """
+import os
+import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
+
+
+def _ensure_gtk4():
+    """Bootstrap: this installer is a GTK4 app, so it needs python3-gi + GTK4 to
+    even draw a window — a chicken-and-egg when *those* are what's missing. If
+    they won't import, install them first, then re-exec ourselves. Elevation:
+    `sudo` when we have a terminal (tty) for the password prompt; otherwise (a
+    desktop-icon launch, no tty) go straight to `pkexec` for a graphical prompt.
+    A one-shot env flag prevents an install→reexec loop if it still fails."""
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk  # noqa: F401
+        return
+    except (ImportError, ValueError):
+        pass
+    if os.environ.get("_WP8_GTK_BOOTSTRAPPED"):
+        sys.stderr.write("error: GTK4 Python bindings still unavailable after "
+                         "install. Install manually: python3-gi + gir1.2-gtk-4.0 "
+                         "(Debian/Ubuntu), or python3-gobject + gtk4.\n")
+        sys.exit(1)
+    apt = shutil.which("apt-get"); dnf = shutil.which("dnf")
+    pac = shutil.which("pacman");  zyp = shutil.which("zypper")
+    if   apt: pkgs = ["apt-get", "install", "-y", "python3-gi", "gir1.2-gtk-4.0"]
+    elif dnf: pkgs = ["dnf", "install", "-y", "python3-gobject", "gtk4"]
+    elif pac: pkgs = ["pacman", "-S", "--needed", "--noconfirm", "python-gobject", "gtk4"]
+    elif zyp: pkgs = ["zypper", "--non-interactive", "install", "python3-gobject",
+                      "typelib-1_0-Gtk-4_0"]
+    else:
+        sys.stderr.write("error: GTK4 Python bindings missing and no supported "
+                         "package manager found (apt/dnf/pacman/zypper).\n")
+        sys.exit(1)
+    if os.geteuid() == 0:
+        elev = []
+    elif sys.stdin.isatty() and shutil.which("sudo"):
+        elev = ["sudo"]                       # terminal -> password prompt here
+    elif shutil.which("pkexec"):
+        elev = ["pkexec"]                     # no tty (desktop launch) -> graphical
+    else:
+        elev = []
+    sys.stderr.write("This installer needs GTK4; installing it now…\n")
+    if subprocess.run(elev + pkgs).returncode != 0:
+        sys.stderr.write("error: could not install the GTK4 packages.\n")
+        sys.exit(1)
+    os.execve(sys.executable, [sys.executable] + sys.argv,
+              dict(os.environ, _WP8_GTK_BOOTSTRAPPED="1"))
+
+
+_ensure_gtk4()
 
 import gi
 gi.require_version("Gtk", "4.0")
