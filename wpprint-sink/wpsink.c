@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     /* No explicit destination? adopt the one `wpselect` recorded ($WPCOM/wpsink.dest). */
     static char destbuf[128];
     if (!spool_cmd && !dst.device) {
-        char cfg[256], dir[256]; wp_rendezvous_dir(dir, sizeof dir);
+        char cfg[288], dir[256]; wp_rendezvous_dir(dir, sizeof dir);
         snprintf(cfg, sizeof cfg, "%s/wpsink.dest", dir);
         FILE *cf = fopen(cfg, "r");
         if (cf && fgets(destbuf, sizeof destbuf, cf)) {
