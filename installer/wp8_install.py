@@ -232,14 +232,24 @@ class Engine:
         log = []
         log += self._guard_target()          # bail before touching anything
         if self.install_deps:
-            log += self._install_deps()
+            # a package-install failure (no network, held package, …) must NOT
+            # abort the whole install — the tree install + retarget don't need
+            # the packages; WP just won't run/print until they're added. Warn.
+            try:
+                log += self._install_deps()
+            except InstallError as e:
+                log.append(f"WARNING: could not install dependencies ({e}); "
+                           "continuing — install them by hand to run WordPerfect.")
         if not (self.media / "shared/ship").is_file():
             raise InstallError(f"install media not found (no shared/ship) at {self.media}")
         if not (self.media / "linux/bin").is_dir():
             raise InstallError(f"install media incomplete (no linux/ tree) at {self.media}")
         if not Path("/lib/ld-linux.so.2").exists():
-            raise InstallError("32-bit loader /lib/ld-linux.so.2 missing "
-                               "(install libc6:i386)")
+            # needed to *run* WP, not to install it — warn, don't abort.
+            log.append("WARNING: the 32-bit loader /lib/ld-linux.so.2 is missing — "
+                       "WordPerfect won't start until you install it (Debian/Ubuntu: "
+                       "sudo dpkg --add-architecture i386 && sudo apt install libc6:i386). "
+                       "Installing the tree anyway.")
         # printing needs lp/lpr on PATH (WP's xwpdest execs them). Soft-warn — a
         # fresh/headless box often lacks the CUPS client; without it WP installs
         # and runs fine but can't print. --install-deps installs these for you.

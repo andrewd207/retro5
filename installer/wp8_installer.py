@@ -89,6 +89,7 @@ class Installer(Gtk.Application):
         super().__init__(application_id="com.wp8.installer",
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.uninstall_mode = uninstall_mode
+        self._log = []                        # captured output for the done/failure page
 
     def do_activate(self):
         prov = Gtk.CssProvider(); prov.load_from_data(CSS)
@@ -180,6 +181,7 @@ class Installer(Gtk.Application):
             return
         if idx != 1:
             return
+        self._log = []
         self.stack.set_visible_child_name("progress")
         threading.Thread(target=self._uninstall_worker,
                          args=(target, self._is_system_path(target)), daemon=True).start()
@@ -419,6 +421,7 @@ class Installer(Gtk.Application):
         self._launch_install(chosen, target, overwrite=True)
 
     def _launch_install(self, chosen, target, overwrite):
+        self._log = []                        # fresh capture for this run
         self.stack.set_visible_child_name("progress")
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
@@ -502,12 +505,18 @@ class Installer(Gtk.Application):
         # latest raw output (esp. the long, otherwise-silent apt phase) -> keeps
         # it visibly alive so the user never thinks it failed.
         self.activity.set_text(line)
+        self._log.append(line)                # keep for the failure report
         return False
 
     def _on_step(self, step):
         self.activity.set_text("")            # a step boundary clears the activity line
         self.bar.set_fraction(step.fraction)
         self.bar.set_text(f"{int(step.fraction*100)}%  –  {step.title}")
+        self._log.append(("OK  " if step.ok else "FAIL ") + step.title)
+        for l in step.log:
+            self._log.append("    " + l)
+        if step.detail:
+            self._log.append("    ! " + step.detail)
         row = Gtk.Box(spacing=8); row.add_css_class("steprow")
         icon = Gtk.Label(label="✓" if step.ok else "✗")
         icon.add_css_class("ok" if step.ok else "fail")
@@ -548,7 +557,10 @@ class Installer(Gtk.Application):
         else:
             self.done_title.set_text("Installation failed")
             self.done_title.add_css_class("fail")
-            self.done_body.set_text("See the steps above for the error.")
+            self.done_body.set_text("The installer did not finish. The full log is "
+                                    "below — the last lines usually name the cause.")
+            # show the captured output so the failure is never invisible
+            self.done_log.set_text("\n".join(self._log[-200:]) or "(no output captured)")
             self.launch_btn.set_visible(False)
         self.stack.set_visible_child_name("done")
         return False
