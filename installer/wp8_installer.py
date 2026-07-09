@@ -167,10 +167,11 @@ class Installer(Gtk.Application):
     def _start_uninstall(self, target):
         dlg = Gtk.AlertDialog()
         dlg.set_message(f"Uninstall WordPerfect 8 from {target}?")
-        dlg.set_detail("Removes the install tree, its launcher and menu entry. Your "
-                       "~/.wprc profile and your documents are kept."
+        dlg.set_detail("Removes the install tree, its launcher and menu entry. "
+                       "“Uninstall” keeps your ~/.wprc settings + documents; "
+                       "“…and settings” also deletes ~/.wprc."
                        + ("\n\nThis needs your admin password." if self._is_system_path(target) else ""))
-        dlg.set_buttons(["Cancel", "Uninstall"])
+        dlg.set_buttons(["Cancel", "Uninstall", "…and settings"])
         dlg.set_cancel_button(0); dlg.set_default_button(1)
         dlg.choose(self.win, None, self._on_uninstall_confirm, target)
 
@@ -179,20 +180,23 @@ class Installer(Gtk.Application):
             idx = dlg.choose_finish(res)
         except Exception:  # noqa - dismissed
             return
-        if idx != 1:
+        if idx not in (1, 2):            # 0/dismissed = Cancel
             return
         self._log = []
         self.stack.set_visible_child_name("progress")
         threading.Thread(target=self._uninstall_worker,
-                         args=(target, self._is_system_path(target)), daemon=True).start()
+                         args=(target, self._is_system_path(target), idx == 2),
+                         daemon=True).start()
 
-    def _uninstall_worker(self, target, system):
+    def _uninstall_worker(self, target, system, remove_profile=False):
         if system:
             GLib.idle_add(self._on_step,
                           Step("elevate", "Requesting admin access (pkexec)...", 0.1, ok=True))
             engine_py = str(Path(__file__).with_name("wp8_install.py"))
-            p = subprocess.run(["pkexec", sys.executable, engine_py, "--uninstall", str(target)],
-                               capture_output=True, text=True)
+            cmd = ["pkexec", sys.executable, engine_py, "--uninstall", str(target)]
+            if remove_profile:
+                cmd.append("--remove-profile")
+            p = subprocess.run(cmd, capture_output=True, text=True)
             log = [l.strip() for l in p.stdout.splitlines() if l.strip()]
             ok = (p.returncode == 0)
             GLib.idle_add(self._on_step, Step(
@@ -201,7 +205,7 @@ class Installer(Gtk.Application):
         else:
             eng = Engine(Path(target), target=Path(target))   # media unused for uninstall
             try:
-                log = eng.uninstall(Path(target))
+                log = eng.uninstall(Path(target), remove_profile=remove_profile)
                 GLib.idle_add(self._on_step, Step("uninstall", "Uninstalled", 1.0, ok=True, log=log))
                 ok = True
             except Exception as e:  # noqa
@@ -246,6 +250,20 @@ class Installer(Gtk.Application):
             label="Install for all users (system-wide — asks for your admin password)")
         self.system_chk.connect("toggled", self._on_system_toggled)
         b.append(self.system_chk)
+        self.deps_chk = Gtk.CheckButton(
+            label="Install required packages (32-bit libs, CUPS, menu fonts)", active=True)
+        self.deps_chk.set_tooltip_text(
+            "WordPerfect needs 32-bit runtime libraries; printing needs the CUPS "
+            "client and the menus need X fonts. Installs them with your admin "
+            "password. Uncheck if you'll install them yourself.")
+        b.append(self.deps_chk)
+        self.repair_chk = Gtk.CheckButton(
+            label="Repair only — re-add fonts/drivers/config to the tree above (keep binaries)")
+        self.repair_chk.set_tooltip_text(
+            "Runs the finishing steps (font/data archives, printer drivers, valid "
+            ".wpc.admin, permissions) on the existing install at “Install to”, "
+            "using the media, without reinstalling the binaries. Same as --complete.")
+        b.append(self.repair_chk)
         self.opt_status = Gtk.Label(xalign=0, wrap=True); self.opt_status.add_css_class("subtitle")
         b.append(self.opt_status)
         b.append(Gtk.Box(vexpand=True))
@@ -426,11 +444,23 @@ class Installer(Gtk.Application):
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
                          args=(chosen, target, self.system_chk.get_active(),
-                               self.launcher_chk.get_active(), make_desktop, overwrite),
+                               self.launcher_chk.get_active(), make_desktop, overwrite,
+                               self.deps_chk.get_active(), self.repair_chk.get_active()),
                          daemon=True).start()
 
-    def _worker(self, chosen, target, system, make_launcher, make_desktop, overwrite=False):
+    def _worker(self, chosen, target, system, make_launcher, make_desktop,
+                overwrite=False, deps=True, repair=False):
         ok = True; stats = {}
+        engine_py = str(Path(__file__).with_name("wp8_install.py"))
+        # user (non-system) install + deps: elevate JUST the packages via pkexec
+        # (--deps-only), then install the tree unprivileged into ~/.local.
+        if deps and not system:
+            GLib.idle_add(self._on_step,
+                          Step("deps", "Installing required packages (admin password)…", 0.02, ok=True))
+            self._stream_cmd(["pkexec", sys.executable, engine_py, "--deps-only"])
+        if repair:
+            self._do_repair(chosen, target, system, engine_py)
+            return
         if system:
             # System-wide: elevate the WHOLE install with pkexec (desktop-standard
             # polkit prompt). As root it installs the tree to /opt AND a system
@@ -441,7 +471,9 @@ class Installer(Gtk.Application):
             engine_py = str(Path(__file__).with_name("wp8_install.py"))
             # the elevated CLI does its own discovery/resolution of this exact path
             cmd = ["pkexec", sys.executable, engine_py, "--media", str(chosen.path),
-                   "--target", str(target), "--install-deps"]
+                   "--target", str(target)]
+            if deps:
+                cmd.append("--install-deps")
             if overwrite:
                 cmd.append("--overwrite")
             if not make_launcher:
@@ -469,21 +501,20 @@ class Installer(Gtk.Application):
                 ok = False
         GLib.idle_add(self._on_finish, ok, stats, target)
 
-    def _stream_elevated(self, cmd, target):
-        """Run the elevated install and stream its output LIVE, so the long,
-        otherwise-silent phases (package install, tree decompress) show progress
-        instead of a frozen bar that looks failed. Parses the CLI's
-        `[OK ] NN%  Title` step lines into the progress bar + step rows; every
-        other line (apt output, etc.) updates the 'current activity' label."""
+    def _stream_cmd(self, cmd):
+        """Run a subprocess and stream its output LIVE so long, otherwise-silent
+        phases (package install, tree decompress) show progress instead of a
+        frozen bar that looks failed. Parses the CLI's `[OK ] NN%  Title` step
+        lines into the progress bar + step rows; every other line (apt output,
+        etc.) updates the 'current activity' label. Returns the exit code (-1 on
+        spawn failure)."""
         import re
-        GLib.idle_add(self._on_step,
-                      Step("elevate", "Requesting admin access (pkexec)…", 0.02, ok=True))
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
         except Exception as e:  # noqa
-            GLib.idle_add(self._on_step, Step("elevate", "pkexec failed", 0.1, ok=False, detail=str(e)))
-            GLib.idle_add(self._on_finish, False, {}, target); return
+            GLib.idle_add(self._on_status_line, f"could not run: {e}")
+            return -1
         step_re = re.compile(r"^\[(OK |FAIL)\]\s+(\d+)%\s+(.*)$")
         for line in p.stdout:
             line = line.rstrip("\n")
@@ -495,7 +526,39 @@ class Installer(Gtk.Application):
                               int(m.group(2)) / 100.0, ok=(m.group(1).strip() == "OK")))
             else:
                 GLib.idle_add(self._on_status_line, line.strip())
-        ok = (p.wait() == 0)
+        return p.wait()
+
+    def _do_repair(self, chosen, target, system, engine_py):
+        """Repair an existing install (fonts/drivers/config) from media — the
+        GUI face of --complete. System roots go through pkexec."""
+        GLib.idle_add(self._on_step,
+                      Step("repair", "Repairing install (fonts / drivers / config)…", 0.15, ok=True))
+        if system:
+            cmd = ["pkexec", sys.executable, engine_py,
+                   "--media", str(chosen.path), "--complete", str(target)]
+            ok = (self._stream_cmd(cmd) == 0)
+        else:
+            ok = True
+            try:
+                with mediamod.resolve(chosen.path) as rm:
+                    kind = "deb" if rm.kind == mediamod.DEB else "native"
+                    eng = Engine(rm.root, target, version=rm.version, source_kind=kind)
+                    for line in eng.complete(target):
+                        GLib.idle_add(self._on_status_line, line)
+                        self._log.append(line)
+            except Exception as e:  # noqa
+                GLib.idle_add(self._on_step, Step("repair", "Repair failed", 1.0,
+                                                  ok=False, detail=str(e)))
+                ok = False
+        GLib.idle_add(self._on_step, Step(
+            "done", "Repair complete" if ok else "Repair failed", 1.0, ok=ok))
+        GLib.idle_add(self._on_finish, ok, {"repaired": str(target)}, target)
+
+    def _stream_elevated(self, cmd, target):
+        """The system install: stream the elevated CLI and then finish."""
+        GLib.idle_add(self._on_step,
+                      Step("elevate", "Requesting admin access (pkexec)…", 0.02, ok=True))
+        ok = (self._stream_cmd(cmd) == 0)
         GLib.idle_add(self._on_step, Step(
             "done", "System-wide install complete" if ok else "System install failed",
             1.0, ok=ok, detail="" if ok else "cancelled/denied, or see the activity above"))

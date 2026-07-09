@@ -797,7 +797,10 @@ export XLOCALEDIR=/usr/share/X11/locale
 export WPIPEDELAY=60
 : "${{DISPLAY:=:0}}"; export DISPLAY
 # NB: do NOT set WPLANG (sends xwp down a broken admintxt path)
-exec "$ROOT/wpbin/xwp" "$@"
+# Bigger menus: WP's default Motif font is a tiny 8pt helvetica (unreadable on
+# modern high-res displays). -fontSize scales the whole UI; default to a
+# readable 17, override with $WPFONTSIZE (or pass your own -fontSize after).
+exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
 """
 
     def launcher(self):
@@ -1197,6 +1200,10 @@ def main(argv):
     ap.add_argument("--install-deps", action="store_true",
                     help="detect the package manager (apt/dnf/pacman/zypper) and "
                          "install the 32-bit runtime libraries WP needs before installing")
+    ap.add_argument("--deps-only", action="store_true",
+                    help="just install the runtime dependencies (32-bit libs, CUPS "
+                         "client, X fonts) and exit; needs root (the GUI elevates this "
+                         "for a user install)")
     ap.add_argument("--overwrite", action="store_true",
                     help="install even if --target already exists and is "
                          "non-empty (replaces name-colliding files in place, no "
@@ -1221,10 +1228,21 @@ def main(argv):
                     help="with --uninstall, also delete ~/.wprc")
     a = ap.parse_args(argv)
 
+    # --- deps-only: install the runtime packages and exit (no media needed) ---
+    if a.deps_only:
+        try:
+            for line in Engine(Path("."), Path("."))._install_deps():
+                print(f"  - {line}")
+            return 0
+        except InstallError as e:
+            print(f"FAIL: {e}"); return 1
+
     # --- repair / uninstall operate on an installed ROOT, no media needed ---
     if a.complete:
         try:
-            eng = Engine(a.complete, a.target or DEFAULT_TARGET)
+            # media = --media if given (needed for the font/data archives), else
+            # assume the root is itself a native media tree.
+            eng = Engine(a.media or a.complete, a.complete)
             for line in eng.complete(a.complete):
                 print(f"  - {line}")
             print(f"\nCompleted {a.complete}.")
