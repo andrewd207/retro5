@@ -393,6 +393,14 @@ class Engine:
                 continue
 
             dst = dstdir / nam2
+            # unlink an existing dst first so a reinstall can replace a file that
+            # is currently executing (a wpexc/xwp still running from a prior
+            # session) without ETXTBSY; copyfile/wpdecom then write a fresh file.
+            try:
+                if dst.exists():
+                    dst.unlink()
+            except OSError:
+                pass
             # .drs/.lrs and standalone Type1 fonts are read by WP in native
             # form - ship verbatim, never decompress.
             if nam2.endswith((".drs", ".lrs", ".pfb", ".afm")):
@@ -1048,17 +1056,35 @@ exec "$ROOT/wpbin/xwp" "$@"
         log.append(f"shim: {self.retro5}")
         return log
 
+    @staticmethod
+    def _replace_copy(src, dst, *, follow_symlinks=True):
+        """copy2 that UNLINKS an existing dst first, so replacing a file that is
+        currently *executing* — a wpexc/xwp still running from a prior session —
+        works instead of failing with ETXTBSY ("Text file busy"). The running
+        process keeps the old inode; we write a fresh file. (This is how package
+        managers replace live binaries.) Used on --overwrite reinstalls."""
+        try:
+            if os.path.lexists(dst):
+                os.unlink(dst)
+        except OSError:
+            pass
+        shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+        return dst
+
     def install_tree_deb(self) -> list[str]:
         # a .deb already holds an installed, uncompressed tree (binaries, .drs in
-        # runtime form, fonts) — just copy it into the versioned target.
+        # runtime form, fonts) — just copy it into the versioned target. Use
+        # unlink-first copies so a reinstall over a tree with a live wpexc/xwp
+        # doesn't fail with "Text file busy".
         self.target.mkdir(parents=True, exist_ok=True)
         n = 0
         for item in sorted(self.media.iterdir()):
             dst = self.target / item.name
             if item.is_dir():
-                shutil.copytree(item, dst, dirs_exist_ok=True)
+                shutil.copytree(item, dst, dirs_exist_ok=True,
+                                copy_function=self._replace_copy)
             else:
-                shutil.copy2(item, dst)
+                self._replace_copy(item, dst)
             n += 1
         # drop the bundled ancient libc5/libm5 — the retarget points every binary
         # at retro5.so + glibc, so these would only be a foot-gun if ever found.
