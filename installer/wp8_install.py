@@ -33,6 +33,14 @@ TOOLING        = Path(__file__).resolve().parent.parent      # repo root
 # side-by-side installs live under a base dir + a version subdir (8.0 / 8.1)
 DEFAULT_BASE   = Path.home() / ".local/share/wordperfect"
 DEFAULT_TARGET = Path.home() / ".local/share/wordperfect8"   # engine fallback
+GLOBAL_BASE    = Path("/opt/wordperfect")                    # global install base (run as root)
+
+
+def default_base():
+    """Where side-by-side installs go when no --target is given. Run as root we
+    install GLOBALLY under /opt (usable by every user, world-readable, system
+    launcher) instead of hiding it in /root/.local; otherwise per-user ~/.local."""
+    return GLOBAL_BASE if os.geteuid() == 0 else DEFAULT_BASE
 
 # morpher typing-crash patch: NOP the dead OOB `call strcpy` in mor_read_entry
 # (the unguarded `byte & 0x7f` index into the 43-entry particle table). Each
@@ -1209,8 +1217,10 @@ def main(argv):
 
     try:
         with media.resolve(chosen.path) as rm:
-            target = Path(a.target) if a.target else DEFAULT_BASE / rm.version
+            target = Path(a.target) if a.target else default_base() / rm.version
             kind = "deb" if rm.kind == media.DEB else "native"
+            if not a.target and os.geteuid() == 0:
+                print("running as root — installing globally (world-readable):")
             print(f"Installing: {chosen.label}\n  -> {target}")
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
