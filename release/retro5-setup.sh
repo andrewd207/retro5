@@ -55,6 +55,8 @@ ROOT="${ROOT:-/usr/lib/wp8}"
 # link X dynamically (not everything is static-X). They're small and harmless.
 install_deps(){
     echo "==> installing 32-bit runtime libraries (glibc + X libs)"
+    # Printing: WP's xwpdest execs lp/lpr, so also pull the CUPS client tools
+    # (native, not i386) — a fresh/headless box has nothing to print to otherwise.
     if command -v apt-get >/dev/null 2>&1; then
         dpkg --add-architecture i386
         apt-get update
@@ -62,14 +64,18 @@ install_deps(){
         # libxt6 was renamed libxt6t64 on Ubuntu 24.04+/Debian 13 (time_t transition)
         apt-get install -y libx11-6:i386 libxpm4:i386 libxt6:i386 \
           || apt-get install -y libx11-6:i386 libxpm4:i386 libxt6t64:i386
+        apt-get install -y cups-bsd cups-client || true
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y glibc.i686 libX11.i686 libXpm.i686 libXt.i686
+        dnf install -y cups-client || true
     elif command -v pacman >/dev/null 2>&1; then
         grep -q '^\[multilib\]' /etc/pacman.conf 2>/dev/null \
           || echo "note: if this fails, enable the [multilib] repo in /etc/pacman.conf first"
         pacman -S --needed --noconfirm lib32-glibc lib32-libx11 lib32-libxpm lib32-libxt
+        pacman -S --needed --noconfirm cups || true
     elif command -v zypper >/dev/null 2>&1; then
         zypper --non-interactive install glibc-32bit libX11-6-32bit libXpm4-32bit libXt6-32bit
+        zypper --non-interactive install cups-client || true
     else
         die "no supported package manager (apt/dnf/pacman/zypper) found — install the 32-bit libs by hand (see README)"
     fi
@@ -95,6 +101,15 @@ if [ ! -e /lib/ld-linux.so.2 ] && [ ! -e /lib/i386-linux-gnu/ld-linux.so.2 ]; th
     echo "           sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386"
     echo "         (Fedora: glibc.i686 · Arch: lib32-glibc · openSUSE: glibc-32bit)"
     echo "         See the README 'Requirements' section. Continuing the conversion anyway."
+    echo
+fi
+
+# Printing check: WP's xwpdest execs lp/lpr. A fresh/headless box often lacks the
+# CUPS client, so WP runs but can't print. Soft-warn with the fix.
+if ! command -v lp >/dev/null 2>&1 && ! command -v lpr >/dev/null 2>&1; then
+    echo "note: no 'lp'/'lpr' found — WordPerfect can't print until a CUPS client is"
+    echo "      installed (Debian/Ubuntu: cups-bsd cups-client · Fedora/openSUSE:"
+    echo "      cups-client · Arch: cups), or re-run with --install-deps."
     echo
 fi
 

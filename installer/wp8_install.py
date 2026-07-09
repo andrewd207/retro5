@@ -181,19 +181,26 @@ class Engine:
                     "libx11-6:i386", "libxpm4:i386", "libxt6:i386"], fatal=False) != 0:
                 run(["apt-get", "install", "-y",
                      "libx11-6:i386", "libxpm4:i386", "libxt6t64:i386"])
-            return ["installed 32-bit runtime via apt (libc6 + libX11/libXpm/libXt)"]
+            # printing: xwpdest execs lp/lpr, so a fresh box (esp. a headless VM)
+            # needs the CUPS client tools or WP has nothing to spool to. Native,
+            # not i386. Non-fatal — don't abort a WP install over the print client.
+            run(["apt-get", "install", "-y", "cups-bsd", "cups-client"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client lp/lpr via apt"]
         if dnf:
             run(["dnf", "install", "-y", "glibc.i686",
                  "libX11.i686", "libXpm.i686", "libXt.i686"])
-            return ["installed 32-bit runtime via dnf"]
+            run(["dnf", "install", "-y", "cups-client"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client via dnf"]
         if pac:
             run(["pacman", "-S", "--needed", "--noconfirm",
                  "lib32-glibc", "lib32-libx11", "lib32-libxpm", "lib32-libxt"])
-            return ["installed 32-bit runtime via pacman (needs [multilib] enabled)"]
+            run(["pacman", "-S", "--needed", "--noconfirm", "cups"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client via pacman (needs [multilib])"]
         if zyp:
             run(["zypper", "--non-interactive", "install", "glibc-32bit",
                  "libX11-6-32bit", "libXpm4-32bit", "libXt6-32bit"])
-            return ["installed 32-bit runtime via zypper"]
+            run(["zypper", "--non-interactive", "install", "cups-client"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client via zypper"]
         raise InstallError("no supported package manager (apt/dnf/pacman/zypper) found; "
                            "install the 32-bit libs manually (see the README)")
 
@@ -210,6 +217,14 @@ class Engine:
         if not Path("/lib/ld-linux.so.2").exists():
             raise InstallError("32-bit loader /lib/ld-linux.so.2 missing "
                                "(install libc6:i386)")
+        # printing needs lp/lpr on PATH (WP's xwpdest execs them). Soft-warn — a
+        # fresh/headless box often lacks the CUPS client; without it WP installs
+        # and runs fine but can't print. --install-deps installs these for you.
+        if not (shutil.which("lp") or shutil.which("lpr")):
+            log.append("note: no 'lp'/'lpr' found — WordPerfect can't print until a "
+                       "CUPS client is installed (Debian/Ubuntu: cups-bsd cups-client; "
+                       "Fedora/openSUSE: cups-client; Arch: cups). Or re-run with "
+                       "--install-deps.")
         # build wpdecom2 if needed
         if not (self.wpdecom.exists() and os.access(self.wpdecom, os.X_OK)):
             if not shutil.which("gcc"):
