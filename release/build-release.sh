@@ -33,6 +33,13 @@ install -m0644 "$HERE/README.md"           "$STAGE/README.md"
 install -m0644 "$REPO/LICENSE"             "$STAGE/LICENSE"
 # approach B: the full installer, verbatim
 cp -r "$REPO/installer/." "$STAGE/installer/"
+# ...plus the tooling the installer's Engine resolves relative to the bundle
+# root (TOOLING = installer/../): the ship-archive decompressor source it
+# compiles with gcc, and the shim at the path self.compat expects. Without
+# these, wp8_install.py dies at prereqs with "decompressor source missing:
+# .../tools/wpdecom2.c" and then "retro5.so not found and cannot build it".
+install -Dm0644 "$REPO/tools/wpdecom2.c"   "$STAGE/tools/wpdecom2.c"
+install -Dm0644 "$REPO/retro5/retro5.so"   "$STAGE/retro5/retro5.so"
 find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
 echo "== packaging =="
