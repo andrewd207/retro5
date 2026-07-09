@@ -285,14 +285,40 @@ class Installer(Gtk.Application):
             self.opt_status.set_text("⚠  Choose a version to install.")
             return
         chosen = self._candidates[idx]
+        # Don't silently overwrite an existing tree — ask first (the CLI would
+        # refuse without --overwrite; the GUI turns that into a question).
+        if target.exists() and target.is_dir() and any(target.iterdir()):
+            dlg = Gtk.AlertDialog()
+            dlg.set_message(f"An install already exists at {target}")
+            dlg.set_detail("Installing over it replaces files with the same names "
+                           "in place — there is no backup. Your ~/.wprc profile and "
+                           "documents are not touched.\n\nOverwrite it, or cancel and "
+                           "pick a different location?")
+            dlg.set_buttons(["Cancel", "Overwrite"])
+            dlg.set_cancel_button(0); dlg.set_default_button(0)
+            dlg.choose(self.win, None, self._on_overwrite_confirm, chosen)
+            return
+        self._launch_install(chosen, target, overwrite=False)
+
+    def _on_overwrite_confirm(self, dlg, res, chosen):
+        try:
+            idx = dlg.choose_finish(res)
+        except Exception:  # noqa - dismissed
+            return
+        if idx != 1:                       # Cancel / dismissed -> stay on options
+            return
+        target = Path(self.target_entry.get_text().strip())
+        self._launch_install(chosen, target, overwrite=True)
+
+    def _launch_install(self, chosen, target, overwrite):
         self.stack.set_visible_child_name("progress")
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
                          args=(chosen, target, self.system_chk.get_active(),
-                               self.launcher_chk.get_active(), make_desktop),
+                               self.launcher_chk.get_active(), make_desktop, overwrite),
                          daemon=True).start()
 
-    def _worker(self, chosen, target, system, make_launcher, make_desktop):
+    def _worker(self, chosen, target, system, make_launcher, make_desktop, overwrite=False):
         ok = True; stats = {}
         if system:
             # System-wide: elevate the WHOLE install with pkexec (desktop-standard
@@ -305,6 +331,8 @@ class Installer(Gtk.Application):
             # the elevated CLI does its own discovery/resolution of this exact path
             cmd = ["pkexec", sys.executable, engine_py, "--media", str(chosen.path),
                    "--target", str(target)]
+            if overwrite:
+                cmd.append("--overwrite")
             if not make_launcher:
                 cmd.append("--no-launcher")
             if not make_desktop:
@@ -328,7 +356,8 @@ class Installer(Gtk.Application):
                     kind = "deb" if rm.kind == mediamod.DEB else "native"
                     eng = Engine(rm.root, target, make_launcher=make_launcher,
                                  make_desktop=make_desktop,
-                                 version=rm.version, source_kind=kind)
+                                 version=rm.version, source_kind=kind,
+                                 overwrite=overwrite)
                     for step in eng.run():
                         GLib.idle_add(self._on_step, step)
                         stats = eng.stats
