@@ -89,13 +89,14 @@ class Engine:
                  make_launcher: bool = True, make_desktop: bool = True,
                  tree_only: bool = False, tooling: Path = TOOLING,
                  version: str = "8", source_kind: str = "native",
-                 install_deps: bool = False):
+                 install_deps: bool = False, overwrite: bool = False):
         self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
         self.version = str(version)         # "8.0" / "8.1" — side-by-side installs
         self.source_kind = source_kind      # "native" (ship manifest) or "deb"
         self.install_deps = install_deps    # --install-deps: pull the 32-bit runtime
+        self.overwrite = overwrite          # --overwrite: install over an existing tree
         self.compat = self.tooling / "retro5"           # shim source (this repo)
         self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
         self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
@@ -122,6 +123,36 @@ class Engine:
             return h[:4] == b"\x7fELF" and h[4] == 1
         except Exception:
             return False
+
+    # ---- safety guard: don't clobber an existing install ----------------
+    def _guard_target(self) -> list[str]:
+        """Refuse to install onto an existing non-empty target unless
+        --overwrite. A fresh install writes files in place with no backup, so
+        pointing it at an install you already have (or any populated dir) would
+        silently overwrite name-collisions. --complete/--uninstall never call
+        this. Returns a one-line warning when --overwrite bypasses the guard."""
+        t = self.target
+        if not t.exists():
+            return []
+        if not self.overwrite:
+            if t.is_dir():
+                if not any(t.iterdir()):
+                    return []                       # empty dir is fine
+                what = "directory already exists and is not empty"
+            else:
+                what = "path already exists and is not a directory"
+            raise InstallError(
+                f"target {what}: {t}\n"
+                "        Refusing to overwrite it (existing files would be "
+                "replaced in place, no backup).\n"
+                "        Re-run with --overwrite to install over it, or pass a "
+                "different --target.\n"
+                f"        To remove an old install cleanly first: --uninstall {t}")
+        # --overwrite: allowed, but say so loudly.
+        if t.is_dir() and any(t.iterdir()):
+            return [f"WARNING: --overwrite: installing over existing tree at {t} "
+                    "(files with the same names are replaced in place, no backup)"]
+        return []
 
     # ---- 32-bit runtime deps (optional, --install-deps) -----------------
     def _install_deps(self) -> list[str]:
@@ -169,6 +200,7 @@ class Engine:
     # ---- step 1: prerequisites ------------------------------------------
     def prereqs(self) -> list[str]:
         log = []
+        log += self._guard_target()          # bail before touching anything
         if self.install_deps:
             log += self._install_deps()
         if not (self.media / "shared/ship").is_file():
@@ -820,6 +852,7 @@ exec "$ROOT/wpbin/xwp" "$@"
     # ---- .deb (suite) install path --------------------------------------
     def prereqs_deb(self) -> list[str]:
         log = []
+        log += self._guard_target()          # bail before touching anything
         if self.install_deps:
             log += self._install_deps()
         if not (self.media / "wpbin/xwp").is_file():
@@ -951,6 +984,10 @@ def main(argv):
     ap.add_argument("--install-deps", action="store_true",
                     help="detect the package manager (apt/dnf/pacman/zypper) and "
                          "install the 32-bit runtime libraries WP needs before installing")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="install even if --target already exists and is "
+                         "non-empty (replaces name-colliding files in place, no "
+                         "backup); without it the install refuses and stops")
     ap.add_argument("--no-launcher", action="store_true")
     ap.add_argument("--no-desktop", action="store_true",
                     help="do not add an application-menu entry")
@@ -1026,7 +1063,7 @@ def main(argv):
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
                          version=rm.version, source_kind=kind,
-                         install_deps=a.install_deps)
+                         install_deps=a.install_deps, overwrite=a.overwrite)
             return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1

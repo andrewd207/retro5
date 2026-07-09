@@ -53,6 +53,10 @@ python3 wp8_install.py --media /path/to/wp8.iso --target ~/.local/share/wordperf
 # when several versions are found, pick one by its --list index
 python3 wp8_install.py --media "/path/to/ISO Images" --pick 3
 
+# by default the install STOPS if --target already exists and is non-empty
+# (it won't silently overwrite a tree). Pass --overwrite to install in place.
+python3 wp8_install.py --media /path/to/wp8.iso --target ~/wp8 --overwrite
+
 python3 wp8_install.py --complete /usr/wplinux                # repair an existing tree
 python3 wp8_install.py --tree-only --target /opt/wordperfect8 # root half of a system install
 python3 wp8_install.py --help
