@@ -28,6 +28,6 @@ echo
 # -f follow children (xwpdest/wpexc/xwppmgr); -yy annotate fds with the socket/
 # file they point at; -s 4096 -xx full byte dumps; trace only the IPC-bearing calls.
 exec strace -f -yy -s 4096 -xx -tt \
-    -e trace=socket,connect,bind,accept,accept4,listen,read,write,open,openat,unlink,mkfifo,execve \
+    -e trace=socket,connect,bind,accept,accept4,listen,read,write,open,openat,unlink,mknodat,execve \
     -o "$OUT" \
     "$LAUNCH"
