@@ -40,6 +40,17 @@ cp -r "$REPO/installer/." "$STAGE/installer/"
 # .../tools/wpdecom2.c" and then "retro5.so not found and cannot build it".
 install -Dm0644 "$REPO/tools/wpdecom2.c"   "$STAGE/tools/wpdecom2.c"
 install -Dm0644 "$REPO/retro5/retro5.so"   "$STAGE/retro5/retro5.so"
+# supplemental CUPS print system (opt-in --modern-print): source only, the
+# installer builds wpsink/wpselect at install time (like wpdecom2)
+if [ -d "$REPO/wpprint-sink" ]; then
+    mkdir -p "$STAGE/wpprint-sink"
+    for f in wpproto.h wpproto.c wpdest.h wpdest.c wpexec.h wpexec.c wpcups.h wpcups.c \
+             wpsink.c wpselect.c wpprinter-dialog.py xwpdest-dropin.sh Makefile README.md \
+             capture-print-traffic.sh install.sh tests.c; do
+        [ -f "$REPO/wpprint-sink/$f" ] && install -m0644 "$REPO/wpprint-sink/$f" "$STAGE/wpprint-sink/$f"
+    done
+    chmod 0755 "$STAGE/wpprint-sink"/*.sh "$STAGE/wpprint-sink/wpprinter-dialog.py" 2>/dev/null || true
+fi
 find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
 echo "== packaging =="

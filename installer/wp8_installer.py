@@ -188,6 +188,13 @@ class Installer(Gtk.Application):
             label="Install for all users (system-wide — asks for your admin password)")
         self.system_chk.connect("toggled", self._on_system_toggled)
         b.append(self.system_chk)
+        self.modern_chk = Gtk.CheckButton(
+            label="Modern printing via CUPS (experimental) — off by default", active=False)
+        self.modern_chk.set_tooltip_text(
+            "Adds a reversible drop-in so Print > Select opens a CUPS printer chooser. "
+            "Experimental: WordPerfect's print IPC is timing-sensitive, so the actual "
+            "spool path stays native. Needs python3-gi (GTK4) at runtime.")
+        b.append(self.modern_chk)
         self.opt_status = Gtk.Label(xalign=0, wrap=True); self.opt_status.add_css_class("subtitle")
         b.append(self.opt_status)
         b.append(Gtk.Box(vexpand=True))
@@ -315,10 +322,12 @@ class Installer(Gtk.Application):
         make_desktop = self.launcher_chk.get_active() and self.desktop_chk.get_active()
         threading.Thread(target=self._worker,
                          args=(chosen, target, self.system_chk.get_active(),
-                               self.launcher_chk.get_active(), make_desktop, overwrite),
+                               self.launcher_chk.get_active(), make_desktop, overwrite,
+                               self.modern_chk.get_active()),
                          daemon=True).start()
 
-    def _worker(self, chosen, target, system, make_launcher, make_desktop, overwrite=False):
+    def _worker(self, chosen, target, system, make_launcher, make_desktop,
+                overwrite=False, modern_print=False):
         ok = True; stats = {}
         if system:
             # System-wide: elevate the WHOLE install with pkexec (desktop-standard
@@ -333,6 +342,8 @@ class Installer(Gtk.Application):
                    "--target", str(target)]
             if overwrite:
                 cmd.append("--overwrite")
+            if modern_print:
+                cmd.append("--modern-print")
             if not make_launcher:
                 cmd.append("--no-launcher")
             if not make_desktop:
@@ -357,7 +368,7 @@ class Installer(Gtk.Application):
                     eng = Engine(rm.root, target, make_launcher=make_launcher,
                                  make_desktop=make_desktop,
                                  version=rm.version, source_kind=kind,
-                                 overwrite=overwrite)
+                                 overwrite=overwrite, modern_print=modern_print)
                     for step in eng.run():
                         GLib.idle_add(self._on_step, step)
                         stats = eng.stats

@@ -89,7 +89,8 @@ class Engine:
                  make_launcher: bool = True, make_desktop: bool = True,
                  tree_only: bool = False, tooling: Path = TOOLING,
                  version: str = "8", source_kind: str = "native",
-                 install_deps: bool = False, overwrite: bool = False):
+                 install_deps: bool = False, overwrite: bool = False,
+                 modern_print: bool = False):
         self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
@@ -97,6 +98,8 @@ class Engine:
         self.source_kind = source_kind      # "native" (ship manifest) or "deb"
         self.install_deps = install_deps    # --install-deps: pull the 32-bit runtime
         self.overwrite = overwrite          # --overwrite: install over an existing tree
+        self.modern_print = modern_print    # --modern-print: OPT-IN CUPS print drop-in
+        self.wpprint = self.tooling / "wpprint-sink"   # supplemental print system
         self.compat = self.tooling / "retro5"           # shim source (this repo)
         self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
         self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
@@ -989,6 +992,49 @@ exec "$ROOT/wpbin/xwp" "$@"
         return [f"copied WordPerfect {self.version} suite tree "
                 f"({n} entries) to {self.target}"]
 
+    # ---- optional: supplemental CUPS print system (--modern-print) ------
+    def modern_print_step(self):
+        """OPT-IN (default OFF): install the supplemental CUPS-backed print
+        system (wpprint-sink/) as a reversible drop-in over xwpdest.
+
+        EXPERIMENTAL. WordPerfect's print IPC is timing-sensitive, so this is
+        deliberately conservative: the drop-in intercepts ONLY the human-paced
+        printer-SELECT dialog and opens a CUPS chooser; the actual print/spool
+        path still runs WP's native xwpdest (kept as xwpdest.orig), which owns
+        the timing-critical socket IPC. Builds wpsink/wpselect with gcc (already
+        a prereq); the dialog needs python3-gi (GTK4) at runtime."""
+        if not self.modern_print:
+            return ["modern print: not enabled (default; --modern-print to opt in)"]
+        src, shbin = self.wpprint, self.target / "shbin10"
+        if not (src / "wpsink.c").is_file():
+            return [f"WARNING: --modern-print set but {src} not found; skipping"]
+        if not shbin.is_dir():
+            return ["WARNING: --modern-print: target has no shbin10; skipping"]
+        out = []
+        if shutil.which("make"):
+            self._run(["make", "-C", str(src), "wpsink", "wpselect"])
+        for f in ("wpsink", "wpselect"):
+            b = src / f
+            if b.exists():
+                shutil.copyfile(b, shbin / f); os.chmod(shbin / f, 0o755)
+        dlg = shbin / "wpprinter-dialog.py"
+        shutil.copyfile(src / "wpprinter-dialog.py", dlg); os.chmod(dlg, 0o755)
+        # swap xwpdest for the drop-in (back up the real one exactly once)
+        xd, orig = shbin / "xwpdest", shbin / "xwpdest.orig"
+        if xd.exists() and not orig.exists():
+            try: already = "retro5 modern-print drop-in" in xd.read_text(errors="replace")
+            except Exception: already = False
+            if not already:
+                shutil.move(str(xd), str(orig))
+                out.append("backed up original xwpdest -> xwpdest.orig")
+        shutil.copyfile(src / "xwpdest-dropin.sh", xd); os.chmod(xd, 0o755)
+        out.append("installed supplemental CUPS print system (EXPERIMENTAL): Print > "
+                   "Select opens the CUPS chooser; spool path stays native xwpdest")
+        if not (src / "wpsink").exists():
+            out.append("note: wpsink/wpselect not built (need gcc+make) — the dialog "
+                       "still works; the sink is for the future full-replacement path")
+        return out
+
     # ---- orchestration ---------------------------------------------------
     STEPS = [
         ("prereqs",        "Checking prerequisites",  0.05, "prereqs"),
@@ -1015,6 +1061,9 @@ exec "$ROOT/wpbin/xwp" "$@"
         steps = self.DEB_STEPS if self.source_kind == "deb" else self.STEPS
         if self.tree_only:
             steps = [s for s in steps if s[0] not in ("launcher", "user_setup")]
+        if self.modern_print:   # opt-in supplemental print system, last
+            steps = steps + [("modern_print", "Supplemental print system",
+                              1.0, "modern_print_step")]
         for key, title, frac, meth in steps:
             try:
                 log = getattr(self, meth)()
@@ -1083,6 +1132,11 @@ def main(argv):
                     help="install even if --target already exists and is "
                          "non-empty (replaces name-colliding files in place, no "
                          "backup); without it the install refuses and stops")
+    ap.add_argument("--modern-print", action="store_true",
+                    help="OPT-IN, EXPERIMENTAL: also install the supplemental "
+                         "CUPS-backed print system (a reversible drop-in that makes "
+                         "Print>Select open a CUPS chooser; the spool path stays "
+                         "native). Off by default. Dialog needs python3-gi (GTK4).")
     ap.add_argument("--no-launcher", action="store_true")
     ap.add_argument("--no-desktop", action="store_true",
                     help="do not add an application-menu entry")
@@ -1158,7 +1212,8 @@ def main(argv):
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
                          version=rm.version, source_kind=kind,
-                         install_deps=a.install_deps, overwrite=a.overwrite)
+                         install_deps=a.install_deps, overwrite=a.overwrite,
+                         modern_print=a.modern_print)
             return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1
