@@ -159,11 +159,16 @@ if [ ! -e "$ROOT/shlib10/passpost.prs" ]; then
     if [ -n "$_pp" ]; then
         cp "$_pp" "$ROOT/shlib10/passpost.prs"
         echo "-- copied genuine passpost.prs from $_pp"
+    elif [ -f "$ROOT/shlib10/pssave.prs" ]; then
+        # passpost.prs isn't shipped by any edition (WP generates it); seed it
+        # from the shipped, genuine pssave.prs (a real PostScript printer), never
+        # from default.prs (a different, generic printer).
+        cp "$ROOT/shlib10/pssave.prs" "$ROOT/shlib10/passpost.prs"
+        echo "-- seeded passpost.prs from pssave.prs (genuine PostScript printer;"
+        echo "   set its destination to your lpr/CUPS command to print to hardware)"
     else
-        echo "warning: shlib10/passpost.prs is missing (this WP tree omits it) and"
-        echo "         no sibling install has it to copy. WP's default printer won't"
-        echo "         open until it's present. NOT fabricating one from default.prs"
-        echo "         (a different, generic printer)."
+        echo "warning: shlib10/passpost.prs and pssave.prs are both missing — WP's"
+        echo "         default printer won't open. NOT fabricating from default.prs."
     fi
 fi
 

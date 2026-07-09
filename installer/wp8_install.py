@@ -601,12 +601,22 @@ class Engine:
                 out.append(f"passpost.prs was missing (this packaging omits it) — "
                            f"copied the genuine one from {found}")
             else:
-                out.append("WARNING: passpost.prs (WP's 'Passthru PostScript' "
-                           "printer) is missing and no sibling WordPerfect install "
-                           "has it to copy. WP's default printer won't open until "
-                           "it's present — install a native WP disc alongside (its "
-                           "passpost.prs will be reused). NOT fabricating one from "
-                           "default.prs: that is a different, generic printer.")
+                # passpost.prs isn't shipped by ANY edition — WP generates it at
+                # runtime, and the ship manifest carries only default.prs +
+                # pssave.prs. For a single fresh install (no sibling to copy from),
+                # seed it from the shipped, GENUINE pssave.prs: a real PostScript
+                # printer, structurally ~= passpost (NOT the generic default.prs).
+                ps = shlib / "pssave.prs"
+                if ps.is_file():
+                    shutil.copyfile(ps, pp); os.chmod(pp, 0o644)
+                    out.append("passpost.prs was missing — seeded it from the shipped "
+                               "pssave.prs (a genuine PostScript printer). It prints "
+                               "PostScript; point the printer's destination at your "
+                               "lpr/CUPS command to print to hardware.")
+                else:
+                    out.append("WARNING: passpost.prs and pssave.prs are both missing "
+                               "— WP's default printer won't open. (Not fabricating "
+                               "from default.prs, a different generic printer.)")
         # (2) wp.drs: the display-resource file. The Corel Linux OS .deb ships
         # only wp.lrs, not wp.drs, so a .deb install has no display resource and
         # WP errors at startup. We can't redistribute Corel's wp.drs, but a
@@ -667,6 +677,10 @@ if [ ! -e "$ROOT/shlib10/passpost.prs" ]; then
         cmp -s "$_sib" "${{_sib%passpost.prs}}default.prs" && continue
         cp "$_sib" "$ROOT/shlib10/passpost.prs" 2>/dev/null; break
     done
+    # no genuine sibling: seed from the shipped pssave.prs (a real PostScript
+    # printer), never from default.prs (a different, generic printer).
+    [ ! -e "$ROOT/shlib10/passpost.prs" ] && [ -f "$ROOT/shlib10/pssave.prs" ] && \
+        cp "$ROOT/shlib10/pssave.prs" "$ROOT/shlib10/passpost.prs" 2>/dev/null
 fi
 xhost +local: >/dev/null 2>&1
 {ldlib}export WPC="$ROOT"
