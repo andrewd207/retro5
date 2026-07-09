@@ -172,12 +172,16 @@ class Engine:
             raise InstallError("--install-deps installs system packages; re-run as root (sudo)")
         apt = shutil.which("apt-get"); dnf = shutil.which("dnf")
         pac = shutil.which("pacman");  zyp = shutil.which("zypper")
+        print("==> installing system packages (this can take a few minutes)…", flush=True)
 
         def run(cmd, fatal=True):
-            r = self._run(cmd)
+            # STREAM the package manager's output live (do NOT capture) so the user
+            # sees progress — a captured apt-get sits silent for minutes and looks
+            # hung. Echo the command first for context.
+            print("   $ " + " ".join(cmd), flush=True)
+            r = subprocess.run(cmd)
             if r.returncode != 0 and fatal:
-                raise InstallError("package install failed: " + " ".join(cmd) +
-                                   "\n" + (r.stderr or ""))
+                raise InstallError("package install failed: " + " ".join(cmd))
             return r.returncode
 
         if apt:
@@ -1148,6 +1152,10 @@ def main(argv):
                     help="install even if --target already exists and is "
                          "non-empty (replaces name-colliding files in place, no "
                          "backup); without it the install refuses and stops")
+    ap.add_argument("--system", action="store_true",
+                    help="install system-wide under /opt (world-readable, system "
+                         "launcher) for all users. Implied when run as root; a "
+                         "non-root user is elevated with pkexec.")
     ap.add_argument("--no-launcher", action="store_true")
     ap.add_argument("--no-desktop", action="store_true",
                     help="do not add an application-menu entry")
@@ -1187,6 +1195,25 @@ def main(argv):
     # --- fresh install: discover + resolve media (ISO / dir / folder-of-ISOs) ---
     if not a.media:
         ap.error("--media is required (an ISO, a native tree, or a folder of ISOs)")
+
+    # --- system install: root implies it; a non-root user is elevated ---------
+    # `--system` (or running as root) installs globally under /opt. When a
+    # non-root user asks for it, re-run the whole command under pkexec so it can
+    # write /opt + the system dirs (paths made absolute, since pkexec resets env).
+    if a.system and os.geteuid() != 0:
+        if not shutil.which("pkexec"):
+            ap.error("--system needs root; install pkexec, or re-run with sudo")
+        raw = list(argv)
+        for k, tok in enumerate(raw):                 # make --media/--target absolute
+            if tok in ("--media", "--target") and k + 1 < len(raw):
+                raw[k + 1] = str(Path(raw[k + 1]).expanduser().resolve())
+            elif tok.startswith(("--media=", "--target=")):
+                key, val = tok.split("=", 1)
+                raw[k] = f"{key}={Path(val).expanduser().resolve()}"
+        print("system install requested — elevating with pkexec…", flush=True)
+        os.execvp("pkexec", ["pkexec", sys.executable,
+                             os.path.abspath(__file__)] + raw)   # replaces us
+
     media = _load_media()
     cands = media.discover([Path(a.media)])
     installable = [c for c in cands if c.installable]
@@ -1217,10 +1244,12 @@ def main(argv):
 
     try:
         with media.resolve(chosen.path) as rm:
-            target = Path(a.target) if a.target else default_base() / rm.version
+            system = a.system or os.geteuid() == 0
+            base = GLOBAL_BASE if system else DEFAULT_BASE
+            target = Path(a.target) if a.target else base / rm.version
             kind = "deb" if rm.kind == media.DEB else "native"
-            if not a.target and os.geteuid() == 0:
-                print("running as root — installing globally (world-readable):")
+            if system and not a.target:
+                print("system install — global, world-readable, for all users:")
             print(f"Installing: {chosen.label}\n  -> {target}")
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
