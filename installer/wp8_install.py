@@ -824,6 +824,44 @@ exec "$ROOT/wpbin/xwp" "$@"
             out.append(f"note: add {bindir} to PATH, or run {lp} directly")
         return out
 
+    # ---- pre-bake the print Destination so a fresh install prints ---------
+    def _prebake_lp_destination(self, setfile) -> bool:
+        """Set the "Passthru PostScript" printer's Destination to `lp  <f>` (pipe
+        PostScript to the CUPS default printer; `<f>` = spool file) in a
+        .wpc8x.set. WP defaults the Destination to *None* -> "Invalid printer
+        destination", so out of the box nothing prints until the user sets it by
+        hand. The Destination lives in the key-0x01 printer record of .wpc8x.set
+        (NOT in passpost.prs), as an ASCII sub-record: a port name at +0x11 and
+        the command at +0x3a of a block at file offset 0x408. Byte layout RE'd
+        from a working install. Guarded: only the "Passthru PostScript" record,
+        and only when the Destination is currently empty (never clobbers a
+        user-set one). Idempotent. Returns True if a destination is now present.
+
+        NOTE: some packagings (the .deb) have WP *generate* .wpc8x.set at first
+        run, so there's nothing to patch at install time — those still need the
+        one-time manual Destination step (documented). Best-effort."""
+        try:
+            data = bytearray(Path(setfile).read_bytes())
+        except OSError:
+            return False
+        OFF = 0x408
+        if data[:4] != b"\xffWPC" or len(data) < OFF + 66:
+            return False
+        # guard: key-0x01 record must be the Passthru PostScript printer
+        name = data[0x21e:0x21e + 38].decode("utf-16le", "replace").split("\x00")[0]
+        if name != "Passthru PostScript":
+            return False
+        # already has a destination? leave it untouched (idempotent, no clobber)
+        if b"<f>" in bytes(data[OFF:OFF + 66]) or data[OFF + 0x11:OFF + 0x18].strip(b"\x00"):
+            return True
+        DEST = bytearray(66)
+        DEST[0:17] = b"\x58\x02\x00\x00\x86\x00\x0a\x00\x00\x00\x00\x00\x07\x02\x00\x00\x00"
+        DEST[17:24] = b"WPSpool"           # +0x11: the print port name
+        DEST[58:66] = b"lp  <f>\x00"        # +0x3a: the command (pipe PS to CUPS)
+        data[OFF:OFF + 66] = DEST
+        Path(setfile).write_bytes(bytes(data))
+        return b"lp  <f>" in Path(setfile).read_bytes()
+
     # ---- step 8: per-user setup -----------------------------------------
     def user_setup(self):
         if self._is_system_install():
@@ -845,6 +883,14 @@ exec "$ROOT/wpbin/xwp" "$@"
             os.chmod(dst, 0o600)
         else:
             out.append("~/.wprc/.wpc8x.set already present")
+        # pre-set the print Destination to `lp` so printing works out of the box
+        # (WP defaults it to None -> "Invalid printer destination"). Patch both the
+        # shlib10 seed (for future users) and this user's copy. No-op if absent /
+        # already set / not the Passthru PostScript record.
+        for s in (self.target / "shlib10/.wpc8x.set", dst):
+            if s.is_file() and self._prebake_lp_destination(s):
+                out.append(f"pre-set print Destination = 'lp' in {s.name} ({s.parent.name})")
+                break
         return out
 
     # ---- complete: repair an existing root (no binary reinstall) ---------
