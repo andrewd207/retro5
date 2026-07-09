@@ -1,0 +1,6 @@
+# build artifacts
+wpsink
+wpselect
+t_tests
+*.o
+/tmp/wpsink-selftest.ps
