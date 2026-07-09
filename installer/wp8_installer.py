@@ -212,23 +212,28 @@ class Installer(Gtk.Application):
         b = self._page("options")
         self._heading(b, "Options", "Confirm the source media and where to install.")
         grid = Gtk.Grid(row_spacing=10, column_spacing=10)
+        media_box = Gtk.Box(spacing=6)
         self.media_entry = Gtk.Entry(hexpand=True)
-        self.media_entry.set_placeholder_text("an ISO, an extracted tree, or a folder of ISOs")
-        detect = Gtk.Button(label="Detect versions")
-        detect.connect("clicked", self._on_detect)
+        self.media_entry.set_placeholder_text("a mounted disc, an ISO, or a folder of ISOs")
+        browse = Gtk.Button(label="Browse…"); browse.connect("clicked", self._on_browse)
+        detect = Gtk.Button(label="Detect versions"); detect.connect("clicked", self._on_detect)
+        media_box.append(self.media_entry); media_box.append(browse); media_box.append(detect)
         self.version_dd = Gtk.DropDown.new_from_strings(["(press Detect versions)"])
         self.version_dd.set_sensitive(False)
         self.version_dd.connect("notify::selected", self._on_version_changed)
         self._candidates = []          # installable media.Candidate objects
         self.target_entry = Gtk.Entry(text=str(DEFAULT_TARGET), hexpand=True)
         grid.attach(Gtk.Label(label="Install media:", xalign=0), 0, 0, 1, 1)
-        grid.attach(self.media_entry, 1, 0, 1, 1)
-        grid.attach(detect, 2, 0, 1, 1)
+        grid.attach(media_box, 1, 0, 1, 1)
         grid.attach(Gtk.Label(label="Version:", xalign=0), 0, 1, 1, 1)
-        grid.attach(self.version_dd, 1, 1, 2, 1)
+        grid.attach(self.version_dd, 1, 1, 1, 1)
         grid.attach(Gtk.Label(label="Install to:", xalign=0), 0, 2, 1, 1)
-        grid.attach(self.target_entry, 1, 2, 2, 1)
+        grid.attach(self.target_entry, 1, 2, 1, 1)
         b.append(grid)
+        # auto-detect mounted WP media so the user usually doesn't type anything
+        found = self._autodetect_media()
+        if found:
+            self.media_entry.set_text(found)
         self.launcher_chk = Gtk.CheckButton(label="Create launcher (~/.local/bin/xwp)", active=True)
         b.append(self.launcher_chk)
         self.desktop_chk = Gtk.CheckButton(label="Add WordPerfect to the applications menu", active=True)
@@ -253,6 +258,11 @@ class Installer(Gtk.Application):
         b = self._page("progress")
         self._heading(b, "Installing…", "This takes a minute; the WP tree is being decompressed.")
         self.bar = Gtk.ProgressBar(show_text=True); b.append(self.bar)
+        # live "current activity" line — shows the latest output (esp. the long,
+        # otherwise-silent package install) so it never looks frozen/failed.
+        self.activity = Gtk.Label(xalign=0, wrap=True, ellipsize=3)  # 3 = END
+        self.activity.add_css_class("subtitle")
+        b.append(self.activity)
         self.steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         sw = Gtk.ScrolledWindow(vexpand=True); sw.set_child(self.steps_box)
         sw.add_css_class("card")
@@ -275,6 +285,11 @@ class Installer(Gtk.Application):
 
     # ---- run -------------------------------------------------------------
     def _on_system_toggled(self, chk):
+        # the launcher goes to /usr/local/bin (system) vs ~/.local/bin (user) —
+        # show the real path so the checkbox isn't misleading.
+        self.launcher_chk.set_label(
+            "Create launcher (/usr/local/bin/xwp)" if chk.get_active()
+            else "Create launcher (~/.local/bin/xwp)")
         # re-version the target under the right base (/opt vs ~/.local)
         if self._candidates and 0 <= self.version_dd.get_selected() < len(self._candidates):
             self._on_version_changed()
@@ -283,6 +298,48 @@ class Installer(Gtk.Application):
             self.target_entry.set_text("/opt/wordperfect")
         else:
             self.target_entry.set_text(getattr(self, "_user_target", str(DEFAULT_TARGET)))
+
+    # ---- media: browse + auto-detect ------------------------------------
+    def _on_browse(self, _btn):
+        """Folder picker for the install media — a mounted disc, a WP tree, or a
+        folder containing ISOs. Covers every case (a lone ISO is reached via its
+        containing folder; discover scans it)."""
+        dlg = Gtk.FileDialog()
+        dlg.set_title("Choose install media (mounted disc, WP tree, or folder of ISOs)")
+        cur = self.media_entry.get_text().strip()
+        if cur and Path(cur).is_dir():
+            dlg.set_initial_folder(Gio.File.new_for_path(cur))
+        dlg.select_folder(self.win, None, self._on_browse_done)
+
+    def _on_browse_done(self, dlg, res):
+        try:
+            folder = dlg.select_folder_finish(res)
+        except Exception:      # noqa - cancelled / dismissed
+            return
+        if folder:
+            self.media_entry.set_text(folder.get_path())
+            self._on_detect(None)          # auto-scan what was just picked
+
+    def _autodetect_media(self):
+        """Scan likely mount points for WordPerfect media so the user usually
+        doesn't have to type or browse. Returns the first path that looks like WP
+        media (a native tree, a WP .deb, or ISOs), else ''."""
+        import glob
+        user = os.environ.get("USER") or ""
+        roots = (glob.glob(f"/media/{user}/*") + glob.glob(f"/run/media/{user}/*")
+                 + glob.glob("/media/*") + glob.glob("/mnt/*") + ["/cdrom"])
+        for r in roots:
+            p = Path(r)
+            try:
+                if not p.is_dir():
+                    continue
+                if ((p / "shared/ship").exists() or (p / "linux/bin").is_dir()
+                        or any(p.glob("*.iso")) or any(p.glob("*.ISO"))
+                        or any(p.glob("wp*full*.deb"))):
+                    return str(p)
+            except OSError:
+                continue
+        return ""
 
     def _on_detect(self, _btn):
         path = self.media_entry.get_text().strip()
@@ -381,25 +438,14 @@ class Installer(Gtk.Application):
             engine_py = str(Path(__file__).with_name("wp8_install.py"))
             # the elevated CLI does its own discovery/resolution of this exact path
             cmd = ["pkexec", sys.executable, engine_py, "--media", str(chosen.path),
-                   "--target", str(target)]
+                   "--target", str(target), "--install-deps"]
             if overwrite:
                 cmd.append("--overwrite")
             if not make_launcher:
                 cmd.append("--no-launcher")
             if not make_desktop:
                 cmd.append("--no-desktop")
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True)
-            except Exception as e:  # noqa
-                GLib.idle_add(self._on_step, Step("elevate", "pkexec failed", 0.1, ok=False, detail=str(e)))
-                GLib.idle_add(self._on_finish, False, {}, target); return
-            log = [l.strip() for l in p.stdout.splitlines() if l.strip()]
-            ok = (p.returncode == 0)
-            GLib.idle_add(self._on_step, Step(
-                "system", "System-wide install (elevated)" if ok else "System install failed",
-                1.0, ok=ok, detail="" if ok else (p.stderr or "cancelled/denied").strip()[:300],
-                log=log[-16:]))
-            GLib.idle_add(self._on_finish, ok, {"install": str(target)}, target)
+            self._stream_elevated(cmd, target)
             return
         else:
             try:
@@ -420,7 +466,46 @@ class Installer(Gtk.Application):
                 ok = False
         GLib.idle_add(self._on_finish, ok, stats, target)
 
+    def _stream_elevated(self, cmd, target):
+        """Run the elevated install and stream its output LIVE, so the long,
+        otherwise-silent phases (package install, tree decompress) show progress
+        instead of a frozen bar that looks failed. Parses the CLI's
+        `[OK ] NN%  Title` step lines into the progress bar + step rows; every
+        other line (apt output, etc.) updates the 'current activity' label."""
+        import re
+        GLib.idle_add(self._on_step,
+                      Step("elevate", "Requesting admin access (pkexec)…", 0.02, ok=True))
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except Exception as e:  # noqa
+            GLib.idle_add(self._on_step, Step("elevate", "pkexec failed", 0.1, ok=False, detail=str(e)))
+            GLib.idle_add(self._on_finish, False, {}, target); return
+        step_re = re.compile(r"^\[(OK |FAIL)\]\s+(\d+)%\s+(.*)$")
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            m = step_re.match(line)
+            if m:
+                GLib.idle_add(self._on_step, Step("sys", m.group(3).strip(),
+                              int(m.group(2)) / 100.0, ok=(m.group(1).strip() == "OK")))
+            else:
+                GLib.idle_add(self._on_status_line, line.strip())
+        ok = (p.wait() == 0)
+        GLib.idle_add(self._on_step, Step(
+            "done", "System-wide install complete" if ok else "System install failed",
+            1.0, ok=ok, detail="" if ok else "cancelled/denied, or see the activity above"))
+        GLib.idle_add(self._on_finish, ok, {"install": str(target)}, target)
+
+    def _on_status_line(self, line):
+        # latest raw output (esp. the long, otherwise-silent apt phase) -> keeps
+        # it visibly alive so the user never thinks it failed.
+        self.activity.set_text(line)
+        return False
+
     def _on_step(self, step):
+        self.activity.set_text("")            # a step boundary clears the activity line
         self.bar.set_fraction(step.fraction)
         self.bar.set_text(f"{int(step.fraction*100)}%  –  {step.title}")
         row = Gtk.Box(spacing=8); row.add_css_class("steprow")
