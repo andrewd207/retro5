@@ -608,11 +608,17 @@ class Installer(Gtk.Application):
             self.done_title.set_text("Installation complete")
             self.done_title.remove_css_class("fail")
             sysp = self._is_system_path(target)
-            self._launch_path = "/usr/local/bin/xwp" if sysp else str(Path.home() / ".local/bin/xwp")
+            bindir = "/usr/local/bin" if sysp else str(Path.home() / ".local/bin")
+            # launchers are version-suffixed (xwp-8.1) so 8.0/8.1 coexist; the
+            # versioned target's last component IS the version.
+            version = target.name
+            vsuffix = "" if version in ("", "8") else f"-{version}"
+            self._launch_path = f"{bindir}/xwp{vsuffix}"
             summary = (f"{stats.get('decompressed',0)} files decompressed, "
                        f"{stats.get('drivers',0)} printer drivers, "
                        f"{stats.get('fonts',0)} fonts.\n\n"
-                       f"Launch with  {self._launch_path}  (add -fontSize 20 for bigger menus).\n"
+                       f"Launch with  {self._launch_path}  (menus are pre-sized; "
+                       f"set $WPFONTSIZE to change).\n"
                        f"File locking works via the shim — no need to disable it.")
             self.done_body.set_text(summary)
             self.done_log.set_text("\n".join(f"{k}: {v}" for k, v in stats.items()))
