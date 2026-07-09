@@ -774,6 +774,19 @@ if [ ! -e "$ROOT/shlib10/passpost.prs" ]; then
         cp "$ROOT/shlib10/pssave.prs" "$ROOT/shlib10/passpost.prs" 2>/dev/null
 fi
 xhost +local: >/dev/null 2>&1
+# WP's Motif menus ask the X server for -adobe-helvetica-*-75-75-iso8859-1;
+# without those bitmap fonts on the server's FONT PATH the menus fall back to an
+# ugly `fixed` font. Installing the xfonts-* packages adds the dirs, but a
+# server that was already running won't have them in its path — add them here at
+# launch (and rehash) so the nice font shows without a logout. Harmless if xset
+# or the dirs are absent.
+if command -v xset >/dev/null 2>&1; then
+    for _fp in /usr/share/fonts/X11/75dpi /usr/share/fonts/X11/100dpi \
+               /usr/share/fonts/X11/Type1 /usr/share/fonts/X11/misc; do
+        [ -d "$_fp" ] && xset +fp "$_fp" 2>/dev/null
+    done
+    xset fp rehash 2>/dev/null
+fi
 {ldlib}export WPC="$ROOT"
 # point the ancient statically-linked Xlib at the modern X locale dir
 export XLOCALEDIR=/usr/share/X11/locale
