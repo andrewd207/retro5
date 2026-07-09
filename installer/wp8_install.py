@@ -545,6 +545,33 @@ class Engine:
             out.append("installed retro5.so into shbin10")
         return out
 
+    def _run_wpfi(self) -> bool:
+        """Generate wp.drs (+ fonts) by running WordPerfect's own file/font
+        installer, exactly as the Corel Linux .deb postinst does:
+        `( cd shbin10; ./wpfi )`. wp.drs is referenced by xwp/wpfi/xwppmgr at
+        runtime but is shipped in NO edition — it is *generated* by wpfi. Our
+        tree-copy install never runs the .deb's maintainer scripts, so wpfi never
+        ran and wp.drs was never created (WP then errors at startup). wpfi is
+        retargeted with the rest of the tree and runs HEADLESS under the shim
+        (no X libs). Must run AFTER install_shim so the loader finds retro5.so.
+        Returns True if wp.drs exists afterward."""
+        shbin = self.target / "shbin10"
+        wpfi  = shbin / "wpfi"
+        drs   = self.target / "shlib10" / "wp.drs"
+        if not (wpfi.exists() and os.access(wpfi, os.X_OK)):
+            return drs.exists()                 # native discs ship wp.drs directly
+        env = dict(os.environ)
+        env["WPC"] = str(self.target)
+        env.setdefault("XLOCALEDIR", "/usr/share/X11/locale")
+        if getattr(self, "_shim_ldpath", None): # user install: shim lives in shbin10
+            prev = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = str(shbin) + (":" + prev if prev else "")
+        try:
+            self._run(["./wpfi"], cwd=str(shbin), env=env)
+        except Exception:                        # noqa - never let wpfi abort the install
+            pass
+        return drs.exists()
+
     def runtime_config(self):
         out = self.install_shim()
         shlib = self.target / "shlib10"; shlib.mkdir(parents=True, exist_ok=True)
@@ -632,29 +659,37 @@ class Engine:
                     out.append("WARNING: passpost.prs and pssave.prs are both missing "
                                "— WP's default printer won't open. (Not fabricating "
                                "from default.prs, a different generic printer.)")
-        # (2) wp.drs: the display-resource file. The Corel Linux OS .deb ships
-        # only wp.lrs, not wp.drs, so a .deb install has no display resource and
-        # WP errors at startup. We can't redistribute Corel's wp.drs, but a
-        # side-by-side WordPerfect install has a (compatible, compressed) one —
-        # borrow it. Otherwise warn clearly.
+        # (2) wp.drs: the display-resource file. It is referenced by
+        # xwp/wpfi/xwppmgr at runtime but shipped by NO edition — WP *generates*
+        # it via wpfi (its file/font installer). The Corel Linux .deb creates it
+        # in its postinst (`cd shbin10; ./wpfi`), which our tree-copy install
+        # never runs, so wp.drs is missing and WP errors at startup. Fix, in
+        # order: (a) generate it properly with wpfi (works for a lone install),
+        # (b) borrow a compatible one from a sibling WP install, (c) warn.
         drs = shlib / "wp.drs"
         if not drs.exists():
-            found = None
-            base = self.target.parent
-            if base.is_dir():
-                for sib in sorted(base.iterdir()):
-                    cand = sib / "shlib10/wp.drs"
-                    if cand.is_file() and cand.resolve() != drs.resolve():
-                        found = cand; break
-            if found:
-                shutil.copyfile(found, drs); os.chmod(drs, 0o644)
-                out.append(f"wp.drs was missing (this packaging omits it) — "
-                           f"copied it from {found}")
+            if self._run_wpfi() and drs.exists():
+                try: os.chmod(drs, 0o644)
+                except OSError: pass
+                out.append("generated wp.drs via wpfi (WP's file/font installer, "
+                           "as the Corel .deb postinst does)")
             else:
-                out.append("WARNING: wp.drs is missing and no sibling WordPerfect "
-                           "install has one to copy. WP will error at startup. "
-                           "Install a native WP disc alongside (its wp.drs will be "
-                           "reused), or place a compressed wp.drs in shlib10.")
+                found = None
+                base = self.target.parent
+                if base.is_dir():
+                    for sib in sorted(base.iterdir()):
+                        cand = sib / "shlib10/wp.drs"
+                        if cand.is_file() and cand.resolve() != drs.resolve():
+                            found = cand; break
+                if found:
+                    shutil.copyfile(found, drs); os.chmod(drs, 0o644)
+                    out.append(f"wp.drs was missing; wpfi didn't produce one — "
+                               f"copied a compatible one from {found}")
+                else:
+                    out.append("WARNING: wp.drs is missing, wpfi didn't generate it, "
+                               "and no sibling WordPerfect install has one to copy. "
+                               "WP will error at startup. Install a native WP disc "
+                               "alongside (its wp.drs will be reused).")
         # (3) XKeysymDB: WP's bundled 1998 libX11 resolves Motif virtual keysyms
         # (osfDelete/osfLeft/...) used by dialog text-field translations through
         # this file. Modern X dropped it, so without it Delete/BackSpace/arrow
