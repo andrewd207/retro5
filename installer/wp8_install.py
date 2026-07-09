@@ -23,7 +23,7 @@ The engine is UI-agnostic: run() is a generator yielding Step objects the GUI
 (or the CLI) renders. Nothing here imports GTK.
 """
 from __future__ import annotations
-import os, re, shutil, stat, struct, subprocess, sys
+import filecmp, os, re, shutil, stat, struct, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -569,19 +569,44 @@ class Engine:
         doesn't die on a missing file at startup."""
         out = []
         shlib = self.target / "shlib10"
-        # (1) passpost.prs: WP's factory PostScript printer resource. Some discs
-        # ship only default.prs/pssave.prs, but WP defaults its printer to
-        # "passpost" and errors "File not found ... passpost.prs". Give it a
-        # valid .prs (a copy of the generic default) so the default printer opens.
+        # (1) passpost.prs: WP's factory "Passthru PostScript" printer resource.
+        # WP's default-printer record (key 0x01 in .wpc8x.set/.wpc.admin) selects
+        # this printer BY NAME, so WP then loads shlib10/passpost.prs and errors
+        # "File not found ... passpost.prs" if it's absent. It is a SPECIFIC
+        # printer definition (~24 KB) — NOT interchangeable with default.prs
+        # (~86 KB, a different, generic printer): fabricating passpost.prs from
+        # default.prs yields a wrong/broken default printer. Native discs ship the
+        # genuine file (install_tree copies it from the ship manifest); some
+        # packagings (the Corel Linux .deb) omit it. Recover it the same way we do
+        # wp.drs — COPY the genuine file from a sibling WP install — never
+        # fabricate one. We can't redistribute Corel's .prs ourselves.
         pp = shlib / "passpost.prs"
         if not pp.exists():
-            for cand in ("default.prs", "pssave.prs"):
-                src = shlib / cand
-                if src.is_file():
-                    shutil.copyfile(src, pp); os.chmod(pp, 0o644)
-                    out.append(f"created shlib10/passpost.prs from {cand} "
-                               "(WP's default printer resource)")
-                    break
+            found = None
+            base = self.target.parent
+            if base.is_dir():
+                for sib in sorted(base.iterdir()):
+                    cand = sib / "shlib10/passpost.prs"
+                    if not (cand.is_file() and cand.resolve() != pp.resolve()):
+                        continue
+                    # Skip a sibling's FABRICATED passpost (a byte-copy of its own
+                    # default.prs, from the old self-heal) — only ever propagate a
+                    # genuine printer resource, never re-spread the wrong one.
+                    dflt = sib / "shlib10/default.prs"
+                    if dflt.is_file() and filecmp.cmp(cand, dflt, shallow=False):
+                        continue
+                    found = cand; break
+            if found:
+                shutil.copyfile(found, pp); os.chmod(pp, 0o644)
+                out.append(f"passpost.prs was missing (this packaging omits it) — "
+                           f"copied the genuine one from {found}")
+            else:
+                out.append("WARNING: passpost.prs (WP's 'Passthru PostScript' "
+                           "printer) is missing and no sibling WordPerfect install "
+                           "has it to copy. WP's default printer won't open until "
+                           "it's present — install a native WP disc alongside (its "
+                           "passpost.prs will be reused). NOT fabricating one from "
+                           "default.prs: that is a different, generic printer.")
         # (2) wp.drs: the display-resource file. The Corel Linux OS .deb ships
         # only wp.lrs, not wp.drs, so a .deb install has no display resource and
         # WP errors at startup. We can't redistribute Corel's wp.drs, but a
@@ -630,12 +655,18 @@ if [ ! -e "$HOME/.wprc/.wpc8x.set" ] && [ -f "$ROOT/shlib10/.wpc8x.set" ]; then
     cp "$ROOT/shlib10/.wpc8x.set" "$HOME/.wprc/.wpc8x.set" 2>/dev/null
     chmod 0600 "$HOME/.wprc/.wpc8x.set" 2>/dev/null
 fi
-# self-heal WP's default printer resource: WP defaults its printer to "passpost"
-# and errors "File not found ... passpost.prs" if it's absent. Repairs trees from
-# installs that predate the install-time heal (user installs; system trees are
-# handled at install time and this no-ops harmlessly if unwritable).
-if [ ! -e "$ROOT/shlib10/passpost.prs" ] && [ -f "$ROOT/shlib10/default.prs" ]; then
-    cp "$ROOT/shlib10/default.prs" "$ROOT/shlib10/passpost.prs" 2>/dev/null
+# self-heal WP's default printer resource: WP's default-printer record selects
+# "Passthru PostScript" by name, so it loads shlib10/passpost.prs and errors
+# "File not found ... passpost.prs" if it's absent. passpost.prs is a SPECIFIC
+# printer, NOT default.prs (a different, generic printer) — so copy the genuine
+# file from a sibling install if this tree lacks it; never fabricate it.
+if [ ! -e "$ROOT/shlib10/passpost.prs" ]; then
+    for _sib in "$ROOT"/../*/shlib10/passpost.prs; do
+        [ -f "$_sib" ] || continue
+        # skip a sibling's fabricated passpost (a copy of its own default.prs)
+        cmp -s "$_sib" "${{_sib%passpost.prs}}default.prs" && continue
+        cp "$_sib" "$ROOT/shlib10/passpost.prs" 2>/dev/null; break
+    done
 fi
 xhost +local: >/dev/null 2>&1
 {ldlib}export WPC="$ROOT"

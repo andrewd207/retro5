@@ -143,11 +143,28 @@ echo "-- XKeysymDB -> $XKDB_SYS"
 install -Dm0644 "$HERE/XKeysymDB" "$XKDB_SYS"
 [ -d "$ROOT/shlib10" ] && install -m0644 "$HERE/XKeysymDB" "$ROOT/shlib10/XKeysymDB"
 
-# 5. passpost.prs: WP defaults its printer to "passpost" and errors
-#    "File not found ... passpost.prs" if it's absent. Seed it from default.prs.
-if [ ! -e "$ROOT/shlib10/passpost.prs" ] && [ -f "$ROOT/shlib10/default.prs" ]; then
-    cp "$ROOT/shlib10/default.prs" "$ROOT/shlib10/passpost.prs"
-    echo "-- created $ROOT/shlib10/passpost.prs"
+# 5. passpost.prs: WP's default-printer record selects "Passthru PostScript" by
+#    name, so WP loads shlib10/passpost.prs and errors "File not found" if it's
+#    absent. It's a SPECIFIC printer (~24 KB), NOT default.prs (~86 KB, generic)
+#    — copy the genuine file from a sibling WP install if this tree lacks it;
+#    never fabricate it from default.prs (that yields a broken default printer).
+if [ ! -e "$ROOT/shlib10/passpost.prs" ]; then
+    _pp=""
+    for _sib in "$ROOT"/../*/shlib10/passpost.prs; do
+        [ -f "$_sib" ] || continue
+        # skip a sibling's fabricated passpost (a copy of its own default.prs)
+        cmp -s "$_sib" "${_sib%passpost.prs}default.prs" && continue
+        _pp="$_sib"; break
+    done
+    if [ -n "$_pp" ]; then
+        cp "$_pp" "$ROOT/shlib10/passpost.prs"
+        echo "-- copied genuine passpost.prs from $_pp"
+    else
+        echo "warning: shlib10/passpost.prs is missing (this WP tree omits it) and"
+        echo "         no sibling install has it to copy. WP's default printer won't"
+        echo "         open until it's present. NOT fabricating one from default.prs"
+        echo "         (a different, generic printer)."
+    fi
 fi
 
 cat <<EOF
