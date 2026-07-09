@@ -185,22 +185,33 @@ class Engine:
             # needs the CUPS client tools or WP has nothing to spool to. Native,
             # not i386. Non-fatal — don't abort a WP install over the print client.
             run(["apt-get", "install", "-y", "cups-bsd", "cups-client"], fatal=False)
-            return ["installed 32-bit runtime + CUPS client lp/lpr via apt"]
+            # UI fonts: WP's Motif menus request -adobe-helvetica-*-75-75-iso8859-1.
+            # A fresh box without the legacy X bitmap fonts can't resolve it and
+            # falls back to an ugly `fixed` font. Pull the adobe-helvetica providers.
+            run(["apt-get", "install", "-y", "xfonts-base", "xfonts-75dpi",
+                 "xfonts-100dpi", "xfonts-scalable"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client + X UI fonts via apt"]
         if dnf:
             run(["dnf", "install", "-y", "glibc.i686",
                  "libX11.i686", "libXpm.i686", "libXt.i686"])
             run(["dnf", "install", "-y", "cups-client"], fatal=False)
-            return ["installed 32-bit runtime + CUPS client via dnf"]
+            run(["dnf", "install", "-y", "xorg-x11-fonts-75dpi",
+                 "xorg-x11-fonts-100dpi", "xorg-x11-fonts-ISO8859-1-75dpi"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client + X UI fonts via dnf"]
         if pac:
             run(["pacman", "-S", "--needed", "--noconfirm",
                  "lib32-glibc", "lib32-libx11", "lib32-libxpm", "lib32-libxt"])
             run(["pacman", "-S", "--needed", "--noconfirm", "cups"], fatal=False)
-            return ["installed 32-bit runtime + CUPS client via pacman (needs [multilib])"]
+            run(["pacman", "-S", "--needed", "--noconfirm",
+                 "xorg-fonts-75dpi", "xorg-fonts-100dpi"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client + X UI fonts via pacman (needs [multilib])"]
         if zyp:
             run(["zypper", "--non-interactive", "install", "glibc-32bit",
                  "libX11-6-32bit", "libXpm4-32bit", "libXt6-32bit"])
             run(["zypper", "--non-interactive", "install", "cups-client"], fatal=False)
-            return ["installed 32-bit runtime + CUPS client via zypper"]
+            run(["zypper", "--non-interactive", "install",
+                 "xorg-x11-fonts", "xorg-x11-fonts-legacy"], fatal=False)
+            return ["installed 32-bit runtime + CUPS client + X UI fonts via zypper"]
         raise InstallError("no supported package manager (apt/dnf/pacman/zypper) found; "
                            "install the 32-bit libs manually (see the README)")
 

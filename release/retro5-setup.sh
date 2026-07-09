@@ -65,17 +65,23 @@ install_deps(){
         apt-get install -y libx11-6:i386 libxpm4:i386 libxt6:i386 \
           || apt-get install -y libx11-6:i386 libxpm4:i386 libxt6t64:i386
         apt-get install -y cups-bsd cups-client || true
+        # UI fonts: WP's Motif menus ask for -adobe-helvetica-*-75-75-iso8859-1;
+        # without the legacy X bitmap fonts they fall back to an ugly `fixed` font.
+        apt-get install -y xfonts-base xfonts-75dpi xfonts-100dpi xfonts-scalable || true
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y glibc.i686 libX11.i686 libXpm.i686 libXt.i686
         dnf install -y cups-client || true
+        dnf install -y xorg-x11-fonts-75dpi xorg-x11-fonts-100dpi xorg-x11-fonts-ISO8859-1-75dpi || true
     elif command -v pacman >/dev/null 2>&1; then
         grep -q '^\[multilib\]' /etc/pacman.conf 2>/dev/null \
           || echo "note: if this fails, enable the [multilib] repo in /etc/pacman.conf first"
         pacman -S --needed --noconfirm lib32-glibc lib32-libx11 lib32-libxpm lib32-libxt
         pacman -S --needed --noconfirm cups || true
+        pacman -S --needed --noconfirm xorg-fonts-75dpi xorg-fonts-100dpi || true
     elif command -v zypper >/dev/null 2>&1; then
         zypper --non-interactive install glibc-32bit libX11-6-32bit libXpm4-32bit libXt6-32bit
         zypper --non-interactive install cups-client || true
+        zypper --non-interactive install xorg-x11-fonts xorg-x11-fonts-legacy || true
     else
         die "no supported package manager (apt/dnf/pacman/zypper) found — install the 32-bit libs by hand (see README)"
     fi
