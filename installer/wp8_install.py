@@ -611,6 +611,22 @@ class Engine:
             self._run(["./wpfi"], cwd=str(shbin), env=env)
         except Exception:                        # noqa - never let wpfi abort the install
             pass
+        # wpfi initializes WP's print-exchange mailbox /tmp/wpc-$USER-$HOST. In a
+        # system/root install it inherits USER=<invoker> from the environment but
+        # creates that dir ROOT-owned (0755). A later normal-user launch then can't
+        # create its .wpexc8.LCK inside it (EACCES) -> WP's fork of the wpexc helper
+        # exits 1 -> the misleading "Cannot create a new process" dialog. Remove any
+        # root-owned mailbox so the user's first run makes a fresh, user-owned one.
+        # Only touch root-owned dirs — a real user's live mailbox is user-owned, so
+        # this never disturbs a running session, and it also self-heals a VM already
+        # broken by an earlier root run.
+        if os.geteuid() == 0:
+            for d in Path("/tmp").glob("wpc-*"):
+                try:
+                    if d.is_dir() and d.stat().st_uid == 0:
+                        shutil.rmtree(d, ignore_errors=True)
+                except OSError:
+                    pass
         return drs.exists()
 
     def runtime_config(self):
