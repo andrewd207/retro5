@@ -1174,11 +1174,28 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         # the tree and stashes the other fonts under the X11 Type1 dir, so a bare
         # tree-copy otherwise leaves the document font list showing only
         # Courier-WP.
-        nres = self._harvest_shlib_resources(self.target / "shlib10")
+        shlib = self.target / "shlib10"
+        nres = self._harvest_shlib_resources(shlib)
         out = [f"copied WordPerfect {self.version} suite tree "
                f"({n} entries) to {self.target}"]
         if nres:
             out.append(f"gathered {nres} font/driver resource file(s) into shlib10")
+        # wp.drs is WP's FONT REGISTRY — WP lists a graphic font only if wp.drs
+        # names it, regardless of which .pfb files exist. The .deb ships no
+        # wp.drs, so any present here is one WE generated on a PRIOR install —
+        # possibly before the fonts above were gathered, i.e. registering only
+        # Courier-WP. Since _ensure_runtime_resources regenerates wp.drs (via
+        # wpfi) only when it is ABSENT, a reinstall would otherwise keep that
+        # stale registry and the new faces would never show. Drop it so wpfi
+        # rebuilds it against the now-complete font set.
+        drs = shlib / "wp.drs"
+        if drs.exists():
+            try:
+                drs.unlink()
+                out.append("removed stale wp.drs so it is rebuilt for the current "
+                           "font set")
+            except OSError:
+                pass
         return out
 
     # ---- orchestration ---------------------------------------------------
