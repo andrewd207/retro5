@@ -213,14 +213,32 @@ def _label_for(path: Path, kind: str, version: str) -> str:
     return f"Unrecognized media — {name}"
 
 
+def _find_debs(root: Path, maxdepth: int = 8) -> list[str]:
+    """Recursively find WordPerfect .deb files under root, tolerating unreadable
+    directories. A plain Path.rglob aborts the whole scan the moment it steps
+    into a flaky mount (e.g. a VirtualBox Guest Additions CD raising
+    'OSError: [Errno 5] Input/output error') — so walk with os.walk(onerror=…)
+    which just skips a directory it can't read. Depth-bounded so scanning a
+    broad root like /media doesn't wander the entire filesystem."""
+    root = str(root)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        if dirpath.count(os.sep) - base_depth >= maxdepth:
+            dirnames[:] = []                     # stop descending past maxdepth
+        for n in filenames:
+            if n.endswith(".deb") and any(g in n for g in _DEB_GLOBS):
+                found.append(os.path.join(dirpath, n))
+    return found
+
+
 def classify(path: Path) -> Candidate:
     """Classify a single path (ISO or directory) without full extraction."""
     path = Path(path)
     if path.is_dir():
         if _find_native_root(path):
             return Candidate(path, NATIVE, _label_for(path, NATIVE, "8.0"), "8.0")
-        debs = [str(p) for p in path.rglob("*.deb")
-                if any(g in p.name for g in _DEB_GLOBS)]
+        debs = _find_debs(path)
         if debs:
             v = _deb_version(debs)
             return Candidate(path, DEB, _label_for(path, DEB, v), v, debs)
