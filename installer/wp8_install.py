@@ -533,13 +533,36 @@ class Engine:
             return [f for f in sorted(ef.iterdir()) if f.is_file()]
         return []
 
+    @staticmethod
+    def _short_font_name(stem: str, used: set) -> str:
+        """WordPerfect stores each font's base filename in a small fixed field
+        and uses classic 8.3 names for its own fonts (wphv____, wpco____). A
+        basename longer than 8 chars makes wpfi's later reopen of the font fail,
+        and wpfi aborts the WHOLE install run with 'error: d' (empirically: <=9
+        works, >=10 fails; RE traced it to that reopen). So map every extra font
+        to a UNIQUE basename of <=8 chars. The display name comes from the .afm's
+        FullName, not the filename, so the short name is purely internal — keep an
+        alnum prefix for legibility and disambiguate with a hex tail."""
+        base = re.sub(r"[^a-z0-9]", "", stem.lower()) or "font"
+        cand = base[:8]
+        if cand and cand not in used:
+            used.add(cand); return cand
+        i = 0
+        while True:
+            suf = format(i, "x")
+            cand = (base[:8 - len(suf)] or "f") + suf
+            if cand not in used:
+                used.add(cand); return cand
+            i += 1
+
     def _install_extra_fonts(self, shlib: Path) -> list[str]:
         """Add the user's fonts from self.extra_fonts into shlib10 so wpfi
-        registers them in wp.drs (WP then lists them). --extra-fonts is a
-        directory of fonts, or 'auto'/'system' to pull the system's Type1 fonts
-        via fontconfig. Ready Type1 .pfb are copied verbatim with their sibling
-        .afm; .ttf/.otf/.ttc (and .t1/.pfa) are converted to Type1 first. Only a
-        font with BOTH a .pfb and a matching .afm registers, so we report pairs."""
+        registers them in wp.drs. --extra-fonts is a directory of fonts, or
+        'auto'/'system' to pull the system's fonts via fontconfig. Ready Type1
+        .pfb are copied (their .afm copied if present, else synthesised with
+        fontforge); .ttf/.otf/.ttc/.t1/.pfa are converted to Type1 (Latin subset).
+        Every pair is written under a <=15-char basename (see _short_font_name)
+        or wpfi rejects it. Only a font with BOTH .pfb and .afm registers."""
         out: list[str] = []
         src = self.extra_fonts
         srcs = self._extra_font_sources()
@@ -553,85 +576,88 @@ class Engine:
                        f"source — skipped")
             return out
         shlib.mkdir(parents=True, exist_ok=True)
-        pfb_added: set[str] = set()
-        afm_added: set[str] = set()
-        need_convert = []
-        # track category + FontName so the wp.drs rebuild can drop converted
-        # fonts first on wpfi failure, and so we skip duplicate/oversized ones.
-        self._extra_type1: set[str] = set()
+        self._extra_type1: set[str] = set()      # short names, for wp.drs fallback
         self._extra_converted: set[str] = set()
+        # seed the used-name set with fonts already in shlib10 (WP's own wp*, any
+        # harvested faces) so a generated short name never collides with them.
+        used_names: set[str] = {p.stem.lower() for p in shlib.glob("*.pfb")}
+        used_names |= {p.stem.lower() for p in shlib.glob("*.afm")}
         seen_fontnames: set[str] = set()
+        have_ff = bool(shutil.which("fontforge"))
 
-        def _keep_converted(stem: Path) -> bool:
-            """After a conversion, enforce the wpfi-safety rules: both files must
-            exist, the .afm must be reasonably small (a font that didn't subset),
-            and its FontName must be new. Removes the pair and returns False if
-            not kept."""
-            pfb, afm = stem.with_suffix(".pfb"), stem.with_suffix(".afm")
-            if not (pfb.exists() and afm.exists()):
-                return False
-            if afm.stat().st_size > 200_000:      # un-subsettable monster — protect wpfi
-                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True)
-                return False
-            fn = None
-            for ln in afm.read_text(errors="replace").splitlines():
-                if ln.startswith("FontName"):
-                    fn = ln.split(None, 1)[-1].strip(); break
-                if ln.startswith("StartCharMetrics"):
-                    break
-            if fn and fn in seen_fontnames:       # duplicate FontName — dedupe
-                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True)
-                return False
-            if fn:
-                seen_fontnames.add(fn)
-            for p in (pfb, afm):
-                os.chmod(p, 0o644)
-            return True
-
+        # group sources into one job per original font (by source stem): a ready
+        # Type1 pair, or a file needing conversion.
+        jobs: dict[str, dict] = {}
         for f in srcs:
             if not f.is_file():
                 continue
-            ext = f.suffix.lower()
-            if ext in (".pfb", ".afm"):
-                dst = shlib / f.name.lower()
-                self._replace_copy(f, dst); os.chmod(dst, 0o644)
-                (pfb_added if ext == ".pfb" else afm_added).add(dst.stem)
-                self._extra_type1.add(dst.stem)
-                # a .pfb discovered on its own (fc-list) — grab its sibling .afm
-                if ext == ".pfb":
-                    sib = f.with_suffix(".afm")
-                    if sib.is_file():
-                        ad = shlib / sib.name.lower()
-                        self._replace_copy(sib, ad); os.chmod(ad, 0o644)
-                        afm_added.add(ad.stem); self._extra_type1.add(ad.stem)
-            elif ext in (".pfa", ".t1", ".ttf", ".otf", ".ttc"):
-                need_convert.append(f)
-        # convert everything that isn't already .pfb/.afm
-        if need_convert:
-            conv = self._font_converter()
-            if not conv:
-                out.append(f"--extra-fonts: {len(need_convert)} font(s) need "
-                           f"conversion to Type1 but neither fontforge nor ttf2pt1 "
-                           f"is installed — install one (fontforge) to include them")
-            else:
-                nok = 0
-                for f in need_convert:
-                    stem = shlib / f.stem.lower()
-                    if self._convert_to_type1(f, stem) and _keep_converted(stem):
-                        pfb_added.add(stem.name); afm_added.add(stem.name)
-                        self._extra_converted.add(stem.name); nok += 1
-                out.append(f"converted {nok}/{len(need_convert)} font(s) to Type1 "
-                           f"with {conv[0]} (Latin subset; kern-stripped)")
-        # a font registers only with BOTH .pfb and .afm; warn on unpaired ones
-        paired = pfb_added & afm_added
-        lonely = (pfb_added ^ afm_added)
-        if paired:
-            out.append(f"added {len(paired)} extra font(s) to shlib10 "
-                       f"(wpfi will register them in wp.drs)")
-        if lonely:
-            out.append(f"note: {len(lonely)} extra font file(s) lack a matching "
-                       f".pfb/.afm pair and won't register: "
-                       f"{', '.join(sorted(lonely))}")
+            ext = f.suffix.lower(); key = str(f.parent) + "/" + f.stem.lower()
+            job = jobs.setdefault(key, {})
+            if ext == ".pfb":
+                job["pfb"] = f
+                sib = f.with_suffix(".afm")
+                if sib.is_file():
+                    job.setdefault("afm", sib)
+            elif ext == ".afm":
+                job.setdefault("afm", f)
+            elif ext in (".ttf", ".otf", ".ttc", ".t1", ".pfa"):
+                job["convert"] = f
+
+        def _fontname(afm: Path):
+            for ln in afm.read_text(errors="replace").splitlines():
+                if ln.startswith("FontName"):
+                    return ln.split(None, 1)[-1].strip()
+                if ln.startswith("StartCharMetrics"):
+                    return None
+            return None
+
+        def _dedupe_or_drop(pfb: Path, afm: Path) -> bool:
+            """Drop the pair if its .afm is unreadable/oversized or a duplicate
+            FontName; else record the FontName. Returns True to keep."""
+            if not (pfb.exists() and afm.exists()) or afm.stat().st_size > 200_000:
+                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True); return False
+            fn = _fontname(afm)
+            if fn and fn in seen_fontnames:
+                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True); return False
+            if fn:
+                seen_fontnames.add(fn)
+            os.chmod(pfb, 0o644); os.chmod(afm, 0o644)
+            return True
+
+        n_type1 = n_conv = n_need_ff = 0
+        for key, job in jobs.items():
+            short = self._short_font_name(Path(key).name, used_names)
+            dpfb, dafm = shlib / f"{short}.pfb", shlib / f"{short}.afm"
+            if "pfb" in job:                      # ready Type1
+                self._replace_copy(job["pfb"], dpfb)
+                if "afm" in job:
+                    self._replace_copy(job["afm"], dafm)
+                elif have_ff:                     # metrics missing — synthesise them
+                    self._run(["fontforge", "-quiet", "-lang=ff", "-c",
+                               "Open($1); Generate($2)", str(dpfb), str(dafm)])
+                if _dedupe_or_drop(dpfb, dafm):
+                    self._extra_type1.add(short); n_type1 += 1
+                else:
+                    used_names.discard(short)
+            elif "convert" in job:                # needs conversion to Type1
+                if not have_ff and not shutil.which("ttf2pt1"):
+                    n_need_ff += 1; used_names.discard(short); continue
+                if self._convert_to_type1(job["convert"], shlib / short) and \
+                        _dedupe_or_drop(dpfb, dafm):
+                    self._extra_converted.add(short); n_conv += 1
+                else:
+                    used_names.discard(short)
+
+        if n_type1:
+            out.append(f"added {n_type1} Type1 font(s) to shlib10")
+        if n_conv:
+            out.append(f"converted {n_conv} font(s) to Type1 (Latin subset, "
+                       f"kern-stripped) and added them")
+        if n_need_ff:
+            out.append(f"--extra-fonts: {n_need_ff} font(s) need fontforge/ttf2pt1 "
+                       f"to convert to Type1 — install fontforge to include them")
+        if not (n_type1 or n_conv):
+            out.append("--extra-fonts: no usable fonts found to add")
         return out
 
     def _ship_entries(self):
