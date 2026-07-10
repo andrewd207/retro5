@@ -97,7 +97,8 @@ class Engine:
                  make_launcher: bool = True, make_desktop: bool = True,
                  tree_only: bool = False, tooling: Path = TOOLING,
                  version: str = "8", source_kind: str = "native",
-                 install_deps: bool = False, overwrite: bool = False):
+                 install_deps: bool = False, overwrite: bool = False,
+                 extra_fonts: Path | None = None):
         self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
@@ -105,6 +106,10 @@ class Engine:
         self.source_kind = source_kind      # "native" (ship manifest) or "deb"
         self.install_deps = install_deps    # --install-deps: pull the 32-bit runtime
         self.overwrite = overwrite          # --overwrite: install over an existing tree
+        # --extra-fonts DIR: add user fonts to WP's list. Type1 .pfb/.afm are
+        # copied straight in; .ttf/.otf are converted to Type1 first. wpfi then
+        # registers whatever lands in shlib10 into wp.drs (see _install_extra_fonts).
+        self.extra_fonts = Path(extra_fonts) if extra_fonts else None
         self.compat = self.tooling / "retro5"           # shim source (this repo)
         self.wpdecom_src = self.tooling / "tools/wpdecom2.c"
         self.wpdecom = self.tooling / "tools/wpdecom2"  # build output (gitignored)
@@ -202,6 +207,10 @@ class Engine:
             # falls back to an ugly `fixed` font. Pull the adobe-helvetica providers.
             run(["apt-get", "install", "-y", "xfonts-base", "xfonts-75dpi",
                  "xfonts-100dpi", "xfonts-scalable"], fatal=False)
+            # font converter for --extra-fonts (.ttf/.otf -> Type1). Only when the
+            # user asked to add fonts; fontforge is large, so don't pull it always.
+            if self.extra_fonts and not self._font_converter():
+                run(["apt-get", "install", "-y", "fontforge"], fatal=False)
             return ["installed 32-bit runtime + CUPS client + X UI fonts via apt"]
         if dnf:
             run(["dnf", "install", "-y", "glibc.i686",
@@ -209,6 +218,8 @@ class Engine:
             run(["dnf", "install", "-y", "cups-client"], fatal=False)
             run(["dnf", "install", "-y", "xorg-x11-fonts-75dpi",
                  "xorg-x11-fonts-100dpi", "xorg-x11-fonts-ISO8859-1-75dpi"], fatal=False)
+            if self.extra_fonts and not self._font_converter():
+                run(["dnf", "install", "-y", "fontforge"], fatal=False)
             return ["installed 32-bit runtime + CUPS client + X UI fonts via dnf"]
         if pac:
             run(["pacman", "-S", "--needed", "--noconfirm",
@@ -216,6 +227,8 @@ class Engine:
             run(["pacman", "-S", "--needed", "--noconfirm", "cups"], fatal=False)
             run(["pacman", "-S", "--needed", "--noconfirm",
                  "xorg-fonts-75dpi", "xorg-fonts-100dpi"], fatal=False)
+            if self.extra_fonts and not self._font_converter():
+                run(["pacman", "-S", "--needed", "--noconfirm", "fontforge"], fatal=False)
             return ["installed 32-bit runtime + CUPS client + X UI fonts via pacman (needs [multilib])"]
         if zyp:
             run(["zypper", "--non-interactive", "install", "glibc-32bit",
@@ -223,6 +236,8 @@ class Engine:
             run(["zypper", "--non-interactive", "install", "cups-client"], fatal=False)
             run(["zypper", "--non-interactive", "install",
                  "xorg-x11-fonts", "xorg-x11-fonts-legacy"], fatal=False)
+            if self.extra_fonts and not self._font_converter():
+                run(["zypper", "--non-interactive", "install", "fontforge"], fatal=False)
             return ["installed 32-bit runtime + CUPS client + X UI fonts via zypper"]
         raise InstallError("no supported package manager (apt/dnf/pacman/zypper) found; "
                            "install the 32-bit libs manually (see the README)")
@@ -393,6 +408,109 @@ class Engine:
                 continue
             self._replace_copy(f, dst); os.chmod(dst, 0o644); n += 1
         return n
+
+    # extensions we treat as ready-to-use Type1 (copied as-is) vs need conversion
+    _TYPE1_EXT = (".pfb", ".afm", ".pfa")
+    _CONVERT_EXT = (".ttf", ".otf", ".ttc")
+
+    @staticmethod
+    def _font_converter() -> tuple[str, list] | None:
+        """Return (tool, argv-template) for TTF/OTF -> Type1, or None if neither
+        converter is installed. ttf2pt1 emits .pfb+.afm directly; fontforge is
+        scripted to Generate both (it picks format by extension)."""
+        if shutil.which("fontforge"):
+            return ("fontforge", None)
+        if shutil.which("ttf2pt1"):
+            return ("ttf2pt1", None)
+        return None
+
+    def _convert_to_type1(self, src: Path, stem_dst: Path) -> bool:
+        """Convert one .ttf/.otf at src into stem_dst.pfb + stem_dst.afm.
+        stem_dst is the output path WITHOUT extension. Returns True on success."""
+        conv = self._font_converter()
+        if not conv:
+            return False
+        tool = conv[0]
+        pfb = stem_dst.with_suffix(".pfb")
+        afm = stem_dst.with_suffix(".afm")
+        try:
+            if tool == "fontforge":
+                script = "Open($1); Generate($2); Generate($3)"
+                r = self._run(["fontforge", "-quiet", "-lang=ff", "-c", script,
+                               str(src), str(pfb), str(afm)])
+            else:  # ttf2pt1: "-b" = binary .pfb; writes <out>.pfb and <out>.afm
+                r = self._run(["ttf2pt1", "-b", str(src), str(stem_dst)])
+            return pfb.exists() and afm.exists()
+        except Exception:
+            return False
+
+    def _install_extra_fonts(self, shlib: Path) -> list[str]:
+        """Add the user's fonts from self.extra_fonts into shlib10 so wpfi
+        registers them in wp.drs (WP then lists them). Ready Type1 .pfb/.afm are
+        copied verbatim (WP's native format); .ttf/.otf/.ttc are converted to
+        Type1 first. .pfa is converted to .pfb if fontforge is present, else
+        skipped with a note. Only fonts that end up with BOTH a .pfb and a
+        matching .afm actually register, so we report the pairs installed."""
+        out: list[str] = []
+        src = self.extra_fonts
+        if not src or not src.is_dir():
+            if src:
+                out.append(f"--extra-fonts: {src} is not a directory — skipped")
+            return out
+        shlib.mkdir(parents=True, exist_ok=True)
+        pfb_added: set[str] = set()
+        afm_added: set[str] = set()
+        need_convert = []
+        for f in sorted(src.iterdir()):
+            if not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            if ext in (".pfb", ".afm"):
+                dst = shlib / f.name.lower()
+                self._replace_copy(f, dst); os.chmod(dst, 0o644)
+                (pfb_added if ext == ".pfb" else afm_added).add(dst.stem)
+            elif ext == ".pfa":
+                if shutil.which("fontforge"):
+                    dst = shlib / (f.stem.lower() + ".pfb")
+                    r = self._run(["fontforge", "-quiet", "-lang=ff", "-c",
+                                   "Open($1); Generate($2)", str(f), str(dst)])
+                    if dst.exists():
+                        os.chmod(dst, 0o644); pfb_added.add(dst.stem)
+                else:
+                    out.append(f"--extra-fonts: {f.name} is .pfa and fontforge "
+                               f"isn't installed to convert it — skipped")
+            elif ext in self._CONVERT_EXT:
+                need_convert.append(f)
+        # convert TTF/OTF/TTC
+        if need_convert:
+            conv = self._font_converter()
+            if not conv:
+                out.append(f"--extra-fonts: {len(need_convert)} TrueType/OpenType "
+                           f"font(s) need conversion but neither fontforge nor "
+                           f"ttf2pt1 is installed — install one to include them")
+            else:
+                nok = 0
+                for f in need_convert:
+                    stem = shlib / f.stem.lower()
+                    if self._convert_to_type1(f, stem):
+                        for e in (".pfb", ".afm"):
+                            p = stem.with_suffix(e)
+                            if p.exists():
+                                os.chmod(p, 0o644)
+                        pfb_added.add(stem.name); afm_added.add(stem.name); nok += 1
+                out.append(f"converted {nok}/{len(need_convert)} TrueType/OpenType "
+                           f"font(s) to Type1 with {conv[0]}")
+        # a font registers only with BOTH .pfb and .afm; warn on unpaired ones
+        paired = pfb_added & afm_added
+        lonely = (pfb_added ^ afm_added)
+        if paired:
+            out.append(f"added {len(paired)} extra font(s) to shlib10 "
+                       f"(wpfi will register them in wp.drs)")
+        if lonely:
+            out.append(f"note: {len(lonely)} extra font file(s) lack a matching "
+                       f".pfb/.afm pair and won't register: "
+                       f"{', '.join(sorted(lonely))}")
+        return out
 
     def _ship_entries(self):
         """Yield (src, dst_rel_dir, dst_name, perm, opt) for linux + ALL sections."""
@@ -714,6 +832,17 @@ class Engine:
         doesn't die on a missing file at startup."""
         out = []
         shlib = self.target / "shlib10"
+        # --extra-fonts: drop user fonts into shlib10 BEFORE wp.drs is (re)built,
+        # so the wpfi step below picks them up. If any were added, remove an
+        # existing wp.drs so the block further down regenerates it with them.
+        if self.extra_fonts:
+            fout = self._install_extra_fonts(shlib)
+            out += fout
+            if any(l.startswith("added ") or l.startswith("converted ") for l in fout):
+                drs0 = shlib / "wp.drs"
+                if drs0.exists():
+                    try: drs0.unlink()
+                    except OSError: pass
         # (1) passpost.prs: WP's factory "Passthru PostScript" printer resource.
         # WP's default-printer record (key 0x01 in .wpc8x.set/.wpc.admin) selects
         # this printer BY NAME, so WP then loads shlib10/passpost.prs and errors
@@ -1011,6 +1140,38 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         shlib = root / "shlib10"
         if not shlib.is_dir():
             raise InstallError(f"no shlib10 under {root}")
+        self.target = root
+        # --extra-fonts on an existing install: add the fonts and rebuild wp.drs
+        # via wpfi so they register — no media needed. If the caller gave no real
+        # media (the ship manifest), this is a pure font-add; do it and return.
+        fontlog: list[str] = []
+        if self.extra_fonts:
+            fontlog = self._install_extra_fonts(shlib)
+            if any(l.startswith(("added ", "converted ")) for l in fontlog):
+                # let wpfi find the shim: a user install keeps retro5.so in
+                # shbin10 (system installs have it on the ldconfig path already).
+                if (root / "shbin10").is_dir():
+                    self._shim_ldpath = str(root / "shbin10")
+                drs = shlib / "wp.drs"
+                if drs.exists():
+                    try: drs.unlink()
+                    except OSError: pass
+                if self._run_wpfi() and drs.exists():
+                    try: os.chmod(drs, 0o644)
+                    except OSError: pass
+                    fontlog.append("rebuilt wp.drs via wpfi so the new fonts are "
+                                   "listed")
+                else:
+                    fontlog.append("WARNING: could not rebuild wp.drs via wpfi; "
+                                   "the new fonts may not appear until WP rebuilds it")
+        if not (self.media / "shared/ship").is_file():
+            # no native media to repair from — a font-only --complete run
+            if not self.extra_fonts:
+                raise InstallError(
+                    f"--complete needs --media (the WP install media) to repair "
+                    f"font/driver archives; {self.media} has no shared/ship. "
+                    f"(Use --extra-fonts DIR to only add fonts, no media needed.)")
+            return fontlog or ["nothing to do"]
         self.prereqs()                      # media present + wpdecom2 built
         arch = extracted = ndrv = 0
         for src, dir2, nam2, perm, opt in self._ship_entries():
@@ -1037,7 +1198,8 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         (shlib / ".wp8.lm").write_bytes(b""); os.chmod(shlib / ".wp8.lm", 0o644)  # kill eval nag
         self.target = root
         permlog = self.fix_perms()
-        return [f"font archives: {arch} ({extracted} members) + {supp} supplementary",
+        return fontlog + [
+                f"font archives: {arch} ({extracted} members) + {supp} supplementary",
                 f"printer drivers: {ndrv}",
                 "valid .wpc.admin written"] + permlog
 
@@ -1296,6 +1458,11 @@ def main(argv):
                     help="install even if --target already exists and is "
                          "non-empty (replaces name-colliding files in place, no "
                          "backup); without it the install refuses and stops")
+    ap.add_argument("--extra-fonts", metavar="DIR",
+                    help="add fonts from DIR to WordPerfect's font list: Type1 "
+                         ".pfb/.afm are copied in; .ttf/.otf are converted to "
+                         "Type1 (needs fontforge or ttf2pt1) — wpfi then registers "
+                         "them in wp.drs")
     ap.add_argument("--system", action="store_true",
                     help="install system-wide under /opt (world-readable, system "
                          "launcher) for all users. Implied when run as root; a "
@@ -1330,7 +1497,8 @@ def main(argv):
         try:
             # media = --media if given (needed for the font/data archives), else
             # assume the root is itself a native media tree.
-            eng = Engine(a.media or a.complete, a.complete)
+            eng = Engine(a.media or a.complete, a.complete,
+                         extra_fonts=a.extra_fonts)
             for line in eng.complete(a.complete):
                 print(f"  - {line}")
             print(f"\nCompleted {a.complete}.")
@@ -1409,7 +1577,8 @@ def main(argv):
             eng = Engine(rm.root, target, make_launcher=not a.no_launcher,
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
                          version=rm.version, source_kind=kind,
-                         install_deps=a.install_deps, overwrite=a.overwrite)
+                         install_deps=a.install_deps, overwrite=a.overwrite,
+                         extra_fonts=a.extra_fonts)
             return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1
