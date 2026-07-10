@@ -23,7 +23,7 @@ The engine is UI-agnostic: run() is a generator yielding Step objects the GUI
 (or the CLI) renders. Nothing here imports GTK.
 """
 from __future__ import annotations
-import filecmp, os, re, shutil, stat, struct, subprocess, sys
+import filecmp, fnmatch, os, re, shutil, stat, struct, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -346,6 +346,52 @@ class Engine:
                         and not (shlib / f.name).exists()):
                     shutil.copyfile(f, shlib / f.name)
                     os.chmod(shlib / f.name, 0o644); n += 1
+        return n
+
+    # WP runtime resources it resolves from shlib10, and where each is used.
+    # Fonts: wp.drs lists a graphic font only if its .pfb outline (+ .afm
+    #   metrics) is in shlib10.
+    # Printer drivers: xwppmgr enumerates wp60????.??.all in shlib10.
+    # Printer resources: .prs (passpost/pssave/…) loaded by name.
+    # A retail disc drops all of these in shlib10 directly; the Corel .deb keeps
+    # some in the tree but stashes others outside it (e.g. the fonts under
+    # usr/X11R6/lib/X11/fonts/Type1/), so a bare tree-copy is incomplete —
+    # famously the document font list then shows only Courier-WP.
+    _SHLIB_RESOURCE_GLOBS = ("wp*.pfb", "wp*.afm", "wp60*.all", "*.prs")
+
+    def _harvest_shlib_resources(self, shlib: Path) -> int:
+        """Gather WP's shlib10 runtime resources (graphic fonts, printer drivers,
+        printer .prs) from anywhere in the extracted media into shlib10, no
+        matter how the media lays them out. Copies only names shlib10 is missing
+        (never clobbers a file already in the WP tree). Case-insensitive; stays
+        correct if a future .deb/disc moves these files around. Returns count."""
+        # Scan from the top of the extracted media: the .deb tree is
+        # <root>/usr/lib/wp8, and the split-out fonts live at <root>/usr/X11R6/…,
+        # so climb from the wp tree until we reach the dir that CONTAINS usr/
+        # (the extraction root). Guard against climbing all the way to the
+        # filesystem root (which also "contains" /usr) — never scan there; fall
+        # back to the media dir if there is no sane enclosing 'usr'.
+        root, cur = self.media, self.media
+        for _ in range(6):
+            if cur.parent == cur:                # hit filesystem root — stop
+                break
+            if (cur / "usr").is_dir():
+                root = cur; break
+            cur = cur.parent
+        seen, n = set(), 0
+        for f in root.rglob("*"):
+            if not f.is_file():
+                continue
+            low = f.name.lower()
+            if not any(fnmatch.fnmatch(low, g) for g in self._SHLIB_RESOURCE_GLOBS):
+                continue
+            if low in seen:                      # first match by basename wins
+                continue
+            seen.add(low)
+            dst = shlib / low
+            if dst.exists():                     # already in the WP tree — keep it
+                continue
+            self._replace_copy(f, dst); os.chmod(dst, 0o644); n += 1
         return n
 
     def _ship_entries(self):
@@ -1123,8 +1169,17 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         for pat in ("libc.so.5*", "libm.so.5*"):
             for f in (self.target / "wpbin").glob(pat):
                 f.unlink()
-        return [f"copied WordPerfect {self.version} suite tree "
-                f"({n} entries) to {self.target}"]
+        # Gather WP's shlib10 runtime resources (graphic fonts, printer drivers,
+        # .prs) from anywhere in the media — the .deb keeps only Courier-WP in
+        # the tree and stashes the other fonts under the X11 Type1 dir, so a bare
+        # tree-copy otherwise leaves the document font list showing only
+        # Courier-WP.
+        nres = self._harvest_shlib_resources(self.target / "shlib10")
+        out = [f"copied WordPerfect {self.version} suite tree "
+               f"({n} entries) to {self.target}"]
+        if nres:
+            out.append(f"gathered {nres} font/driver resource file(s) into shlib10")
+        return out
 
     # ---- orchestration ---------------------------------------------------
     STEPS = [
