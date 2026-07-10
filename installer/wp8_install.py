@@ -424,18 +424,65 @@ class Engine:
             return ("ttf2pt1", None)
         return None
 
-    # fontforge script: keep only Latin (U+0020..U+024F) + drop kerning, then
-    # emit .pfb + .afm. WP addresses glyphs through its own ~1500-char set, so a
-    # Latin subset loses nothing WP could reach — and it keeps the .afm small so
-    # wpfi (which chokes on multi-MB metrics from full Unicode fonts) stays happy.
-    _FF_SUBSET = ("Open($1); Select(0u0020,0u024f); SelectInvert(); "
-                  "DetachAndRemoveGlyphs(); RemoveAllKerns(); "
-                  "Generate($2); Generate($3)")
+    # fontforge conversion script (Python). WP's 1998 rasterizer has NO anti-
+    # aliasing and relies on a font's EMBEDDED Type1 hints — WP's own fonts are
+    # hand-hinted; a raw TTF->Type1 conversion has none, so thin stems drop out
+    # and text renders broken/ugly. So we: (1) Latin-subset (WP only addresses
+    # its own ~1500-char set, and it keeps the .afm small); (2) autoHint() every
+    # glyph; (3) reopen and derive the STANDARD stem widths (StdHW/StdVW +
+    # StemSnap) that WP-native fonts carry and that WP's rasterizer uses to snap
+    # stems to consistent pixel widths. autoHint only hints the *selected* glyphs
+    # (hence selection.all()), and the hints are only readable after a reload.
+    _FF_CONVERT_PY = r'''
+import sys, os, fontforge
+from collections import Counter
+src, out_pfb, out_afm = sys.argv[1], sys.argv[2], sys.argv[3]
+tmp = out_pfb + ".tmp.pfb"
+f = fontforge.open(src)
+f.selection.select(("ranges", "unicode"), 0x20, 0x24F)
+f.selection.invert()
+for g in list(f.selection.byGlyphs):
+    f.removeGlyph(g)
+f.selection.all()
+f.autoHint()
+f.generate(tmp)
+g = fontforge.open(tmp)
+hw, vw = Counter(), Counter()
+for gl in g.glyphs():
+    for _p, w in (getattr(gl, "hhints", ()) or ()):
+        if w > 0: hw[round(w)] += 1
+    for _p, w in (getattr(gl, "vhints", ()) or ()):
+        if w > 0: vw[round(w)] += 1
+def arr(vals): return "[" + " ".join(str(int(v)) for v in vals) + "]"
+def snap(c, n=4): return sorted(w for w, _ in c.most_common(n))
+if hw:
+    g.private["StdHW"] = arr([hw.most_common(1)[0][0]]); g.private["StemSnapH"] = arr(snap(hw))
+if vw:
+    g.private["StdVW"] = arr([vw.most_common(1)[0][0]]); g.private["StemSnapV"] = arr(snap(vw))
+g.generate(out_pfb)
+g.generate(out_afm)
+try: os.remove(tmp)
+except OSError: pass
+'''
+
+    def _ff_script_path(self) -> Path:
+        """Write the fontforge conversion script to a temp file once, reuse it."""
+        p = getattr(self, "_ff_script", None)
+        if p and Path(p).is_file():
+            return Path(p)
+        import tempfile
+        fd, name = tempfile.mkstemp(suffix="_ffconv.py")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(self._FF_CONVERT_PY)
+        self._ff_script = name
+        return Path(name)
 
     def _convert_to_type1(self, src: Path, stem_dst: Path) -> bool:
         """Convert one .ttf/.otf/.t1/.pfa at src into stem_dst.pfb + stem_dst.afm
-        (WITHOUT extension). fontforge is subsetted to Latin so the metrics stay
-        wpfi-safe; ttf2pt1 (TTF only) is a fallback. Returns True on success."""
+        (WITHOUT extension). fontforge is Latin-subset + autohinted with computed
+        standard stems (see _FF_CONVERT_PY) so it renders cleanly in WP's
+        rasterizer; ttf2pt1 (TTF only, self-hinting) is a fallback. Returns True
+        on success."""
         conv = self._font_converter()
         if not conv:
             return False
@@ -444,10 +491,11 @@ class Engine:
         afm = stem_dst.with_suffix(".afm")
         try:
             if tool == "fontforge":
-                r = self._run(["fontforge", "-quiet", "-lang=ff", "-c",
-                               self._FF_SUBSET, str(src), str(pfb), str(afm)])
+                self._run(["fontforge", "-quiet", "-script",
+                           str(self._ff_script_path()),
+                           str(src), str(pfb), str(afm)])
             else:  # ttf2pt1: "-b" = binary .pfb; writes <out>.pfb and <out>.afm
-                r = self._run(["ttf2pt1", "-b", str(src), str(stem_dst)])
+                self._run(["ttf2pt1", "-b", str(src), str(stem_dst)])
             return pfb.exists() and afm.exists()
         except Exception:
             return False
@@ -652,7 +700,7 @@ class Engine:
             out.append(f"added {n_type1} Type1 font(s) to shlib10")
         if n_conv:
             out.append(f"converted {n_conv} font(s) to Type1 (Latin subset, "
-                       f"kern-stripped) and added them")
+                       f"autohinted for WP's rasterizer) and added them")
         if n_need_ff:
             out.append(f"--extra-fonts: {n_need_ff} font(s) need fontforge/ttf2pt1 "
                        f"to convert to Type1 — install fontforge to include them")
