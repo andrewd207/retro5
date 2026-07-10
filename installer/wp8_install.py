@@ -424,9 +424,18 @@ class Engine:
             return ("ttf2pt1", None)
         return None
 
+    # fontforge script: keep only Latin (U+0020..U+024F) + drop kerning, then
+    # emit .pfb + .afm. WP addresses glyphs through its own ~1500-char set, so a
+    # Latin subset loses nothing WP could reach — and it keeps the .afm small so
+    # wpfi (which chokes on multi-MB metrics from full Unicode fonts) stays happy.
+    _FF_SUBSET = ("Open($1); Select(0u0020,0u024f); SelectInvert(); "
+                  "DetachAndRemoveGlyphs(); RemoveAllKerns(); "
+                  "Generate($2); Generate($3)")
+
     def _convert_to_type1(self, src: Path, stem_dst: Path) -> bool:
-        """Convert one .ttf/.otf at src into stem_dst.pfb + stem_dst.afm.
-        stem_dst is the output path WITHOUT extension. Returns True on success."""
+        """Convert one .ttf/.otf/.t1/.pfa at src into stem_dst.pfb + stem_dst.afm
+        (WITHOUT extension). fontforge is subsetted to Latin so the metrics stay
+        wpfi-safe; ttf2pt1 (TTF only) is a fallback. Returns True on success."""
         conv = self._font_converter()
         if not conv:
             return False
@@ -435,33 +444,151 @@ class Engine:
         afm = stem_dst.with_suffix(".afm")
         try:
             if tool == "fontforge":
-                script = "Open($1); Generate($2); Generate($3)"
-                r = self._run(["fontforge", "-quiet", "-lang=ff", "-c", script,
-                               str(src), str(pfb), str(afm)])
+                r = self._run(["fontforge", "-quiet", "-lang=ff", "-c",
+                               self._FF_SUBSET, str(src), str(pfb), str(afm)])
             else:  # ttf2pt1: "-b" = binary .pfb; writes <out>.pfb and <out>.afm
                 r = self._run(["ttf2pt1", "-b", str(src), str(stem_dst)])
             return pfb.exists() and afm.exists()
         except Exception:
             return False
 
+    def _discover_type1_fonts(self) -> list[Path] | None:
+        """Ask fontconfig (fc-list) for the Type1 fonts installed on the system.
+        Returns the .pfb outline files (WP's native format; their .afm sit
+        alongside). Returns None if fc-list isn't installed. Prefers .pfb and
+        skips .t1/.pfa duplicates of a font we already have as .pfb, so a box
+        with both /usr/share/fonts/X11/Type1 (.pfb) and .../type1/*/... (.t1)
+        doesn't list every face twice."""
+        if not shutil.which("fc-list"):
+            return None
+        r = self._run(["fc-list", ":fontformat=Type 1", "file"])
+        pfb, other = [], []
+        for line in r.stdout.splitlines():
+            p = line.split(":", 1)[0].strip()
+            if not p:
+                continue
+            (pfb if p.lower().endswith(".pfb") else other).append(Path(p))
+        # include a .t1/.pfa only if no .pfb of the same stem was found
+        pfb_stems = {p.stem.lower() for p in pfb}
+        extra = [p for p in other if p.suffix.lower() in (".t1", ".pfa")
+                 and p.stem.lower() not in pfb_stems]
+        return pfb + extra
+
+    # In 'auto' mode we convert TrueType/OpenType only for these Latin TEXT
+    # families (matched EXACTLY against a font's family list, so "Noto Sans" is
+    # included but "Noto Sans Gujarati" is not) — and only their standard four
+    # styles (see _discover_curated_ttf). This keeps a desktop's ~3200 TTF/OTF
+    # (2000+ of them CJK/emoji, which don't convert to Type1) from flooding WP.
+    _CURATED_TTF_FAMILIES = frozenset({
+        "dejavu sans", "dejavu serif", "dejavu sans mono",
+        "liberation sans", "liberation serif", "liberation mono",
+        "noto sans", "noto serif", "noto sans mono", "noto mono",
+        "ubuntu", "ubuntu mono", "freesans", "freeserif", "freemono",
+        "cantarell", "gelasio", "tinos", "arimo", "cousine",
+        "bitstream vera sans", "bitstream vera serif", "bitstream vera sans mono",
+        "open sans", "roboto", "roboto mono", "lato",
+        "source code pro", "source sans pro",
+    })
+
+    def _discover_curated_ttf(self) -> list[Path]:
+        """fc-list the system's TrueType/OpenType fonts and return the standard
+        four styles (Regular/Bold/Italic/BoldItalic, normal width) of the curated
+        Latin text families only. Empty if fc-list is missing."""
+        if not shutil.which("fc-list"):
+            return []
+        r = self._run(["fc-list", "-f",
+                       "%{file}\t%{family}\t%{weight}\t%{slant}\t%{width}\n"])
+        hits: list[Path] = []
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 5:
+                continue
+            path, fams, wt, sl, wd = parts[:5]
+            if not path.lower().endswith((".ttf", ".otf", ".ttc")):
+                continue
+            names = {x.strip().lower() for x in fams.split(",")}
+            if not (names & self._CURATED_TTF_FAMILIES):
+                continue
+            try:
+                wt, sl, wd = int(wt), int(sl), int(wd)
+            except ValueError:
+                continue
+            if wd != 100 or wt not in (80, 200) or sl not in (0, 100):
+                continue                       # normal width, regular/bold, roman/italic
+            hits.append(Path(path))
+        return sorted(set(hits))
+
+    def _extra_font_sources(self) -> list[Path] | None:
+        """Resolve --extra-fonts to a list of font files. A directory yields its
+        files; 'auto'/'system'/'fontconfig' discovers, via fc-list, the system's
+        Type1 fonts (copied) plus a curated set of common Latin TrueType families
+        (converted). Returns None if 'auto' is asked but fc-list is missing."""
+        ef = self.extra_fonts
+        if str(ef).lower() in ("auto", "system", "fontconfig"):
+            t1 = self._discover_type1_fonts()
+            if t1 is None:                     # no fc-list at all
+                return None
+            return t1 + self._discover_curated_ttf()
+        if ef.is_dir():
+            return [f for f in sorted(ef.iterdir()) if f.is_file()]
+        return []
+
     def _install_extra_fonts(self, shlib: Path) -> list[str]:
         """Add the user's fonts from self.extra_fonts into shlib10 so wpfi
-        registers them in wp.drs (WP then lists them). Ready Type1 .pfb/.afm are
-        copied verbatim (WP's native format); .ttf/.otf/.ttc are converted to
-        Type1 first. .pfa is converted to .pfb if fontforge is present, else
-        skipped with a note. Only fonts that end up with BOTH a .pfb and a
-        matching .afm actually register, so we report the pairs installed."""
+        registers them in wp.drs (WP then lists them). --extra-fonts is a
+        directory of fonts, or 'auto'/'system' to pull the system's Type1 fonts
+        via fontconfig. Ready Type1 .pfb are copied verbatim with their sibling
+        .afm; .ttf/.otf/.ttc (and .t1/.pfa) are converted to Type1 first. Only a
+        font with BOTH a .pfb and a matching .afm registers, so we report pairs."""
         out: list[str] = []
         src = self.extra_fonts
-        if not src or not src.is_dir():
-            if src:
-                out.append(f"--extra-fonts: {src} is not a directory — skipped")
+        srcs = self._extra_font_sources()
+        if srcs is None:
+            out.append("--extra-fonts auto: fontconfig (fc-list) isn't installed "
+                       "— can't discover system fonts (install fontconfig, or pass "
+                       "a fonts directory instead)")
+            return out
+        if not srcs:
+            out.append(f"--extra-fonts: {src} is not a directory or usable font "
+                       f"source — skipped")
             return out
         shlib.mkdir(parents=True, exist_ok=True)
         pfb_added: set[str] = set()
         afm_added: set[str] = set()
         need_convert = []
-        for f in sorted(src.iterdir()):
+        # track category + FontName so the wp.drs rebuild can drop converted
+        # fonts first on wpfi failure, and so we skip duplicate/oversized ones.
+        self._extra_type1: set[str] = set()
+        self._extra_converted: set[str] = set()
+        seen_fontnames: set[str] = set()
+
+        def _keep_converted(stem: Path) -> bool:
+            """After a conversion, enforce the wpfi-safety rules: both files must
+            exist, the .afm must be reasonably small (a font that didn't subset),
+            and its FontName must be new. Removes the pair and returns False if
+            not kept."""
+            pfb, afm = stem.with_suffix(".pfb"), stem.with_suffix(".afm")
+            if not (pfb.exists() and afm.exists()):
+                return False
+            if afm.stat().st_size > 200_000:      # un-subsettable monster — protect wpfi
+                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True)
+                return False
+            fn = None
+            for ln in afm.read_text(errors="replace").splitlines():
+                if ln.startswith("FontName"):
+                    fn = ln.split(None, 1)[-1].strip(); break
+                if ln.startswith("StartCharMetrics"):
+                    break
+            if fn and fn in seen_fontnames:       # duplicate FontName — dedupe
+                pfb.unlink(missing_ok=True); afm.unlink(missing_ok=True)
+                return False
+            if fn:
+                seen_fontnames.add(fn)
+            for p in (pfb, afm):
+                os.chmod(p, 0o644)
+            return True
+
+        for f in srcs:
             if not f.is_file():
                 continue
             ext = f.suffix.lower()
@@ -469,37 +596,32 @@ class Engine:
                 dst = shlib / f.name.lower()
                 self._replace_copy(f, dst); os.chmod(dst, 0o644)
                 (pfb_added if ext == ".pfb" else afm_added).add(dst.stem)
-            elif ext == ".pfa":
-                if shutil.which("fontforge"):
-                    dst = shlib / (f.stem.lower() + ".pfb")
-                    r = self._run(["fontforge", "-quiet", "-lang=ff", "-c",
-                                   "Open($1); Generate($2)", str(f), str(dst)])
-                    if dst.exists():
-                        os.chmod(dst, 0o644); pfb_added.add(dst.stem)
-                else:
-                    out.append(f"--extra-fonts: {f.name} is .pfa and fontforge "
-                               f"isn't installed to convert it — skipped")
-            elif ext in self._CONVERT_EXT:
+                self._extra_type1.add(dst.stem)
+                # a .pfb discovered on its own (fc-list) — grab its sibling .afm
+                if ext == ".pfb":
+                    sib = f.with_suffix(".afm")
+                    if sib.is_file():
+                        ad = shlib / sib.name.lower()
+                        self._replace_copy(sib, ad); os.chmod(ad, 0o644)
+                        afm_added.add(ad.stem); self._extra_type1.add(ad.stem)
+            elif ext in (".pfa", ".t1", ".ttf", ".otf", ".ttc"):
                 need_convert.append(f)
-        # convert TTF/OTF/TTC
+        # convert everything that isn't already .pfb/.afm
         if need_convert:
             conv = self._font_converter()
             if not conv:
-                out.append(f"--extra-fonts: {len(need_convert)} TrueType/OpenType "
-                           f"font(s) need conversion but neither fontforge nor "
-                           f"ttf2pt1 is installed — install one to include them")
+                out.append(f"--extra-fonts: {len(need_convert)} font(s) need "
+                           f"conversion to Type1 but neither fontforge nor ttf2pt1 "
+                           f"is installed — install one (fontforge) to include them")
             else:
                 nok = 0
                 for f in need_convert:
                     stem = shlib / f.stem.lower()
-                    if self._convert_to_type1(f, stem):
-                        for e in (".pfb", ".afm"):
-                            p = stem.with_suffix(e)
-                            if p.exists():
-                                os.chmod(p, 0o644)
-                        pfb_added.add(stem.name); afm_added.add(stem.name); nok += 1
-                out.append(f"converted {nok}/{len(need_convert)} TrueType/OpenType "
-                           f"font(s) to Type1 with {conv[0]}")
+                    if self._convert_to_type1(f, stem) and _keep_converted(stem):
+                        pfb_added.add(stem.name); afm_added.add(stem.name)
+                        self._extra_converted.add(stem.name); nok += 1
+                out.append(f"converted {nok}/{len(need_convert)} font(s) to Type1 "
+                           f"with {conv[0]} (Latin subset; kern-stripped)")
         # a font registers only with BOTH .pfb and .afm; warn on unpaired ones
         paired = pfb_added & afm_added
         lonely = (pfb_added ^ afm_added)
@@ -793,6 +915,55 @@ class Engine:
                     pass
         return drs.exists()
 
+    def _rebuild_wp_drs(self, shlib: Path) -> list[str]:
+        """Regenerate wp.drs via wpfi and GUARANTEE a valid result. wpfi is
+        all-or-nothing: one font it rejects corrupts the whole file (a broken
+        wp.drs is only a few hundred bytes and would leave WP with NO graphic
+        fonts). So try with every font present; if the result is broken, drop the
+        converted extras (fontforge output wpfi may reject as a set), then the
+        Type1 extras too, until wpfi produces a valid file. Always ends valid if
+        WP's own fonts do. Uses _extra_converted/_extra_type1 from
+        _install_extra_fonts. Returns log lines."""
+        drs = shlib / "wp.drs"
+        def _valid() -> bool:
+            try:
+                return drs.exists() and drs.stat().st_size >= 8000
+            except OSError:
+                return False
+        def _regen() -> bool:
+            if drs.exists():
+                try: drs.unlink()
+                except OSError: pass
+            self._run_wpfi()
+            if _valid():
+                try: os.chmod(drs, 0o644)
+                except OSError: pass
+                return True
+            return False
+        def _drop(stems):
+            for s in stems:
+                for e in (".pfb", ".afm"):
+                    (shlib / f"{s}{e}").unlink(missing_ok=True)
+        if _regen():
+            return ["rebuilt wp.drs via wpfi (all fonts registered)"]
+        conv = getattr(self, "_extra_converted", set())
+        if conv:
+            _drop(conv)
+            if _regen():
+                return [f"wpfi rejected the converted TrueType set; rebuilt wp.drs "
+                        f"without them — {len(conv)} converted font(s) dropped, "
+                        f"Type1 fonts kept"]
+        t1 = getattr(self, "_extra_type1", set())
+        if t1:
+            _drop(t1)
+            if _regen():
+                return ["wpfi rejected the extra fonts; rebuilt wp.drs from WP's "
+                        "own fonts only (extra fonts not added)"]
+        if _regen():
+            return ["rebuilt wp.drs via wpfi"]
+        return ["WARNING: wpfi could not build a valid wp.drs; the font list may "
+                "be incomplete"]
+
     def runtime_config(self):
         out = self.install_shim()
         shlib = self.target / "shlib10"; shlib.mkdir(parents=True, exist_ok=True)
@@ -832,17 +1003,14 @@ class Engine:
         doesn't die on a missing file at startup."""
         out = []
         shlib = self.target / "shlib10"
-        # --extra-fonts: drop user fonts into shlib10 BEFORE wp.drs is (re)built,
-        # so the wpfi step below picks them up. If any were added, remove an
-        # existing wp.drs so the block further down regenerates it with them.
+        # --extra-fonts: drop user fonts into shlib10 and rebuild wp.drs (with the
+        # validate/fallback guard) so wpfi registers them. This produces a valid
+        # wp.drs, so the generic wp.drs block further down then no-ops.
         if self.extra_fonts:
             fout = self._install_extra_fonts(shlib)
             out += fout
-            if any(l.startswith("added ") or l.startswith("converted ") for l in fout):
-                drs0 = shlib / "wp.drs"
-                if drs0.exists():
-                    try: drs0.unlink()
-                    except OSError: pass
+            if any(l.startswith(("added ", "converted ")) for l in fout):
+                out += self._rebuild_wp_drs(shlib)
         # (1) passpost.prs: WP's factory "Passthru PostScript" printer resource.
         # WP's default-printer record (key 0x01 in .wpc8x.set/.wpc.admin) selects
         # this printer BY NAME, so WP then loads shlib10/passpost.prs and errors
@@ -1152,18 +1320,7 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
                 # shbin10 (system installs have it on the ldconfig path already).
                 if (root / "shbin10").is_dir():
                     self._shim_ldpath = str(root / "shbin10")
-                drs = shlib / "wp.drs"
-                if drs.exists():
-                    try: drs.unlink()
-                    except OSError: pass
-                if self._run_wpfi() and drs.exists():
-                    try: os.chmod(drs, 0o644)
-                    except OSError: pass
-                    fontlog.append("rebuilt wp.drs via wpfi so the new fonts are "
-                                   "listed")
-                else:
-                    fontlog.append("WARNING: could not rebuild wp.drs via wpfi; "
-                                   "the new fonts may not appear until WP rebuilds it")
+                fontlog += self._rebuild_wp_drs(shlib)
         if not (self.media / "shared/ship").is_file():
             # no native media to repair from — a font-only --complete run
             if not self.extra_fonts:
@@ -1458,11 +1615,14 @@ def main(argv):
                     help="install even if --target already exists and is "
                          "non-empty (replaces name-colliding files in place, no "
                          "backup); without it the install refuses and stops")
-    ap.add_argument("--extra-fonts", metavar="DIR",
-                    help="add fonts from DIR to WordPerfect's font list: Type1 "
-                         ".pfb/.afm are copied in; .ttf/.otf are converted to "
-                         "Type1 (needs fontforge or ttf2pt1) — wpfi then registers "
-                         "them in wp.drs")
+    ap.add_argument("--extra-fonts", metavar="DIR|auto",
+                    help="add fonts to WordPerfect's font list. DIR: Type1 "
+                         ".pfb/.afm are copied in, .ttf/.otf converted to Type1 "
+                         "(needs fontforge or ttf2pt1). 'auto': discover via "
+                         "fontconfig — all system Type1 fonts plus the standard "
+                         "styles of common Latin TrueType families (DejaVu, "
+                         "Liberation, Noto, Ubuntu, …). wpfi then registers them "
+                         "in wp.drs.")
     ap.add_argument("--system", action="store_true",
                     help="install system-wide under /opt (world-readable, system "
                          "launcher) for all users. Implied when run as root; a "
