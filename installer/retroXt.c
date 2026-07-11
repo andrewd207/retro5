@@ -254,7 +254,7 @@ static void rx_install_detours81(void)
     n++;
     WP81_DETOUR_LIST(X)
 #undef X
-    detour_log = rx_detour_log;
+    if (rx_verbose) detour_log = rx_detour_log;   /* per-detour install log: trace only */
     detour_install(tab, n);
 }
 #endif /* RX_STATIC81 */
@@ -314,8 +314,16 @@ static void rx_init(void)
         }
     }
 #endif
-    rx_log("loaded (wheel-scroll %d/notch; cairo=%s; RETROXT_TRACE=1 dumps widgets)",
-           rx_wheel_lines, rx_cairo_ok ? "on" : "OFF");
+    /* Quiet by default (WP is usually launched with no terminal; stderr spam is
+     * noise).  RETROXT_TRACE=1 turns on the full diagnostic stream.  Only an
+     * actionable problem -- cairo missing so the reskin can't draw -- is reported
+     * unconditionally. */
+    if (rx_verbose)
+        rx_log("loaded (wheel-scroll %d/notch; cairo=%s; RETROXT_TRACE=1 dumps widgets)",
+               rx_wheel_lines, rx_cairo_ok ? "on" : "OFF");
+    else if (!rx_cairo_ok)
+        rx_log("cairo unavailable -> reskin drawing OFF (install 32-bit cairo). "
+               "Set RETROXT_TRACE=1 for details.");
 }
 
 /* ------------------------------------------------ real-symbol resolution ---- */
@@ -1826,7 +1834,7 @@ int XCopyArea(Display *d, Drawable src, Drawable dst, GC gc, int sx, int sy,
 int XClearArea(Display *d, Window win, int x, int y, unsigned int w, unsigned int h, Bool exp)
 {
     REAL(XClearArea);
-    if (!rx_in_my_draw) { int bi = rx_drawbtn ? rx_btn_index(win) : -1;
+    if (rx_verbose && !rx_in_my_draw) { int bi = rx_drawbtn ? rx_btn_index(win) : -1;
         if (bi >= 0) rx_log("WIPE XClearArea btn %d %d,%d %ux%u exp=%d", bi, x, y, w, h, exp); }
     if (rx_is_owned_drawable(win)) return 0;
     return real_XClearArea(d, win, x, y, w, h, exp);
@@ -1834,7 +1842,7 @@ int XClearArea(Display *d, Window win, int x, int y, unsigned int w, unsigned in
 int XClearWindow(Display *d, Window win)
 {
     REAL(XClearWindow);
-    if (!rx_in_my_draw) { int bi = rx_drawbtn ? rx_btn_index(win) : -1;
+    if (rx_verbose && !rx_in_my_draw) { int bi = rx_drawbtn ? rx_btn_index(win) : -1;
         if (bi >= 0) rx_log("WIPE XClearWindow btn %d", bi); }
     if (rx_is_owned_drawable(win)) return 0;   /* would wipe our rendering */
     return real_XClearWindow(d, win);
@@ -2207,7 +2215,7 @@ static void rx_note_widget(Widget w)
         if (strcmp(name, "scrollbar0") == 0) {
             rx_docsb = w;
             rx_docshell = rx_shell(w);
-            rx_log("captured document vscroll '%s' (%ux%u)", name, wd, h);
+            if (rx_verbose) rx_log("captured document vscroll '%s' (%ux%u)", name, wd, h);
         } else if (h > wd && h > rx_tallh) {       /* vertical + tallest so far */
             rx_tallsb = w;
             rx_tallh  = h;
