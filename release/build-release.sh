@@ -33,6 +33,22 @@ install -m0644 "$HERE/README.md"           "$STAGE/README.md"
 install -m0644 "$REPO/LICENSE"             "$STAGE/LICENSE"
 # approach B: the full installer, verbatim
 cp -r "$REPO/installer/." "$STAGE/installer/"
+# prune wp81port/ dev-only artifacts (the reskin needs only the prebuilt
+# retroXt81.so + the sources/Makefile to rebuild it; the address-mapping
+# corpus, BSim/Ghidra tooling, and the dead path-B carcass never ship).
+if [ -d "$STAGE/installer/wp81port" ]; then
+    ( cd "$STAGE/installer/wp81port"
+      rm -f bsim_*.tsv named_entrypoints.tsv ambiguous_entrypoints.tsv \
+            exact_matches_rh40.json \
+            wp81_fullsyms.o wp81_fullsyms.s wp81_fullsyms.gdb \
+            wp81_forward.so wp81_forward.c wp81_forward.h \
+            wp81_names.o wp81_names.s wp81_verify.py wp81_verify.gdb \
+            wp81_verify_checks.tsv wp81_xsyms.o wp81_xsyms.s \
+            wp81_xt_symbols.map wp81_xt_symbols.nm verify.gdb \
+            detour_selftest match81.py patch81.py map_internal.py \
+            final_map.py gen_syms.py locate_op.py \
+            *.java 2>/dev/null || true )
+fi
 # ...plus the tooling the installer's Engine resolves relative to the bundle
 # root (TOOLING = installer/../): the ship-archive decompressor source it
 # compiles with gcc, and the shim at the path self.compat expects. Without

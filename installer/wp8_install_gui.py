@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Andrew Haines
-"""wp8_installer.py - GTK4 wizard front-end for wp8_install.Engine.
+"""wp8_install_gui.py - GTK4 wizard front-end for wp8_install.Engine.
 
 Zero-to-installed WordPerfect 8 (user-local, no root). Three pages:
   Welcome -> Options (media/target) -> Progress -> Done.
 The engine runs in a worker thread; steps stream back to the UI.
 
-Run:  python3 wp8_installer.py
+Run:  python3 wp8_install_gui.py
 """
 import os
 import shutil
@@ -257,6 +257,14 @@ class Installer(Gtk.Application):
             "client and the menus need X fonts. Installs them with your admin "
             "password. Uncheck if you'll install them yourself.")
         b.append(self.deps_chk)
+        self.reskin_chk = Gtk.CheckButton(
+            label="Modern look (retroXt reskin — flat scrollbars, crisp fonts, modern buttons)")
+        self.reskin_chk.set_tooltip_text(
+            "Installs the retroXt reskin so WordPerfect's 1998 Motif UI renders in a "
+            "modern flat style (via cairo). Fully reversible and safe: it only touches "
+            "this exact install and no-ops on any other binary. Adds 32-bit cairo to the "
+            "package install.")
+        b.append(self.reskin_chk)
         self.repair_chk = Gtk.CheckButton(
             label="Repair only — re-add fonts/drivers/config to the tree above (keep binaries)")
         self.repair_chk.set_tooltip_text(
@@ -445,11 +453,12 @@ class Installer(Gtk.Application):
         threading.Thread(target=self._worker,
                          args=(chosen, target, self.system_chk.get_active(),
                                self.launcher_chk.get_active(), make_desktop, overwrite,
-                               self.deps_chk.get_active(), self.repair_chk.get_active()),
+                               self.deps_chk.get_active(), self.repair_chk.get_active(),
+                               self.reskin_chk.get_active()),
                          daemon=True).start()
 
     def _worker(self, chosen, target, system, make_launcher, make_desktop,
-                overwrite=False, deps=True, repair=False):
+                overwrite=False, deps=True, repair=False, reskin=False):
         ok = True; stats = {}
         engine_py = str(Path(__file__).with_name("wp8_install.py"))
         # user (non-system) install + deps: elevate JUST the packages via pkexec
@@ -457,7 +466,10 @@ class Installer(Gtk.Application):
         if deps and not system:
             GLib.idle_add(self._on_step,
                           Step("deps", "Installing required packages (admin password)…", 0.02, ok=True))
-            self._stream_cmd(["pkexec", sys.executable, engine_py, "--deps-only"])
+            deps_cmd = ["pkexec", sys.executable, engine_py, "--deps-only"]
+            if reskin:
+                deps_cmd.append("--reskin")     # pull 32-bit cairo too
+            self._stream_cmd(deps_cmd)
         if repair:
             self._do_repair(chosen, target, system, engine_py)
             return
@@ -480,6 +492,8 @@ class Installer(Gtk.Application):
                 cmd.append("--no-launcher")
             if not make_desktop:
                 cmd.append("--no-desktop")
+            if reskin:
+                cmd.append("--reskin")
             self._stream_elevated(cmd, target)
             return
         else:
@@ -489,7 +503,7 @@ class Installer(Gtk.Application):
                     eng = Engine(rm.root, target, make_launcher=make_launcher,
                                  make_desktop=make_desktop,
                                  version=rm.version, source_kind=kind,
-                                 overwrite=overwrite)
+                                 overwrite=overwrite, reskin=reskin)
                     for step in eng.run():
                         GLib.idle_add(self._on_step, step)
                         stats = eng.stats

@@ -15,7 +15,7 @@ you're starting from. **Read "Which one do I use?" first.**
 
 | | **A. Convert an existing install** | **B. Fresh install from your media** |
 |---|---|---|
-| Script | `retro5-setup.sh` | `installer/wp8_installer.py` |
+| Script | `retro5-setup.sh` | `installer/wp8_install_gui.py` |
 | Start from | a WP tree already on disk | a WP CD / ISO / `.deb` you own |
 | Installs WordPerfect? | **No** — converts a tree you already have | **Yes** — lays down a clean tree |
 | Typical root | `/usr/lib/wp8` (from `wp81in.sh`) | `~/.local/share/wordperfect/<ver>` or `/opt/wordperfect8` |
@@ -69,7 +69,7 @@ launcher if it doesn't set them already. The keys fix needs **no** env change.
 ## B. Fresh install from your media — the installer
 
 ```bash
-python3 installer/wp8_installer.py            # GUI
+python3 installer/wp8_install_gui.py            # GUI
 python3 installer/wp8_install.py --help       # CLI / advanced
 ```
 

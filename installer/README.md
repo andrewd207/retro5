@@ -29,7 +29,7 @@ media — nothing is written back to the disc/ISO.
 GUI (GTK4 wizard):
 
 ```sh
-python3 wp8_installer.py
+python3 wp8_install_gui.py
 sh install-desktop.sh      # add "Install WordPerfect 8" to your app menu
 ```
 
