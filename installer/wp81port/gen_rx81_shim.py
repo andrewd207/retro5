@@ -24,7 +24,7 @@ NOOP={'XCopyGC'}
 
 # the exact set retroXt81 imports (nm -D retroXt81.so | awk '$1=="U"' | grep X)
 HELPERS="""XAllocColor XCopyGC XCreateGC XCreateImage XCreatePixmap XExtentsOfFontSet XFlush
-XFreeFontInfo XFreeGC XFreePixmap XGetGCValues XQueryColor XQueryFont XSetForeground
+XFree XGetAtomName XFreeFontInfo XFreeGC XFreePixmap XGetGCValues XQueryColor XQueryFont XSetForeground
 XtAddCallback XtAddEventHandler XtAppAddTimeOut XtCallCallbacks XtDisplayOfObject XtHasCallbacks
 XtIsManaged XtIsSensitive XtName XtTranslateCoords XtVaGetValues XtVaSetValues
 XtWidgetToApplicationContext XtWindowOfObject XtWindowToWidget""".split()

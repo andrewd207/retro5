@@ -23,6 +23,12 @@ make -C "$REPO/retro5" clean >/dev/null 2>&1 || true
 make -C "$REPO/retro5" >/dev/null
 [ -f "$REPO/retro5/retro5.so" ] || { echo "build failed: no retro5.so"; exit 1; }
 
+echo "== building retroXt reskin libs (8.0 exported + 8.1 detour) =="
+make -C "$REPO/installer" clean >/dev/null 2>&1 || true
+make -C "$REPO/installer" all >/dev/null
+[ -f "$REPO/installer/retroXt.so" ]            || { echo "build failed: no retroXt.so (8.0)"; exit 1; }
+[ -f "$REPO/installer/wp81port/retroXt81.so" ] || { echo "build failed: no retroXt81.so (8.1)"; exit 1; }
+
 echo "== staging $NAME =="
 mkdir -p "$STAGE/installer"
 install -m0755 "$HERE/retro5-setup.sh"     "$STAGE/retro5-setup.sh"

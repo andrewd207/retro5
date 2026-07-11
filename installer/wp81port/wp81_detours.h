@@ -45,9 +45,11 @@
     X(XPutImage                 , 0x08682c70, 6) \
     X(XSetClipRectangles        , 0x08685940, 5) \
     X(XSetClipMask              , 0x08685990, 7) \
-    X(XDrawString               , 0x08686930, 6)
+    X(XDrawString               , 0x08686930, 6) \
+    X(XTextExtents              , 0x08686ce0, 6) \
+    X(XTextWidth                , 0x08686f50, 6)
 
-#define WP81_NDETOUR 30
+#define WP81_NDETOUR 32
 
 /* per-name absolute address + steal length */
 #define WP81_ADDR_XtDispatchEvent            0x08657ab0
@@ -110,5 +112,9 @@
 #define WP81_STEAL_XSetClipMask              7
 #define WP81_ADDR_XDrawString                0x08686930
 #define WP81_STEAL_XDrawString               6
+#define WP81_ADDR_XTextExtents               0x08686ce0
+#define WP81_STEAL_XTextExtents              6
+#define WP81_ADDR_XTextWidth                 0x08686f50
+#define WP81_STEAL_XTextWidth                6
 
 #endif
