@@ -434,10 +434,15 @@ class Engine:
     # stems to consistent pixel widths. autoHint only hints the *selected* glyphs
     # (hence selection.all()), and the hints are only readable after a reload.
     _FF_CONVERT_PY = r'''
-import sys, os, fontforge
+import sys, os, tempfile, fontforge
 from collections import Counter
 src, out_pfb, out_afm = sys.argv[1], sys.argv[2], sys.argv[3]
-tmp = out_pfb + ".tmp.pfb"
+# The intermediate MUST NOT live beside the outputs in shlib10: fontforge drops
+# a companion .afm next to every .pfb it generates, and a stray long-named .afm
+# with no matching .pfb makes wpfi abort the WHOLE batch (no wp.drs). Keep it in
+# the system temp dir, and remove it plus that companion .afm afterward, so only
+# the final <=8.3 pair ever lands in shlib10.
+_fd, tmp = tempfile.mkstemp(suffix=".pfb"); os.close(_fd)
 f = fontforge.open(src)
 f.selection.select(("ranges", "unicode"), 0x20, 0x24F)
 f.selection.invert()
@@ -461,8 +466,9 @@ if vw:
     g.private["StdVW"] = arr([vw.most_common(1)[0][0]]); g.private["StemSnapV"] = arr(snap(vw))
 g.generate(out_pfb)
 g.generate(out_afm)
-try: os.remove(tmp)
-except OSError: pass
+for x in (tmp, os.path.splitext(tmp)[0] + ".afm", tmp + ".afm"):
+    try: os.remove(x)
+    except OSError: pass
 '''
 
     def _ff_script_path(self) -> Path:
@@ -609,7 +615,7 @@ except OSError: pass
         'auto'/'system' to pull the system's fonts via fontconfig. Ready Type1
         .pfb are copied (their .afm copied if present, else synthesised with
         fontforge); .ttf/.otf/.ttc/.t1/.pfa are converted to Type1 (Latin subset).
-        Every pair is written under a <=15-char basename (see _short_font_name)
+        Every pair is written under a <=8-char basename (see _short_font_name)
         or wpfi rejects it. Only a font with BOTH .pfb and .afm registers."""
         out: list[str] = []
         src = self.extra_fonts
@@ -695,6 +701,16 @@ except OSError: pass
                     self._extra_converted.add(short); n_conv += 1
                 else:
                     used_names.discard(short)
+
+        # Hygiene guard: wpfi is all-or-nothing, so a single stray file kills the
+        # whole run. Remove any leftover conversion intermediate, and any .afm
+        # with no sibling .pfb (an unpaired/oversized metric), before wpfi scans.
+        for pat in ("*.pfb.tmp", "*.pfb.tmp.*", "*.tmp.pfb", "*.tmp.afm"):
+            for junk in shlib.glob(pat):
+                junk.unlink(missing_ok=True)
+        for afm in shlib.glob("*.afm"):
+            if not afm.with_suffix(".pfb").exists():
+                afm.unlink(missing_ok=True)
 
         if n_type1:
             out.append(f"added {n_type1} Type1 font(s) to shlib10")
@@ -959,6 +975,19 @@ except OSError: pass
         shbin = self.target / "shbin10"
         wpfi  = shbin / "wpfi"
         drs   = self.target / "shlib10" / "wp.drs"
+        # Some editions (e.g. the 8.0 retail tree) ship only the X font installer
+        # xwpfi, not the headless 'wpfi' the Corel .deb postinst runs — so wp.drs
+        # can never be built without a display. If this tree lacks wpfi, borrow the
+        # already-retargeted headless binary from a sibling install (same pattern
+        # as passpost.prs); wp.drs is a version-independent WP8 format.
+        if not wpfi.exists():
+            for sib in sorted(self.target.parent.glob("*/shbin10/wpfi")):
+                if sib.is_file():
+                    try:
+                        shutil.copy2(sib, wpfi); os.chmod(wpfi, 0o755)
+                    except OSError:
+                        continue
+                    break
         if not (wpfi.exists() and os.access(wpfi, os.X_OK)):
             return drs.exists()                 # native discs ship wp.drs directly
         env = dict(os.environ)
