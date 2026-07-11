@@ -674,6 +674,8 @@ static void rx_draw_scrollbar(Widget w)
 #define RX_KIND_DOWN 1
 #define RX_KIND_UP   2
 #define RX_GADGET_FS 13         /* fixed label font size for windowless dialog buttons */
+#define RX_MENU_FS_SCALE 0.9    /* menu text: cairo renders Motif's label height a touch
+                                 * large, so scale it down a bit (bar + dropdown items) */
 #define RX_MENU_NORMAL  0       /* is_menu kind: plain item */
 #define RX_MENU_CASCADE 1       /* has a submenu -> draw a chevron */
 #define RX_MENU_TOGGLE  2       /* checkbox item -> draw a check box */
@@ -1099,7 +1101,7 @@ static void rx_render_btn(int bi)
     }
 
     if (b->is_menu) {                                    /* FLAT menu item: hover bg + crisp label */
-        double fs = b->font_h > 0 ? b->font_h : RX_GADGET_FS;
+        double fs = (b->font_h > 0 ? b->font_h : RX_GADGET_FS) * RX_MENU_FS_SCALE;
         if (b->armed || b->hovered) cairo_set_source_rgb(cr, 0.80, 0.87, 0.97);  /* hover/active accent */
         else                        cairo_set_source_rgb(cr, 0.912, 0.912, 0.912);/* menu grey */
         cairo_paint(cr);
