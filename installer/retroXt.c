@@ -41,6 +41,19 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 
+#ifdef RX_STATIC81
+/* WP 8.1 build: xwp links Xt/X11 STATICALLY, so the hooks below can't be reached
+ * by LD_PRELOAD symbol interposition -- they are installed as inline detours over
+ * the fixed absolute addresses mapped in wp81port/wp81_xt_symbols.map, and the
+ * originals are reached through the detour trampolines (orig_<name>). */
+#include "wp81port/detour81.h"
+#include "wp81port/wp81_detours.h"
+#include "wp81port/wp81_fingerprint.h"
+/* fail-safe: verify the loaded exe IS the mapped build before patching hardcoded
+ * addresses (else a different/updated xwp gets corrupted).  See wp81_fpguard.c. */
+extern int wp81_fingerprint_ok(unsigned char got16[16]);
+#endif
+
 /* ---------------------------------------------------------- Cairo isolation --
  * WP is a libc5 program; retro5.so exports libc5 shims (strlen/malloc/free/...)
  * that shadow glibc across the whole process via the flat symbol namespace.  If
@@ -203,6 +216,49 @@ static void rx_log(const char *fmt, ...)
     rx_raw(buf, (size_t)n + 11);                        /* 10 prefix + n + '\n'  */
 }
 
+#ifdef RX_STATIC81
+/* Trampoline pointers to the ORIGINAL Xt/X11 bodies inside xwp -- set by
+ * detour_install().  One per interposed function (exact signature via typeof).
+ * The 5 batch/i18n variants that xwp never links (XDrawArcs/XDrawRectangles/
+ * XFillArcs/XmbDraw*) get a NULL trampoline: their hooks compile but are never
+ * installed nor called. */
+#define X(n, a, s) typeof(&n) orig_##n;
+WP81_DETOUR_LIST(X)
+#undef X
+typeof(&XDrawArcs)          orig_XDrawArcs;
+typeof(&XDrawRectangles)    orig_XDrawRectangles;
+typeof(&XFillArcs)          orig_XFillArcs;
+typeof(&XmbDrawString)      orig_XmbDrawString;
+typeof(&XmbDrawImageString) orig_XmbDrawImageString;
+
+static void rx_detour_log(const char *fmt, ...)
+{
+    char b[256]; va_list ap; int n;
+    va_start(ap, fmt);
+    n = rx_vsnprintf ? rx_vsnprintf(b, sizeof b, fmt, ap) : 0;
+    va_end(ap);
+    if (n > 0) syscall(SYS_write, rx_fd > 0 ? rx_fd : 2, b, (size_t)n);
+}
+
+/* Patch every mapped prologue to jump to our hook (same-named function below). */
+static void rx_install_detours81(void)
+{
+    static detour_t tab[WP81_NDETOUR];
+    int n = 0;
+#define X(nm, ad, st)                                            \
+    tab[n].name   = #nm;                                         \
+    tab[n].target = (void *)(ad);                               \
+    tab[n].hook   = (void *)nm;              /* our hook */       \
+    tab[n].orig   = (void **)&orig_##nm;     /* -> trampoline */  \
+    tab[n].steal  = (st);                                        \
+    n++;
+    WP81_DETOUR_LIST(X)
+#undef X
+    detour_log = rx_detour_log;
+    detour_install(tab, n);
+}
+#endif /* RX_STATIC81 */
+
 __attribute__((constructor))
 static void rx_init(void)
 {
@@ -241,15 +297,38 @@ static void rx_init(void)
     if (wl && *wl) { int n = atoi(wl); if (n > 0 && n < 100) rx_wheel_lines = n; }
     rx_load_cairo();
     if (!rx_cairo_ok) { rx_draw = 0; rx_drawbtn = 0; }   /* no cairo -> Motif draws */
+#ifdef RX_STATIC81
+    {   /* SAFEGUARD: the detours + shim use hardcoded absolute addresses valid ONLY for
+         * the exact build they were mapped from.  MD5 the running exe first; on any
+         * mismatch install NOTHING so a different/updated xwp runs 100% stock. */
+        unsigned char got[16]; int i; char h[33];
+        static const char hx[] = "0123456789abcdef";
+        if (wp81_fingerprint_ok(got)) {
+            rx_install_detours81();   /* patch xwp's static Xt/X11 prologues -> our hooks */
+        } else {
+            for (i = 0; i < 16; i++) { h[i*2] = hx[got[i] >> 4]; h[i*2+1] = hx[got[i] & 15]; }
+            h[32] = 0;
+            rx_draw = 0; rx_drawbtn = 0;   /* belt-and-braces: nothing to draw either */
+            rx_log("FINGERPRINT: this exe md5=%s is not a whitelisted WP 8.1 build", h);
+            rx_log("  -> reskin DISABLED, WP runs unmodified.");
+        }
+    }
+#endif
     rx_log("loaded (wheel-scroll %d/notch; cairo=%s; RETROXT_TRACE=1 dumps widgets)",
            rx_wheel_lines, rx_cairo_ok ? "on" : "OFF");
 }
 
 /* ------------------------------------------------ real-symbol resolution ---- */
 
+#ifdef RX_STATIC81
+/* 8.1: the original lives at a fixed address in xwp, reached via the detour
+ * trampoline set up in the constructor.  No dlsym -- there is no dynamic symbol. */
+#define REAL(name) typeof(&name) real_##name = orig_##name; (void)real_##name;
+#else
 #define REAL(name) \
     static typeof(&name) real_##name; \
     if (!real_##name) real_##name = (typeof(&name))dlsym(RTLD_NEXT, #name);
+#endif
 
 /* class name of a widget OR gadget; RectObj/Object class records share the
  * class_name slot layout with Core, so this is safe for gadgets too. */
@@ -514,7 +593,15 @@ static void rx_draw_scrollbar(Widget w)
     if (W < 2 || H < 2) return;
 
     rx_in_my_draw = 1;
+#ifdef RX_STATIC81
+    /* 8.1: xwp's STATIC libX11 owns the Display.  A cairo xlib surface would drive that
+     * Display through the MODERN libX11 cairo links (two instances) -> _XSend SIGSEGV.
+     * Render to a software image surface and commit with XPutImage, which is detoured
+     * to xwp's own Xlib -- so every X call stays in the single static instance. */
+    sf = cairo_image_surface_create(CAIRO_FORMAT_RGB24, (int)W, (int)H);
+#else
     sf = cairo_xlib_surface_create(d, win, DefaultVisual(d, DefaultScreen(d)), W, H);
+#endif
     cr = cairo_create(sf);
     cairo_set_source_rgb(cr, 0.937, 0.937, 0.937);         /* flat trough */
     cairo_paint(cr);
@@ -556,6 +643,21 @@ static void rx_draw_scrollbar(Widget w)
     cairo_set_source_rgb(cr, 0.60, 0.63, 0.67);            /* rounded pill slider */
     cairo_fill(cr);
     cairo_surface_flush(sf);
+#ifdef RX_STATIC81
+    {   /* commit the rendered image straight to the window via XPutImage (static path) */
+        unsigned char *data = cairo_image_surface_get_data(sf);
+        int stride = cairo_image_surface_get_stride(sf);
+        Visual *vis = DefaultVisual(d, DefaultScreen(d));
+        XImage *xi = data ? XCreateImage(d, vis, 24, ZPixmap, 0, (char *)data, W, H, 32, stride) : 0;
+        if (xi) {
+            GC gc = XCreateGC(d, win, 0, 0);
+            XPutImage(d, win, gc, xi, 0, 0, 0, 0, W, H);
+            XFreeGC(d, gc);
+            xi->data = 0;                                   /* cairo owns the pixels */
+            XDestroyImage(xi);
+        }
+    }
+#endif
     cairo_destroy(cr);
     cairo_surface_destroy(sf);
     XFlush(d);
@@ -1182,8 +1284,13 @@ rx_menu_committed:
             XPutImage(d, pm, gc, xi, 0, 0, 0, 0, W, H);             /* image -> pixmap */
             xi->data = 0;                                           /* cairo owns the pixels */
             XDestroyImage(xi);
+#ifdef RX_STATIC81
+            if (!rx_real_copyarea)  rx_real_copyarea  = orig_XCopyArea;
+            if (!rx_real_copyplane) rx_real_copyplane = orig_XCopyPlane;
+#else
             if (!rx_real_copyarea)  rx_real_copyarea  = (int (*)(Display *, Drawable, Drawable, GC, int, int, unsigned int, unsigned int, int, int))dlsym(RTLD_NEXT, "XCopyArea");
             if (!rx_real_copyplane) rx_real_copyplane = (int (*)(Display *, Drawable, Drawable, GC, int, int, unsigned int, unsigned int, int, int, unsigned long))dlsym(RTLD_NEXT, "XCopyPlane");
+#endif
             /* CLASSIFY: icon - replay Motif's blits INTO the pixmap on our bg. */
             if (b->kind == RX_KIND_TEXT && b->nseg == 0 && b->nblit > 0) {
                 for (i = 0; i < b->nblit; i++) {
@@ -1282,7 +1389,11 @@ static void rx_btn_evh(Widget w, XtPointer cd, XEvent *ev, Boolean *cont)
             Widget par = XtParent(b->w);
             if (par && XtIsRealized(par)) {
                 int (*rc)(Display *, Window, int, int, unsigned int, unsigned int, Bool) =
+#ifdef RX_STATIC81
+                    orig_XClearArea;
+#else
                     (int (*)(Display *, Window, int, int, unsigned int, unsigned int, Bool))dlsym(RTLD_NEXT, "XClearArea");
+#endif
                 if (rc) rc(XtDisplayOfObject(par), XtWindow(par), b->lx, b->ly, b->lw, b->lh, True);
             }
         }
@@ -1374,6 +1485,37 @@ static void rx_hook_gadget(Widget w, int kind)
     XtAddCallback(w, "destroyCallback", rx_btn_destroy, (XtPointer)(long)slot);
 }
 
+/* Menu item that is a GADGET (windowless XmCascadeButtonGadget / XmToggleButtonGadget /
+ * XmPushButtonGadget - common in dialog menus, e.g. the File Open dialog).  Like
+ * rx_hook_gadget but flagged is_menu so it draws the flat menu look (crisp label, hover,
+ * submenu chevron for cascade, checkbox for toggle) and honours XtIsSensitive (greyed when
+ * disabled).  Windowless -> NO XtAddEventHandler (that derefs a bogus Display and crashes);
+ * rendering is driven by intercepting Motif's menu paint (rx_gadget_at). */
+static void rx_hook_menu_gadget(Widget w, int kind)
+{
+    int i, slot = -1;
+    Widget parent;
+    if (!rx_drawbtn) return;
+    for (i = 0; i < rx_nbtn; i++) if (rx_btns[i].w == w) return;
+    parent = XtParent(w);
+    if (!parent) return;
+    for (i = 0; i < rx_nbtn; i++) if (!rx_btns[i].w) { slot = i; break; }
+    if (slot < 0 && rx_nbtn < RX_MAXBTN) slot = rx_nbtn++;
+    if (slot < 0) { static int warned; if (!warned) { warned = 1; rx_log("WARNING: rx_btns full (%d) - new widgets fall back to Motif", RX_MAXBTN); } return; }
+    memset(&rx_btns[slot], 0, sizeof rx_btns[slot]);
+    rx_btns[slot].w = w;
+    rx_btns[slot].kind = kind;
+    rx_btns[slot].is_gadget = 1;
+    rx_btns[slot].is_menu = 1;
+    rx_btns[slot].pwin = XtIsRealized(parent) ? XtWindow(parent) : 0;   /* else resolved lazily */
+    if (rx_verbose) rx_log("hook menu-gadget %d '%s' kind=%d pwin=0x%lx", slot, XtName(w) ? XtName(w) : "", kind, (unsigned long)rx_btns[slot].pwin);
+    if (!rx_app) rx_app = XtWidgetToApplicationContext(w);
+    XtAddCallback(w, "armCallback",       rx_btn_arm,     (XtPointer)(long)slot);
+    XtAddCallback(w, "disarmCallback",    rx_btn_disarm,  (XtPointer)(long)slot);
+    XtAddCallback(w, "cascadingCallback", rx_btn_arm,     (XtPointer)(long)slot);
+    XtAddCallback(w, "destroyCallback",   rx_btn_destroy, (XtPointer)(long)slot);
+}
+
 /* A widget's background colour as cairo RGB (so our fills blend with the dialog). */
 static void rx_bg_rgb(Widget w, double *r, double *g, double *bl)
 {
@@ -1449,7 +1591,15 @@ static void rx_hook_toggle(Widget w)
 static void rx_hook_menuitem(Widget w, int kind)
 {
     int i, slot = -1;
+    const char *cls;
     if (!rx_drawbtn) return;
+    /* Menu items can be GADGETS (XmCascadeButtonGadget / XmToggleButtonGadget - common in
+     * dialog option menus, e.g. the File Open dialog).  Gadgets are windowless RectObj
+     * subclasses: XtAddEventHandler below would fetch a Display off a non-widget layout and
+     * deref garbage -> SIGSEGV (in XSelectInput, on both 8.0 and 8.1).  Our expose-driven
+     * render needs a real window anyway, so leave gadget menu items to Motif. */
+    cls = rx_class(w);
+    if (cls && strstr(cls, "Gadget")) return;
     for (i = 0; i < rx_nbtn; i++) if (rx_btns[i].w == w) return;
     for (i = 0; i < rx_nbtn; i++) if (!rx_btns[i].w) { slot = i; break; }
     if (slot < 0 && rx_nbtn < RX_MAXBTN) slot = rx_nbtn++;
@@ -1554,7 +1704,11 @@ static int rx_list_text(Display *d, Window win, GC gc, int x, int y, const char 
         if (xi) {
             Pixmap pm = XCreatePixmap(d, win, iw, ih, 24);
             GC pgc = XCreateGC(d, pm, 0, 0);
+#ifdef RX_STATIC81
+            if (!rx_real_copyarea) rx_real_copyarea = orig_XCopyArea;
+#else
             if (!rx_real_copyarea) rx_real_copyarea = (int (*)(Display *, Drawable, Drawable, GC, int, int, unsigned int, unsigned int, int, int))dlsym(RTLD_NEXT, "XCopyArea");
+#endif
             XPutImage(d, pm, pgc, xi, 0, 0, 0, 0, iw, ih);
             XCopyGC(d, gc, GCClipXOrigin | GCClipYOrigin | GCClipMask, pgc);   /* clip to the viewport */
             if (rx_real_copyarea) rx_real_copyarea(d, pm, win, pgc, 0, 0, iw, ih, x, y - asc);
@@ -2030,13 +2184,19 @@ static void rx_note_widget(Widget w)
 
     /* Menu items: custom flat render (crisp font + hover + submenu/checkbox marks). */
     if (rx_in_menu(w)) {
-        if (strcmp(cls, "XmCascadeButton") == 0 || strcmp(cls, "XmCascadeButtonGadget") == 0)
+        if (strcmp(cls, "XmCascadeButton") == 0)
             rx_hook_menuitem(w, RX_MENU_CASCADE);
-        else if (strcmp(cls, "XmToggleButton") == 0 || strcmp(cls, "XmToggleButtonGadget") == 0)
+        else if (strcmp(cls, "XmCascadeButtonGadget") == 0)
+            rx_hook_menu_gadget(w, RX_MENU_CASCADE);   /* windowless submenu item */
+        else if (strcmp(cls, "XmToggleButton") == 0)
             rx_hook_menuitem(w, RX_MENU_TOGGLE);
+        else if (strcmp(cls, "XmToggleButtonGadget") == 0)
+            rx_hook_menu_gadget(w, RX_MENU_TOGGLE);
         else if (strcmp(cls, "XmPushButton") == 0)
             rx_hook_menuitem(w, RX_MENU_NORMAL);
-        return;                                       /* handled (or left to Motif if gadget-only) */
+        else if (strcmp(cls, "XmPushButtonGadget") == 0)
+            rx_hook_menu_gadget(w, RX_MENU_NORMAL);
+        return;                                       /* handled */
     }
 
     if (strcmp(cls, "XmScrollBar") == 0) {

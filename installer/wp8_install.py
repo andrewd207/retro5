@@ -23,7 +23,7 @@ The engine is UI-agnostic: run() is a generator yielding Step objects the GUI
 (or the CLI) renders. Nothing here imports GTK.
 """
 from __future__ import annotations
-import filecmp, fnmatch, os, re, shutil, stat, struct, subprocess, sys
+import filecmp, fnmatch, hashlib, os, re, shutil, stat, struct, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -98,7 +98,7 @@ class Engine:
                  tree_only: bool = False, tooling: Path = TOOLING,
                  version: str = "8", source_kind: str = "native",
                  install_deps: bool = False, overwrite: bool = False,
-                 extra_fonts: Path | None = None):
+                 extra_fonts: Path | None = None, reskin: bool = False):
         self.media = Path(media)            # a resolved native tree OR .deb wp tree
         self.target = Path(target)
         self.tooling = Path(tooling)
@@ -120,6 +120,12 @@ class Engine:
         # per-user launcher/~/.wprc (used for the root half of a system install;
         # the per-user half runs unprivileged afterward).
         self.tree_only = tree_only
+        # --reskin: install the retroXt modern Motif reskin. 8.0 (dynamic libX11) swaps
+        # xwp's DT_NEEDED libX11.so.6 -> retroXt.so; 8.1 (static X) LD_PRELOADs
+        # retroXt81.so from the launcher, gated by a post-patch md5 whitelist.
+        self.do_reskin = reskin           # option; the reskin() step is a method (no clash)
+        self._reskin_active = False       # set True once reskin is actually applied
+        self._reskin_preload = None       # basename to LD_PRELOAD (8.1), else None
         self.stats = {}
 
     # ---- helpers ---------------------------------------------------------
@@ -198,6 +204,10 @@ class Engine:
                     "libx11-6:i386", "libxpm4:i386", "libxt6:i386"], fatal=False) != 0:
                 run(["apt-get", "install", "-y",
                      "libx11-6:i386", "libxpm4:i386", "libxt6t64:i386"])
+            # 32-bit cairo: the retroXt modern reskin renders through it (dlopened
+            # at runtime), so it's only needed when --reskin is chosen.
+            if self.do_reskin:
+                run(["apt-get", "install", "-y", "libcairo2:i386"], fatal=False)
             # printing: xwpdest execs lp/lpr, so a fresh box (esp. a headless VM)
             # needs the CUPS client tools or WP has nothing to spool to. Native,
             # not i386. Non-fatal — don't abort a WP install over the print client.
@@ -215,6 +225,8 @@ class Engine:
         if dnf:
             run(["dnf", "install", "-y", "glibc.i686",
                  "libX11.i686", "libXpm.i686", "libXt.i686"])
+            if self.do_reskin:
+                run(["dnf", "install", "-y", "cairo.i686"], fatal=False)   # reskin renderer
             run(["dnf", "install", "-y", "cups-client"], fatal=False)
             run(["dnf", "install", "-y", "xorg-x11-fonts-75dpi",
                  "xorg-x11-fonts-100dpi", "xorg-x11-fonts-ISO8859-1-75dpi"], fatal=False)
@@ -224,6 +236,8 @@ class Engine:
         if pac:
             run(["pacman", "-S", "--needed", "--noconfirm",
                  "lib32-glibc", "lib32-libx11", "lib32-libxpm", "lib32-libxt"])
+            if self.do_reskin:
+                run(["pacman", "-S", "--needed", "--noconfirm", "lib32-cairo"], fatal=False)
             run(["pacman", "-S", "--needed", "--noconfirm", "cups"], fatal=False)
             run(["pacman", "-S", "--needed", "--noconfirm",
                  "xorg-fonts-75dpi", "xorg-fonts-100dpi"], fatal=False)
@@ -233,6 +247,8 @@ class Engine:
         if zyp:
             run(["zypper", "--non-interactive", "install", "glibc-32bit",
                  "libX11-6-32bit", "libXpm4-32bit", "libXt6-32bit"])
+            if self.do_reskin:
+                run(["zypper", "--non-interactive", "install", "libcairo2-32bit"], fatal=False)
             run(["zypper", "--non-interactive", "install", "cups-client"], fatal=False)
             run(["zypper", "--non-interactive", "install",
                  "xorg-x11-fonts", "xorg-x11-fonts-legacy"], fatal=False)
@@ -888,6 +904,73 @@ for x in (tmp, os.path.splitext(tmp)[0] + ".afm", tmp + ".afm"):
                        "(safe: xwp left untouched)")
         return out
 
+    # ---- step 4b: optional modern reskin (retroXt) ----------------------
+    def _reskin_whitelist(self) -> set:
+        """POST-patch md5s the 8.1 detour build's hardcoded addresses are valid for,
+        parsed from wp81port/wp81_fingerprint.h (single source of truth, shared with
+        the runtime guard)."""
+        fp = Path(__file__).resolve().parent / "wp81port" / "wp81_fingerprint.h"
+        if not fp.exists():
+            return set()
+        return set(re.findall(r"\b[0-9a-f]{32}\b", fp.read_text()))
+
+    def _ensure_reskin_so(self, so: Path, make_dir: Path, target: str) -> Path | None:
+        """Use the prebuilt .so if present; else try `make` in its dir. None if neither."""
+        if so.exists():
+            return so
+        if shutil.which("make") and (make_dir / "Makefile").exists():
+            r = self._run(["make", "-C", str(make_dir), target])
+            if r.returncode == 0 and so.exists():
+                return so
+        return so if so.exists() else None
+
+    def reskin(self):
+        if not self.do_reskin:
+            return ["reskin: not requested"]
+        xwp = self.target / "wpbin/xwp"
+        if not xwp.is_file():
+            return ["reskin: xwp not found -> skipped"]
+        shbin = self.target / "shbin10"; shbin.mkdir(parents=True, exist_ok=True)
+        here = Path(__file__).resolve().parent
+        data = xwp.read_bytes()
+        # WP 8.0 dynamically links libX11 (DT_NEEDED string present); 8.1 static-links it.
+        dyn_x11 = b"libX11.so.6\x00" in data
+        out = []
+        if dyn_x11:
+            # 8.0: name-based dlsym hooks. Point xwp's libX11.so.6 NEEDED at retroXt.so
+            # (which chain-loads the real libX11/libXt via its own NEEDED + RTLD_NEXT).
+            so = self._ensure_reskin_so(here / "retroXt.so", here, "retroXt.so")
+            if not so:
+                return ["reskin(8.0): retroXt.so unavailable (need it prebuilt or gcc+cairo) -> skipped"]
+            shutil.copyfile(so, shbin / "retroXt.so"); os.chmod(shbin / "retroXt.so", 0o644)
+            old, new = b"libX11.so.6\x00", b"retroXt.so\x00\x00"      # same length (12B), null-padded
+            if old in data:
+                xwp.write_bytes(data.replace(old, new, 1))
+                self._reskin_active = True
+                out.append("reskin(8.0): retroXt.so installed; xwp DT_NEEDED libX11.so.6 -> retroXt.so")
+            elif b"retroXt.so\x00" in data:
+                self._reskin_active = True
+                out.append("reskin(8.0): already applied")
+            else:
+                out.append("reskin(8.0): libX11.so.6 not in DT_NEEDED -> skipped")
+            return out
+        # 8.1: static X. Gate on the POST-patch md5 so we never LD_PRELOAD hardcoded
+        # detour addresses into a build they don't match.
+        md5 = hashlib.md5(data).hexdigest()
+        if md5 not in self._reskin_whitelist():
+            return [f"reskin(8.1): installed xwp md5 {md5} is not whitelisted for the "
+                    "detour build -> reskin NOT enabled (WP installed stock)"]
+        so = self._ensure_reskin_so(here / "wp81port" / "retroXt81.so",
+                                    here / "wp81port", "retroXt81.so")
+        if not so:
+            return ["reskin(8.1): retroXt81.so unavailable (need it prebuilt or gcc+cairo) -> skipped"]
+        shutil.copyfile(so, shbin / "retroXt81.so"); os.chmod(shbin / "retroXt81.so", 0o644)
+        self._reskin_active = True
+        self._reskin_preload = "retroXt81.so"
+        out.append(f"reskin(8.1): retroXt81.so installed (md5 {md5[:12]} whitelisted); "
+                   "launcher will LD_PRELOAD it")
+        return out
+
     def _is_system_install(self) -> bool:
         """True when installing outside the user's home (e.g. /opt) - the tree
         is root-owned and must be world-readable so every user can run WP."""
@@ -1092,7 +1175,7 @@ for x in (tmp, os.path.splitext(tmp)[0] + ".afm", tmp + ".afm"):
         srcdir = Path(__file__).resolve().parent
         insdir = self.target / "installer"; insdir.mkdir(parents=True, exist_ok=True)
         copied = 0
-        for name in ("wp8_install.py", "wp8_installer.py"):
+        for name in ("wp8_install.py", "wp8_install_gui.py"):
             s = srcdir / name
             if s.is_file():
                 shutil.copyfile(s, insdir / name); os.chmod(insdir / name, 0o755); copied += 1
@@ -1249,7 +1332,7 @@ if command -v xset >/dev/null 2>&1; then
     done
     xset fp rehash 2>/dev/null
 fi
-{ldlib}export WPC="$ROOT"
+{ldlib}{preload}export WPC="$ROOT"
 # point the ancient statically-linked Xlib at the modern X locale dir
 export XLOCALEDIR=/usr/share/X11/locale
 # supply the OSF virtual keysyms WP's 1998 libX11 needs (modern X dropped the
@@ -1282,8 +1365,14 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         vsuffix = "" if self.version in ("", "8") else f"-{self.version}"
         ldlib = "" if not getattr(self, "_shim_ldpath", None) \
                 else f'export LD_LIBRARY_PATH="{self._shim_ldpath}"\n'
+        # 8.1 reskin: LD_PRELOAD retroXt81.so from the launcher (8.0 self-loads it via
+        # its rewritten DT_NEEDED, so no preload line there).
+        preload = ""
+        if getattr(self, "_reskin_active", False) and getattr(self, "_reskin_preload", None):
+            preload = ('# modern Motif reskin (retroXt); its MD5 guard no-ops on any other binary\n'
+                       f'export LD_PRELOAD="$ROOT/shbin10/{self._reskin_preload}"\n')
         lp = bindir / f"xwp{vsuffix}"
-        lp.write_text(self.LAUNCHER.format(root=self.target, ldlib=ldlib))
+        lp.write_text(self.LAUNCHER.format(root=self.target, ldlib=ldlib, preload=preload))
         os.chmod(lp, 0o755)
         self.launcher_path = lp
         out.append(f"launcher: {lp}")
@@ -1318,7 +1407,7 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
             os.chmod(dp, 0o644)
             out.append(f"desktop entry: {dp} (+ New Document action)")
             # matching uninstall entry -> launches the embedded wizard in uninstall mode
-            insui = self.target / "installer" / "wp8_installer.py"
+            insui = self.target / "installer" / "wp8_install_gui.py"
             up = appdir / f"wordperfect{self.version}-uninstall.desktop"
             up.write_text(
                 f"[Desktop Entry]\nType=Application\nName=Uninstall {name}\n"
@@ -1626,6 +1715,7 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         ("install_tree",   "Installing files",        0.55, "install_tree"),
         ("retarget",       "Retargeting binaries",    0.72, "retarget"),
         ("patches",        "Applying patches",        0.78, "patches"),
+        ("reskin",         "Applying modern reskin",  0.82, "reskin"),
         ("fix_perms",      "Setting permissions",     0.85, "fix_perms"),
         ("runtime_config", "Installing runtime",      0.90, "runtime_config"),
         ("launcher",       "Creating launcher",       0.95, "launcher"),
@@ -1636,6 +1726,7 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         ("install_tree",   "Installing suite files",  0.45, "install_tree_deb"),
         ("retarget",       "Retargeting binaries",    0.70, "retarget"),
         ("patches",        "Applying patches",        0.76, "patches"),
+        ("reskin",         "Applying modern reskin",  0.82, "reskin"),
         ("fix_perms",      "Setting permissions",     0.84, "fix_perms"),
         ("runtime_config", "Installing runtime",      0.90, "runtime_config"),
         ("launcher",       "Creating launcher",       0.95, "launcher"),
@@ -1726,6 +1817,12 @@ def main(argv):
                          "styles of common Latin TrueType families (DejaVu, "
                          "Liberation, Noto, Ubuntu, …). wpfi then registers them "
                          "in wp.drs.")
+    ap.add_argument("--reskin", action="store_true",
+                    help="install the retroXt modern Motif reskin (flat scrollbars, "
+                         "crisp fonts, modern buttons/menus; renders via cairo). 8.0 "
+                         "swaps xwp's libX11 DT_NEEDED to retroXt.so; 8.1 LD_PRELOADs "
+                         "retroXt81.so from the launcher (only if the built binary's "
+                         "md5 is whitelisted). Pair with --install-deps for 32-bit cairo.")
     ap.add_argument("--system", action="store_true",
                     help="install system-wide under /opt (world-readable, system "
                          "launcher) for all users. Implied when run as root; a "
@@ -1749,7 +1846,7 @@ def main(argv):
     # --- deps-only: install the runtime packages and exit (no media needed) ---
     if a.deps_only:
         try:
-            for line in Engine(Path("."), Path("."))._install_deps():
+            for line in Engine(Path("."), Path("."), reskin=a.reskin)._install_deps():
                 print(f"  - {line}")
             return 0
         except InstallError as e:
@@ -1841,7 +1938,7 @@ def main(argv):
                          make_desktop=not a.no_desktop, tree_only=a.tree_only,
                          version=rm.version, source_kind=kind,
                          install_deps=a.install_deps, overwrite=a.overwrite,
-                         extra_fonts=a.extra_fonts)
+                         extra_fonts=a.extra_fonts, reskin=a.reskin)
             return _run_install(eng, target)
     except media.MediaError as e:
         print(f"FAIL: {e}"); return 1

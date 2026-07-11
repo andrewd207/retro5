@@ -78,7 +78,7 @@ python3 installer/wp8_install.py --target ~/.local/share/wordperfect8 --media /p
 …or run the GTK wizard:
 
 ```sh
-python3 installer/wp8_installer.py
+python3 installer/wp8_install_gui.py
 ```
 
 ## Repository layout

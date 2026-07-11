@@ -9,7 +9,7 @@
 # community installer at https://xwp8users.com/packages/wp81in.sh, whose root is
 # /usr/lib/wp8. It does NOT install WordPerfect; it converts a tree you already
 # have. To install WP from your own media/ISO/.deb into a fresh tree instead,
-# use the full installer (installer/wp8_installer.py) — see README.
+# use the full installer (installer/wp8_install_gui.py) — see README.
 #
 # Idempotent and safe to re-run. Needs root (writes under the WP tree and into
 # the system 32-bit library dir).
