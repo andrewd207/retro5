@@ -52,6 +52,18 @@ XExtentsOfFontSet:
 XFlush:
 	jmp *.L_XFlush
 .L_XFlush: .long 0x08679850
+	.globl XFree
+	.hidden XFree
+	.type XFree,@function
+XFree:
+	jmp *.L_XFree
+.L_XFree: .long 0x0868b0e0
+	.globl XGetAtomName
+	.hidden XGetAtomName
+	.type XGetAtomName,@function
+XGetAtomName:
+	jmp *.L_XGetAtomName
+.L_XGetAtomName: .long 0x0867a2e0
 	.globl XFreeFontInfo
 	.hidden XFreeFontInfo
 	.type XFreeFontInfo,@function

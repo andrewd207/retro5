@@ -482,6 +482,8 @@ static const char *const RX_RAISED[] = {
     "XmToggleButton", "XmToggleButtonGadget", "XmFrame", "XiCombinationBox", 0
 };
 
+#define RX_LIST_FONT "-*-helvetica-medium-r-normal-*-13-*-*-*-*-*-iso8859-1"  /* proportional
+                                 * X font for XmList rows (replaces WP's fixed-width default) */
 static void rx_restyle(Widget w, const char *cls)
 {
     int thick;
@@ -684,6 +686,8 @@ static void rx_draw_scrollbar(Widget w)
 #define RX_GADGET_FS 13         /* fixed label font size for windowless dialog buttons */
 #define RX_MENU_FS_SCALE 0.9    /* menu text: cairo renders Motif's label height a touch
                                  * large, so scale it down a bit (bar + dropdown items) */
+#define RX_MENUBAR_MARGIN 9     /* horizontal padding grown onto menu-BAR items so the flat
+                                 * labels aren't cramped; Motif reflows the bar to fit */
 #define RX_MENU_NORMAL  0       /* is_menu kind: plain item */
 #define RX_MENU_CASCADE 1       /* has a submenu -> draw a chevron */
 #define RX_MENU_TOGGLE  2       /* checkbox item -> draw a check box */
@@ -702,6 +706,7 @@ struct rx_btn_s {
     int    probed;                  /* tree-probe done once */
     int    is_gadget;               /* windowless XmPushButtonGadget - draws on parent win */
     int    is_menu;                 /* menu item - flat render, hover via enter/leave */
+    int    skip;                    /* text drawn with a symbol/icon font -> leave to Motif */
     int    is_toggle;               /* XmToggleButton - draw check box / radio + label */
     int    is_label;                /* XmLabel(Gadget) - crisp flat text, matching bg */
     int    is_frame;                /* XmFrame - draw a modern group box border */
@@ -942,6 +947,7 @@ static void rx_render_btn(int bi)
     struct rx_btn_s *b = &rx_btns[bi];
     Display *d = XtDisplayOfObject(b->w);
     Window win;
+    if (b->skip) return;              /* symbol-font control: Motif draws it (keeps real icons) */
     int i, gx = 0, gy = 0;              /* commit offset within the target window */
     int sens;                          /* 0 = disabled (insensitive) -> render greyed */
     unsigned int W = 0, H = 0;
@@ -1418,6 +1424,39 @@ static void rx_btn_arm(Widget w, XtPointer cd, XtPointer cb)
     int bi = (int)(long)cd; (void)w; (void)cb;
     rx_btns[bi].armed = 1; rx_btns[bi].dirty = 1; rx_btn_schedule(rx_btns[bi].w);
 }
+/* When a cascade menu item posts its submenu, Motif places the submenu but our
+ * roomier (wider) items leave it overlapping the parent.  Deferred (0-delay) so we
+ * run AFTER Motif has posted+positioned it, then push its left edge flush to the
+ * cascade's right edge so it stops covering the parent menu.  Fires per post
+ * (cascadingCallback), so every sibling submenu is corrected, not just the first. */
+static void rx_submenu_reposition(XtPointer cd, XtIntervalId *id)
+{
+    int bi = (int)(long)cd; (void)id;
+    Widget cascade, pulldown = 0, shell;
+    Position crx = 0, cry = 0, srx = 0, sry = 0; Dimension cw = 0;
+    if (bi < 0 || bi >= rx_nbtn) return;
+    cascade = rx_btns[bi].w;
+    if (!cascade) return;
+    XtVaGetValues(cascade, "subMenuId", &pulldown, (char *)0);
+    if (!pulldown) return;
+    shell = XtParent(pulldown);                       /* the submenu's XmMenuShell */
+    if (!shell) return;
+    XtVaGetValues(cascade, "width", &cw, (char *)0);
+    XtTranslateCoords(cascade, (Position)cw, 0, &crx, &cry);   /* cascade right edge (root) */
+    XtTranslateCoords(shell,   0,           0, &srx, &sry);    /* submenu left edge (root)  */
+    if (rx_verbose) rx_log("submenu bi=%d cascade_right=%d sub_left=%d%s",
+                           bi, (int)crx, (int)srx, (srx < crx) ? " -> nudge" : "");
+    if (srx < crx)                                    /* overlaps parent: push flush right */
+        XtVaSetValues(shell, "x", (Position)crx, (char *)0);
+}
+/* cascadingCallback handler: arm for our render + schedule the overlap fix. */
+static void rx_cascade_cb(Widget w, XtPointer cd, XtPointer cb)
+{
+    int bi = (int)(long)cd; (void)w; (void)cb;
+    rx_btns[bi].armed = 1; rx_btns[bi].dirty = 1; rx_btn_schedule(rx_btns[bi].w);
+    if (rx_skin && rx_app && rx_btns[bi].kind == RX_MENU_CASCADE)
+        XtAppAddTimeOut(rx_app, 0, rx_submenu_reposition, (XtPointer)(long)bi);
+}
 static void rx_btn_disarm(Widget w, XtPointer cd, XtPointer cb)
 {
     int bi = (int)(long)cd; (void)w; (void)cb;
@@ -1522,7 +1561,7 @@ static void rx_hook_menu_gadget(Widget w, int kind)
     if (!rx_app) rx_app = XtWidgetToApplicationContext(w);
     XtAddCallback(w, "armCallback",       rx_btn_arm,     (XtPointer)(long)slot);
     XtAddCallback(w, "disarmCallback",    rx_btn_disarm,  (XtPointer)(long)slot);
-    XtAddCallback(w, "cascadingCallback", rx_btn_arm,     (XtPointer)(long)slot);
+    XtAddCallback(w, "cascadingCallback", rx_cascade_cb,     (XtPointer)(long)slot);
     XtAddCallback(w, "destroyCallback",   rx_btn_destroy, (XtPointer)(long)slot);
 }
 
@@ -1624,7 +1663,7 @@ static void rx_hook_menuitem(Widget w, int kind)
     XtAddEventHandler(w, EnterWindowMask | LeaveWindowMask, False, rx_menuitem_cross, (XtPointer)(long)slot);
     XtAddCallback(w, "armCallback",     rx_btn_arm,     (XtPointer)(long)slot);  /* menu open = active */
     XtAddCallback(w, "disarmCallback",  rx_btn_disarm,  (XtPointer)(long)slot);
-    XtAddCallback(w, "cascadingCallback", rx_btn_arm,   (XtPointer)(long)slot);  /* cascade posting */
+    XtAddCallback(w, "cascadingCallback", rx_cascade_cb,   (XtPointer)(long)slot);  /* cascade posting */
     XtAddCallback(w, "destroyCallback", rx_btn_destroy, (XtPointer)(long)slot);
 }
 
@@ -2022,19 +2061,18 @@ int XDestroyWindow(Display *d, Window win)
     return real_XDestroyWindow(d, win);
 }
 
-/* Record the metrics of Motif's actual label font so we can size the button to it. */
+static int rx_font_metrics(Display *d, Font fid, int *asc, int *desc, int *mono, int *sym);
+/* Record the metrics of Motif's actual label font so we can size the button to it.
+ * If it's a symbol/icon font (e.g. wp60ruler), flag the button skip so we leave it
+ * to Motif -- our cairo text render would turn its icon glyphs into letters. */
 static void rx_set_font_gc(Display *d, int gi, GC gc)
 {
-    XGCValues gv; XFontStruct *fs;
+    XGCValues gv; int a, de, mono = 0, sym = 0;
     if (gi < 0) return;
     if (!XGetGCValues(d, gc, GCFont, &gv) || !gv.font) return;
-    fs = XQueryFont(d, gv.font);
-    if (fs) {
-        if (fs->ascent + fs->descent > 0) {
-            rx_btns[gi].font_asc = fs->ascent;
-            rx_btns[gi].font_h   = fs->ascent + fs->descent;
-        }
-        XFreeFontInfo(NULL, fs, 1);
+    if (rx_font_metrics(d, gv.font, &a, &de, &mono, &sym)) {
+        if (a + de > 0) { rx_btns[gi].font_asc = a; rx_btns[gi].font_h = a + de; }
+        if (sym) rx_btns[gi].skip = 1;
     }
 }
 static void rx_set_font_set(int gi, XFontSet fset)
@@ -2067,6 +2105,207 @@ static int rx_try_gadget_text(Window dr, GC gc, const char *s, int len, int x, i
     return gi;
 }
 
+/* ---- Cairo text pass-through -------------------------------------------------
+ * Re-render Motif's chrome text (lists, fields, labels we don't custom-draw) with
+ * Cairo for a crisp, consistent look, and report Cairo widths from XTextWidth/
+ * XTextExtents so WP lays its controls out to exactly what we draw -- no size
+ * mismatch.  Only chrome uses these X text calls (WP renders the DOCUMENT with its
+ * own rasterizer), so this never touches document content.  The measure path and
+ * the draw path share one font-size mapping, so layout and rendering always agree. */
+#define RX_TEXT_SCALE 0.92          /* cairo font size = (X ascent+descent) * this */
+static cairo_t         *rx_mcr;     /* persistent 1x1 measuring context */
+static cairo_surface_t *rx_ms;      /* its surface (kept so we can heal) */
+static Display         *rx_dpy;     /* stashed so XTextWidth/Extents (no Display arg) can query fonts */
+
+static double rx_text_size(int asc, int desc)
+{
+    int h = asc + desc; if (h < 6) h = 13;
+    return (double)h * RX_TEXT_SCALE;
+}
+/* X text is Latin-1 (iso8859-1); cairo wants UTF-8.  Convert so a high byte can't
+ * throw CAIRO_STATUS_INVALID_STRING (which would stick on a persistent context and
+ * make every later measurement return 0).  Returns bytes written. */
+static int rx_latin1_utf8(const char *s, int len, char *out, int outsz)
+{
+    int i, o = 0;
+    for (i = 0; i < len && o < outsz - 2; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) out[o++] = (char)c;
+        else { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    out[o] = 0;
+    return o;
+}
+#define RX_FONT_PROP "Sans"
+#define RX_FONT_MONO "Monospace"
+/* Honour WP's font-family intent: a fixed-width X font (all glyphs one width) keeps
+ * a monospace cairo font (column alignment); a proportional one gets Sans. */
+static int rx_fs_mono(XFontStruct *fs)
+{
+    return fs && fs->max_bounds.width > 0 && fs->min_bounds.width == fs->max_bounds.width;
+}
+static void rx_mcr_init(void)
+{
+    if (!rx_mcr && rx_cairo_ok) {
+        rx_ms = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
+        rx_mcr = cairo_create(rx_ms);
+    }
+}
+static double rx_measure_str(int asc, int desc, int mono, const char *s, int len)
+{
+    char buf[1200]; cairo_text_extents_t te;
+    if (!rx_cairo_ok) return -1;
+    rx_mcr_init(); if (!rx_mcr) return -1;
+    if (len < 0) len = 0; if (len > 550) len = 550;
+    rx_latin1_utf8(s, len, buf, sizeof buf);
+    cairo_select_font_face(rx_mcr, mono ? RX_FONT_MONO : RX_FONT_PROP,
+                           CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(rx_mcr, rx_text_size(asc, desc));
+    cairo_text_extents(rx_mcr, buf, &te);
+    if (cairo_status(rx_mcr)) {                       /* poisoned -> rebuild for next call */
+        cairo_destroy(rx_mcr); cairo_surface_destroy(rx_ms); rx_mcr = 0; rx_ms = 0;
+        return -1;
+    }
+    return te.x_advance;
+}
+/* cache: font XID -> ascent/descent/mono/symbolic, so we skip XQueryFont per draw.
+ * symbolic = the font's charset is *-fontspecific (or a Symbol family): its glyphs
+ * are icons/dingbats (e.g. WP's Type1/other font-type indicators), NOT text -- we
+ * must NOT re-render those with a text font, so we leave them to Motif. */
+#define RX_XA_FONT ((Atom)18)                 /* predefined XA_FONT */
+static struct { Font id; int asc, desc, mono, sym; } rx_fcache[16];
+static int rx_font_metrics(Display *d, Font fid, int *asc, int *desc, int *mono, int *sym)
+{
+    int i, p; XFontStruct *fs; Atom nameatom = 0;
+    if (!fid) return 0;
+    for (i = 0; i < 16; i++) if (rx_fcache[i].id == fid) {
+        *asc = rx_fcache[i].asc; *desc = rx_fcache[i].desc; *mono = rx_fcache[i].mono; *sym = rx_fcache[i].sym; return 1; }
+    fs = XQueryFont(d, fid); if (!fs) return 0;
+    *asc = fs->ascent; *desc = fs->descent; *mono = rx_fs_mono(fs); *sym = 0;
+    for (p = 0; p < fs->n_properties; p++)
+        if (fs->properties[p].name == RX_XA_FONT) { nameatom = (Atom)fs->properties[p].card32; break; }
+    if (nameatom) {
+        char *xlfd = XGetAtomName(d, nameatom);
+        if (xlfd) {
+            /* Symbol/icon fonts (glyphs are pictograms, not letters): standard
+             * *-fontspecific/Symbol/Dingbat charsets, plus WP's own "wp60ruler"
+             * pi-font (the Q/N font-type and K/L printer-type UI icons).  WP's
+             * TEXT fonts are "wzh00*", so matching "ruler"/"wp*symbol" is safe. */
+            if (strstr(xlfd, "fontspecific") || strstr(xlfd, "ymbol") ||
+                strstr(xlfd, "dingbat") || strstr(xlfd, "ruler") || strstr(xlfd, "wpicon")) *sym = 1;
+            if (rx_verbose) rx_log("font 0x%lx %s%s", (unsigned long)fid, xlfd, *sym ? "  [SYMBOL->Motif]" : "");
+            XFree(xlfd);
+        }
+    }
+    XFreeFontInfo(NULL, fs, 1);
+    for (i = 0; i < 16; i++) if (!rx_fcache[i].id) {
+        rx_fcache[i].id = fid; rx_fcache[i].asc = *asc; rx_fcache[i].desc = *desc;
+        rx_fcache[i].mono = *mono; rx_fcache[i].sym = *sym; break; }
+    return 1;
+}
+static void rx_pixel_rgb(Display *d, unsigned long pixel, double *r, double *g, double *b)
+{
+    XColor c; c.pixel = pixel;
+    XQueryColor(d, DefaultColormap(d, DefaultScreen(d)), &c);
+    *r = c.red / 65535.0; *g = c.green / 65535.0; *b = c.blue / 65535.0;
+}
+/* Render one string via Cairo onto the drawable at the X baseline (x,y).  Fills an
+ * opaque background (the GC background = the control/imagestring bg) so the glyphs
+ * antialias correctly, then blits it in one XPutImage. */
+static int rx_draw_text(Display *d, Drawable dr, GC gc, int x, int y, const char *s, int len, int imgstr)
+{
+    XGCValues gv; int asc = 12, desc = 3, mono = 0, sym = 0; char buf[1200];
+    double fsz, fr, fg, fb, br, bg, bb; cairo_text_extents_t te;
+    unsigned int W, H; cairo_surface_t *sf; cairo_t *cr; int drew = 0;
+    if (!rx_cairo_ok || len <= 0) return 0;
+    if (!rx_dpy) rx_dpy = d;
+    /* XDrawString has NO background: Motif already painted what's under it (a row
+     * bg, or a selection highlight).  Our opaque blit would cover that -- so leave
+     * plain-string draws to Motif and only re-render the opaque XDrawImageString
+     * ones (which own their background).  Keeps selections/highlights intact. */
+    if (!imgstr) return 0;
+    if (len > 550) len = 550;
+    if (!XGetGCValues(d, gc, GCFont | GCForeground | GCBackground, &gv)) {
+        if (rx_verbose) rx_log("text: XGetGCValues failed -> fall back to Motif");
+        return 0;
+    }
+    rx_font_metrics(d, gv.font, &asc, &desc, &mono, &sym);
+    if (sym) return 0;                                /* symbol/icon font -> Motif draws the real glyph */
+    rx_latin1_utf8(s, len, buf, sizeof buf);          /* X Latin-1 -> cairo UTF-8 */
+    fsz = rx_text_size(asc, desc);
+    rx_mcr_init(); if (!rx_mcr) return 0;
+    cairo_select_font_face(rx_mcr, mono ? RX_FONT_MONO : RX_FONT_PROP, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(rx_mcr, fsz);
+    cairo_text_extents(rx_mcr, buf, &te);
+    H = (unsigned int)(asc + desc);
+    /* Cairo sometimes returns ~0 advance for real text (font-resolution hiccup seen in
+     * some dialogs).  Don't blit a 2px sliver (invisible text) -- fall back to Motif so
+     * the text stays visible. */
+    if (te.x_advance < 1.0 || (int)H < 1) {
+        if (rx_verbose) rx_log("text: cairo advance=%.1f status=%d for '%.16s' -> Motif",
+                               te.x_advance, cairo_status(rx_mcr), buf);
+        return 0;
+    }
+    W = (unsigned int)(te.x_advance + 2.5);
+    rx_pixel_rgb(d, gv.foreground, &fr, &fg, &fb);
+    rx_pixel_rgb(d, gv.background, &br, &bg, &bb);
+    if (rx_verbose) rx_log("text dr=0x%lx font=0x%lx %ux%u@%d,%d '%.24s'",
+        (unsigned long)dr, (unsigned long)gv.font, W, H, x, y, buf);
+    sf = cairo_image_surface_create(CAIRO_FORMAT_RGB24, (int)W, (int)H);
+    cr = cairo_create(sf);
+    cairo_set_source_rgb(cr, br, bg, bb); cairo_paint(cr);
+    cairo_select_font_face(cr, mono ? RX_FONT_MONO : RX_FONT_PROP, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, fsz);
+    cairo_set_source_rgb(cr, fr, fg, fb);
+    cairo_move_to(cr, 1.0, (double)asc);
+    cairo_show_text(cr, buf);
+    cairo_surface_flush(sf);
+    {
+        unsigned char *data = cairo_image_surface_get_data(sf);
+        int stride = cairo_image_surface_get_stride(sf);
+        Visual *vis = DefaultVisual(d, DefaultScreen(d));
+        XImage *xi = data ? XCreateImage(d, vis, 24, ZPixmap, 0, (char *)data, W, H, 32, stride) : 0;
+        if (xi) {
+            rx_in_my_draw = 1;
+            XPutImage(d, dr, gc, xi, 0, 0, x, y - asc, W, H);
+            rx_in_my_draw = 0;
+            xi->data = 0; XDestroyImage(xi);
+            drew = 1;
+        }
+    }
+    cairo_destroy(cr); cairo_surface_destroy(sf);
+    return drew;
+}
+/* Metric overrides: hand Motif the Cairo advance so it lays out to our rendering. */
+int XTextWidth(XFontStruct *fs, _Xconst char *string, int count)
+{
+    REAL(XTextWidth);
+    if (rx_draw && rx_cairo_ok && fs && string && count > 0) {
+        int a, de, mono = rx_fs_mono(fs), sym = 0;
+        if (rx_dpy) rx_font_metrics(rx_dpy, fs->fid, &a, &de, &mono, &sym);
+        if (!sym) {                                  /* symbol fonts keep Motif's real metrics */
+            double w = rx_measure_str(fs->ascent, fs->descent, mono, string, count);
+            if (w > 0) return (int)(w + 0.5);        /* only trust a POSITIVE cairo width */
+        }
+    }
+    return real_XTextWidth(fs, string, count);
+}
+int XTextExtents(XFontStruct *fs, _Xconst char *string, int count,
+                 int *dir, int *fasc, int *fdesc, XCharStruct *overall)
+{
+    REAL(XTextExtents);
+    int r = real_XTextExtents(fs, string, count, dir, fasc, fdesc, overall);
+    if (rx_draw && rx_cairo_ok && fs && string && count > 0 && overall) {
+        int a, de, mono = rx_fs_mono(fs), sym = 0;
+        if (rx_dpy) rx_font_metrics(rx_dpy, fs->fid, &a, &de, &mono, &sym);
+        if (!sym) {
+            double w = rx_measure_str(fs->ascent, fs->descent, mono, string, count);
+            if (w > 0) { overall->width = (short)(w + 0.5); overall->rbearing = overall->width; }
+        }
+    }
+    return r;
+}
+
 /* Text draws: for a button window (or a gadget's parent), capture the label bytes
  * and suppress Motif's (we re-render them with Cairo); for a scrollbar, suppress. */
 int XDrawString(Display *d, Drawable dr, GC gc, int x, int y, const char *s, int len)
@@ -2077,9 +2316,10 @@ int XDrawString(Display *d, Drawable dr, GC gc, int x, int y, const char *s, int
     rx_ld("XDrawString", d, dr, s, len, x, y);
     rx_listlog("DrawStr", d, dr, gc, x, y, 0, 0, s, len);
     bi = rx_drawbtn ? rx_btn_index(dr) : -1;
-    if (bi >= 0) { rx_set_font_gc(d, bi, gc); rx_btn_text(bi, s, len, x, y); return 0; }
-    { int gi = rx_try_gadget_text((Window)dr, gc, s, len, x, y); if (gi >= 0) { rx_set_font_gc(d, gi, gc); return 0; } }
+    if (bi >= 0) { rx_set_font_gc(d, bi, gc); if (!rx_btns[bi].skip) { rx_btn_text(bi, s, len, x, y); return 0; } }
+    if (bi < 0) { int gi = rx_try_gadget_text((Window)dr, gc, s, len, x, y); if (gi >= 0) { rx_set_font_gc(d, gi, gc); if (!rx_btns[gi].skip) return 0; } }
     if (rx_draw && rx_is_sb_drawable(dr)) return 0;
+    if (rx_draw && rx_cairo_ok && rx_draw_text(d, dr, gc, x, y, s, len, 0)) return 0;  /* crisp cairo; else fall back to Motif */
     return real_XDrawString(d, dr, gc, x, y, s, len);
 }
 int XDrawImageString(Display *d, Drawable dr, GC gc, int x, int y, const char *s, int len)
@@ -2090,9 +2330,10 @@ int XDrawImageString(Display *d, Drawable dr, GC gc, int x, int y, const char *s
     rx_ld("XDrawImgStr", d, dr, s, len, x, y);
     rx_listlog("DrawImgStr", d, dr, gc, x, y, 0, 0, s, len);
     bi = rx_drawbtn ? rx_btn_index(dr) : -1;
-    if (bi >= 0) { rx_set_font_gc(d, bi, gc); rx_btn_text(bi, s, len, x, y); return 0; }
-    { int gi = rx_try_gadget_text((Window)dr, gc, s, len, x, y); if (gi >= 0) { rx_set_font_gc(d, gi, gc); return 0; } }
+    if (bi >= 0) { rx_set_font_gc(d, bi, gc); if (!rx_btns[bi].skip) { rx_btn_text(bi, s, len, x, y); return 0; } }
+    if (bi < 0) { int gi = rx_try_gadget_text((Window)dr, gc, s, len, x, y); if (gi >= 0) { rx_set_font_gc(d, gi, gc); if (!rx_btns[gi].skip) return 0; } }
     if (rx_draw && rx_is_sb_drawable(dr)) return 0;
+    if (rx_draw && rx_cairo_ok && rx_draw_text(d, dr, gc, x, y, s, len, 1)) return 0;  /* crisp cairo; else fall back to Motif */
     return real_XDrawImageString(d, dr, gc, x, y, s, len);
 }
 void XmbDrawString(Display *d, Drawable dr, XFontSet fset, GC gc, int x, int y, const char *s, int len)
@@ -2186,6 +2427,7 @@ static void rx_note_widget(Widget w)
 {
     const char *cls  = rx_class(w);
     const char *name = XtName(w) ? XtName(w) : "(unnamed)";
+    if (!rx_dpy) rx_dpy = XtDisplayOfObject(w);   /* for XTextWidth/Extents font queries */
 
     if (rx_verbose)
         rx_log("manage  class=%-18s name=%s", cls, name);
@@ -2242,6 +2484,11 @@ static void rx_note_widget(Widget w)
     }
     else if (strcmp(cls, "XmCascadeButton") == 0) {   /* menu-BAR item (File/Edit/...) - flat, no chevron */
         rx_hook_menuitem(w, RX_MENU_NORMAL);
+        /* The bar's buttons are sized for Motif's tight 8pt font, so our flat labels
+         * look cramped.  Grow each with more horizontal margin and let the menu-bar
+         * RowColumn re-lay-out itself -- that keeps the right-aligned Help item in
+         * place (we never reposition it by hand, which would break its alignment). */
+        XtVaSetValues(w, "marginWidth", (Dimension)RX_MENUBAR_MARGIN, (char *)0);
     }
     else if (strcmp(cls, "XmToggleButton") == 0) {    /* dialog checkbox / radio */
         rx_hook_toggle(w);
