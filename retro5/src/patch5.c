@@ -248,8 +248,19 @@ static const uint32_t R5_RGB[R5_GC_N] = {
     R5_COL_EDGE, R5_COL_SUNK, R5_COL_SUNK_IN, R5_COL_HAIRLINE, R5_COL_GLYPH, R5_COL_PRESS
 };
 
-static int r5_skin = 1;             /* RETRO5_SKIN=0 -> leave Motif's drawing alone */
+static int r5_skin = 1;             /* RETRO5_SKIN=0 -> leave Motif's drawing alone (all appearance off) */
+static int r5_text = 1;             /* cairo text layer: RETRO5_TEXT=
+                                     *   1 / unset -> full (load cairo, warm fontconfig, hook draw+metrics)
+                                     *   0         -> off (no cairo load, no warm, no hooks)
+                                     *   "load"    -> DIAGNOSTIC: dlopen cairo's lib graph ONLY — run its
+                                     *                constructors, but no fontconfig init and no hooks.
+                                     *   "warm"    -> DIAGNOSTIC: load + FcInit (font scan), still NO hooks.
+                                     *                load vs warm vs full isolates libs / fontconfig / hooks. */
 static int r5_trace;                /* RETRO5_TRACE=1 -> log every draw call + its widget */
+
+/* True once the text layer is fully wired at library init (cairo loaded, all reals resolved, hooks
+ * installed). Set before WP runs, so every hooked call from WP finds a pure, linker-free hook. */
+static int r5_text_active;
 
 /* ---- the X/Xt call layer, bound two different ways ----
  * The painters below are binary-independent, but HOW they reach X is not. A dynamically-linked host
@@ -287,9 +298,14 @@ static struct {
 /* Set by the per-binary takeover when the host is static; NULL means "resolve by name". */
 static const R5XSyms *r5_xsyms;
 
-/* member <- dlsym("<sym>")            (dynamic hosts)
+/* Resolve from libX11/libXt directly, NEVER dlsym(RTLD_DEFAULT). In this ancient host RTLD_DEFAULT
+ * mis-resolves Xt symbols — e.g. it returned XtDisplayOfObject's address for "XtWindowOfObject", so
+ * we read a Display* as a window and XGetGeometry'd garbage. Defined below; forward-declared here. */
+static void *r5_realsym(const char *name);
+
+/* member <- the genuine library symbol   (dynamic hosts)
  * member <- absolute VA from the binary's own table   (static hosts) */
-#define R5_SYM(memb, sym) (*(void **)&r5x.memb = dlsym(RTLD_DEFAULT, sym), r5x.memb != 0)
+#define R5_SYM(memb, sym) (*(void **)&r5x.memb = r5_realsym(sym), r5x.memb != 0)
 #define R5_ADDR(memb)     (r5_xsyms->memb && !range_unmapped((void *)r5_xsyms->memb, 1) \
                            ? (*(void **)&r5x.memb = (void *)r5_xsyms->memb, 1) : 0)
 
@@ -602,38 +618,37 @@ void retro5_XmDrawHighlight(Display *dpy, Drawable d, GC hl_gc,
 }
 
 /* ======================================================================================= *
- *  Font aliasing — pointing WP's X core fonts at the system's
+ *  Cairo text layer — WP's X text rendered with the system font engine
  * ======================================================================================= *
- * WP is pure X-core-font: it asks for fonts by XLFD (XLoadQueryFont / XListFonts) and measures
- * them with XTextWidth. No Xft, no fontconfig — it predates both. Rather than rewrite the text
- * rendering (which would mean owning metrics too, or every layout in the app shifts), we sit on the
- * SELECTION calls and rewrite the font NAME. WP still measures exactly the font it draws, so
- * spacing stays self-consistent — the font simply becomes a modern one.
+ * WP is pure X-core-font: it asks for fonts by XLFD, DRAWS with XDrawString / XDrawImageString, and
+ * MEASURES with XTextWidth / XTextExtents. A modern X server has no FreeType core-font backend, so
+ * core fonts cannot reach the system's TrueType/OpenType faces at all — the only way to a modern
+ * font is to stop drawing through X and draw with cairo (which resolves families through
+ * fontconfig). So we take over the draw AND the measure calls together and satisfy both from one
+ * cairo font: WP lays its controls out to widths we return, and we draw to exactly those widths, so
+ * layout and rendering can never disagree.
  *
- * The mapping is a table, overridable by a config file so a skin can retune fonts without a
- * rebuild:  ~/.config/retro5/fonts.conf  (or $RETRO5_FONTS), one rule per line:
+ * Unlike retroXt (which had to composite an image surface over a live Motif widget and so could
+ * only touch opaque XDrawImageString), we ARE XDrawString now — we render glyphs straight onto the
+ * same Drawable at the same baseline, so plain strings composite over their background with nothing
+ * to fight. The one hard constraint we keep from retroXt is real: cairo is dlopen'd RTLD_DEEPBIND,
+ * or its (and fontconfig's) libc calls bind to retro5's libc5 shims and font init deadlocks.
  *
- *     # pattern                        replacement
- *     -*-helvetica-*                   -*-dejavu sans-medium-r-normal--*-*-*-*-p-*-iso8859-1
- *
- * `*` matches any run of characters; first rule that matches wins. An alias that fails to load
- * falls back to the font WP originally asked for — a bad config can make the UI ugly, never
- * textless. (WP's bundled character-set bitmaps, shlib10/fonts/wc*.pcf, are deliberately NOT
- * aliased by default: they carry WP's own glyph encodings, and substituting them would mangle
- * symbols rather than modernise them.) */
+ * Safety: any font/string/drawable we cannot handle falls back to the real X call, so the worst
+ * case is legacy-looking text, never missing text. RETRO5_SKIN=0 disables the whole layer. */
+#include <cairo/cairo.h>
+#include <cairo/cairo-xlib.h>
 
+/* --- alias table: WP XLFD family -> cairo family (which fontconfig resolves to a real font) --- */
 #define R5_FONT_RULES 32
-static struct { char pat[128], repl[192]; } r5_fonts[R5_FONT_RULES];
-static int r5_font_n;
-static int r5_font_loaded;
+static struct { char pat[64], repl[64]; } r5_fonts[R5_FONT_RULES];
+static int r5_font_n, r5_font_loaded;
 
-/* glob with a single wildcard character: '*' matches any run (including empty). */
-static int r5_glob(const char *pat, const char *s) {
+static int r5_glob(const char *pat, const char *s) {   /* one-wildcard glob, case-insensitive */
     for (; *pat; pat++, s++) {
         if (*pat == '*') {
-            if (!pat[1]) return 1;                        /* trailing * matches the rest */
-            for (; *s; s++)
-                if (r5_glob(pat + 1, s)) return 1;
+            if (!pat[1]) return 1;
+            for (; *s; s++) if (r5_glob(pat + 1, s)) return 1;
             return r5_glob(pat + 1, s);
         }
         if (!*s) return 0;
@@ -642,114 +657,507 @@ static int r5_glob(const char *pat, const char *s) {
     }
     return !*s;
 }
-
 static void r5_font_add(const char *pat, const char *repl) {
     if (r5_font_n >= R5_FONT_RULES) return;
     strncpy(r5_fonts[r5_font_n].pat,  pat,  sizeof r5_fonts[0].pat  - 1);
     strncpy(r5_fonts[r5_font_n].repl, repl, sizeof r5_fonts[0].repl - 1);
     r5_font_n++;
 }
-
-/* Read the config file, if there is one. Format: `pattern<whitespace>replacement`, # comments. */
+/* ~/.config/retro5/fonts.conf ($RETRO5_FONTS): `wp-family-glob   cairo-family`, # comments.
+ *     -*-helvetica-*     Inter
+ * The config is where per-skin taste lives; it is read before the built-ins, so it wins. */
 static void r5_font_config(void) {
-    char path[512], line[384];
-    const char *env = getenv("RETRO5_FONTS");
-    const char *home = getenv("HOME");
+    char path[512], line[256];
+    const char *env = getenv("RETRO5_FONTS"), *home = getenv("HOME");
     FILE *f;
-
-    if (env && *env) {
-        strncpy(path, env, sizeof path - 1); path[sizeof path - 1] = 0;
-    } else if (home) {
-        snprintf(path, sizeof path, "%s/.config/retro5/fonts.conf", home);
-    } else {
-        return;
-    }
+    if (env && *env) { strncpy(path, env, sizeof path - 1); path[sizeof path - 1] = 0; }
+    else if (home)   { snprintf(path, sizeof path, "%s/.config/retro5/fonts.conf", home); }
+    else return;
     if (!(f = fopen(path, "r"))) return;
     while (fgets(line, sizeof line, f)) {
         char *p = line, *pat, *repl, *e;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || !*p) continue;
         pat = p;
-        while (*p && *p != ' ' && *p != '\t') p++;        /* pattern ends at whitespace */
+        while (*p && *p != ' ' && *p != '\t') p++;
         if (!*p) continue;
         *p++ = 0;
         while (*p == ' ' || *p == '\t') p++;
         repl = p;
-        e = repl + strlen(repl);
-        while (e > repl && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        for (e = repl + strlen(repl); e > repl && (e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '); ) *--e = 0;
         if (*repl) r5_font_add(pat, repl);
     }
     fclose(f);
-    if (r5_trace) {
-        char b[160];
-        int n = snprintf(b, sizeof b, "retro5: loaded %d font rule(s) from %s\n", r5_font_n, path);
-        if (n > 0) write(2, b, (size_t)n);
-    }
 }
-
-/* No built-in rules, on purpose.
- *
- * The tempting default — alias helvetica -> DejaVu — cannot work, and it is worth writing down why
- * so nobody adds it back: a modern X server has NO FreeType core-font backend and ships no
- * fonts.dir for the system TTFs, so DejaVu is simply not among the ~1300 core fonts it will serve.
- * The core font path contains legacy bitmaps and URW Type1 clones and nothing else. Aliasing one
- * XLFD to another can therefore only swap a 1990s face for another 1990s face.
- *
- * Reaching the actual system fonts means bypassing core fonts entirely and drawing text with
- * cairo/fontconfig — which also means owning the METRICS calls (XTextWidth, XTextExtents,
- * XmbTextExtents) in the same breath, because WP measures with one call and draws with another and
- * the two must agree or every layout in the app shifts. That is the next step; this table is the
- * mapping it will consume, keyed the same way, with families instead of XLFDs.
- *
- * Until then the table stays empty by default and the config file is the only source of rules — so
- * the font path is honest: it changes nothing unless you tell it to. */
+/* Built-ins map WP's stock faces onto cairo generic families. "Sans"/"Serif"/"Monospace" are
+ * fontconfig aliases, so they resolve to whatever modern face the system actually installed —
+ * which is exactly the "integrate the system font engine" we want, with no hard-coded face. */
 static void r5_font_init(void) {
     if (r5_font_loaded) return;
     r5_font_loaded = 1;
     r5_font_config();
+    r5_font_add("*helvetica*", "Sans");
+    r5_font_add("*courier*",   "Monospace");
+    r5_font_add("*times*",     "Serif");
 }
+/* Ask the desktop what UI font it actually uses, so WP inherits the user's real font instead of a
+ * generic. GNOME/most environments answer `gsettings get org.gnome.desktop.interface <key>` with
+ * e.g. 'Cantarell 11'; failing that, GTK's settings.ini carries `gtk-font-name`. We keep only the
+ * family (WP's XLFD still decides the size). Cached; a miss just leaves the generic default. */
+static char r5_desk_prop[64], r5_desk_mono[64];
+static int  r5_desk_done;
 
-static const char *r5_font_alias(const char *name) {
-    int i;
-    if (!name || !*name) return 0;
-    r5_font_init();
-    for (i = 0; i < r5_font_n; i++)
-        if (r5_glob(r5_fonts[i].pat, name)) return r5_fonts[i].repl;
-    return 0;
+static void r5_strip_size_quotes(char *s) {             /* 'Cantarell Bold 11' -> Cantarell Bold */
+    char *e;
+    if (*s == '\'' || *s == '"') { memmove(s, s + 1, strlen(s)); }
+    for (e = s + strlen(s); e > s && (e[-1]=='\n'||e[-1]=='\r'||e[-1]=='\''||e[-1]=='"'||e[-1]==' '); )
+        *--e = 0;
+    e = s + strlen(s);                                  /* drop a trailing point size */
+    while (e > s && e[-1] >= '0' && e[-1] <= '9') e--;
+    while (e > s && e[-1] == ' ') e--;
+    *e = 0;
 }
-
-/* The interposed selection calls. Both keep WP's original name as the fallback, so a font we
- * cannot load costs us the restyle, never the text. */
-static XFontStruct *(*r5_real_LoadQueryFont)(Display *, const char *);
-static char **(*r5_real_ListFonts)(Display *, const char *, int, int *);
-
-XFontStruct *retro5_XLoadQueryFont(Display *dpy, const char *name) {
-    const char *alias;
-    XFontStruct *fs;
-    if (!r5_real_LoadQueryFont) *(void **)&r5_real_LoadQueryFont =
-                                    dlsym(RTLD_DEFAULT, "XLoadQueryFont");
-    if (!r5_real_LoadQueryFont) return 0;
-    if (r5_skin && (alias = r5_font_alias(name)) != 0) {
-        if ((fs = r5_real_LoadQueryFont(dpy, alias)) != 0) return fs;
-        if (r5_trace) {
-            char b[256];
-            int n = snprintf(b, sizeof b, "retro5: font alias failed, keeping %s\n", name);
-            if (n > 0) write(2, b, (size_t)n);
+/* File-only, NEVER fork. WP does a timing-sensitive pipe handshake with helper processes at
+ * startup, and a popen() here would fork WP — duplicating those pipe fds into a shell child and
+ * desyncing the handshake (the "spawned-process/IPC" hang). So we read config files directly:
+ * GTK's settings.ini carries `gtk-font-name = Family Size`, which tracks the GNOME/desktop UI font
+ * on every mainstream environment. `key` selects the line (gtk-font-name / gtk-monospace...). */
+static int r5_gtk_font_file(const char *rel, const char *key, char *out, int outsz) {
+    char path[512], line[256]; const char *home = getenv("HOME"); FILE *f; int ok = 0;
+    if (!home) return 0;
+    snprintf(path, sizeof path, "%s/%s", home, rel);
+    if (!(f = fopen(path, "r"))) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *v = strstr(line, key);
+        if (v && (v = strchr(v, '=')) != 0) {
+            v++; while (*v == ' ') v++;
+            strncpy(out, v, outsz - 1); out[outsz - 1] = 0;
+            r5_strip_size_quotes(out); ok = out[0] != 0; break;
         }
     }
-    return r5_real_LoadQueryFont(dpy, name);              /* WP's own choice, always available */
+    fclose(f);
+    return ok;
+}
+static void r5_desktop_init(void) {
+    if (r5_desk_done) return;
+    r5_desk_done = 1;
+    r5_gtk_font_file(".config/gtk-3.0/settings.ini", "gtk-font-name", r5_desk_prop, sizeof r5_desk_prop)
+      || r5_gtk_font_file(".config/gtk-4.0/settings.ini", "gtk-font-name", r5_desk_prop, sizeof r5_desk_prop)
+      || r5_gtk_font_file(".gtkrc-2.0", "gtk-font-name", r5_desk_prop, sizeof r5_desk_prop);
+    if (r5_trace) {
+        char b[160]; int k = snprintf(b, sizeof b, "retro5: desktop UI font prop='%s'\n",
+                     r5_desk_prop); if (k > 0) write(2, b, (size_t)k);
+    }
 }
 
-char **retro5_XListFonts(Display *dpy, const char *pattern, int maxnames, int *count) {
-    const char *alias;
-    char **r;
-    if (!r5_real_ListFonts) *(void **)&r5_real_ListFonts = dlsym(RTLD_DEFAULT, "XListFonts");
-    if (!r5_real_ListFonts) { if (count) *count = 0; return 0; }
-    if (r5_skin && (alias = r5_font_alias(pattern)) != 0) {
-        if ((r = r5_real_ListFonts(dpy, alias, maxnames, count)) != 0 && count && *count > 0)
-            return r;
+static const char *r5_family_for(const char *xlfd_family, int mono) {
+    int i;
+    if (xlfd_family && *xlfd_family) {
+        r5_font_init();
+        for (i = 0; i < r5_font_n; i++)                  /* explicit rules win */
+            if (r5_glob(r5_fonts[i].pat, xlfd_family)) return r5_fonts[i].repl;
     }
-    return r5_real_ListFonts(dpy, pattern, maxnames, count);
+    r5_desktop_init();                                   /* else the desktop's own UI font */
+    if (mono && r5_desk_mono[0]) return r5_desk_mono;
+    if (!mono && r5_desk_prop[0]) return r5_desk_prop;
+    return mono ? "Monospace" : "Sans";                  /* last resort: fontconfig generic */
+}
+
+/* --- cairo, dlopen'd RTLD_DEEPBIND (see banner) --- */
+static struct {
+    int ready;
+    cairo_surface_t *(*xlib_surface_create)(Display *, Drawable, Visual *, int, int);
+    cairo_surface_t *(*image_surface_create)(cairo_format_t, int, int);
+    cairo_t *(*create)(cairo_surface_t *);
+    void (*destroy)(cairo_t *);
+    void (*surface_destroy)(cairo_surface_t *);
+    void (*surface_flush)(cairo_surface_t *);
+    void (*set_source_rgb)(cairo_t *, double, double, double);
+    void (*move_to)(cairo_t *, double, double);
+    void (*rectangle)(cairo_t *, double, double, double, double);
+    void (*fill)(cairo_t *);
+    void (*select_font_face)(cairo_t *, const char *, cairo_font_slant_t, cairo_font_weight_t);
+    void (*set_font_size)(cairo_t *, double);
+    void (*show_text)(cairo_t *, const char *);
+    void (*text_extents)(cairo_t *, const char *, cairo_text_extents_t *);
+    cairo_status_t (*status)(cairo_t *);
+} cz;
+
+/* Non-blocking check used by the draw/measure hot path: is cairo ready to use? We NEVER dlopen from
+ * here — the load is done once at library init (r5_cairo_preload), before WP's main and before any
+ * helper is spawned, because a heavy dlopen inside a startup expose stalls WP's main thread while it
+ * is mid-IPC-handshake and the app hangs. Until preload has finished, text falls back to real X. */
+static int r5_cairo(void) { return cz.ready > 0; }
+
+/* STEP 1 — just load the library graph (cairo + its deps: fontconfig, freetype, pixman, xcb, ...)
+ * and bind the symbols. This runs every dependency's ELF CONSTRUCTOR. It does NOT init fontconfig
+ * (no font scan) and does NOT touch X. Split out from the warm/hook steps so a diagnostic build can
+ * do exactly this and nothing else — to answer "is merely loading these libs what breaks WP?" */
+static int r5_cairo_load(void) {
+    void *h;
+    if (cz.ready) return cz.ready > 0;
+    cz.ready = -1;
+    if (!(h = dlopen("libcairo.so.2", RTLD_NOW | RTLD_DEEPBIND))) return 0;
+#define CZ(m, s) (*(void **)&cz.m = dlsym(h, s), cz.m != 0)
+    if (!(CZ(xlib_surface_create, "cairo_xlib_surface_create") &&
+          CZ(image_surface_create, "cairo_image_surface_create") &&
+          CZ(create, "cairo_create") && CZ(destroy, "cairo_destroy") &&
+          CZ(surface_destroy, "cairo_surface_destroy") && CZ(surface_flush, "cairo_surface_flush") &&
+          CZ(set_source_rgb, "cairo_set_source_rgb") && CZ(move_to, "cairo_move_to") &&
+          CZ(rectangle, "cairo_rectangle") && CZ(fill, "cairo_fill") &&
+          CZ(select_font_face, "cairo_select_font_face") && CZ(set_font_size, "cairo_set_font_size") &&
+          CZ(show_text, "cairo_show_text") && CZ(text_extents, "cairo_text_extents") &&
+          CZ(status, "cairo_status")))
+        return 0;
+#undef CZ
+    cz.ready = 1;
+    return 1;
+}
+
+/* STEP 2 — force FcInit + first face load (the font-info part), on an image surface so no X is
+ * needed. Process-global-cached, so the first real draw is cheap. Separate from load() so it can
+ * be skipped by the diagnostic build. */
+static void r5_cairo_warm(void) {
+    cairo_surface_t *ms;
+    cairo_t *cr;
+    cairo_text_extents_t te;
+    if (cz.ready <= 0) return;
+    if ((ms = cz.image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1)) != 0) {
+        if ((cr = cz.create(ms)) != 0) {
+            cz.select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cz.set_font_size(cr, 13.0);
+            cz.text_extents(cr, "Ag", &te);
+            cz.destroy(cr);
+        }
+        cz.surface_destroy(ms);
+    }
+}
+
+/* --- per-font record, keyed by the X Font XID: the lifecycle hook the design turns on ---
+ * WP allocates fonts (XLoadQueryFont) and frees them (XFreeFont), and every draw/measure GC carries
+ * the Font XID of the font in play. That XID is our key: we build a record the first time we see a
+ * font, keep it alongside WP's, and drop it when WP frees the font. The record holds everything the
+ * cairo path needs (family + size + style), computed ONCE, so per-glyph work is just rendering. */
+#define R5_XA_FONT ((Atom)18)              /* predefined XA_FONT property = the font's XLFD */
+#define R5_UNSPECIFIED_PIXMAP ((Pixmap)2)  /* Motif's XmUNSPECIFIED_PIXMAP — "this label has no pixmap" */
+typedef struct {
+    Font id;
+    int  used;
+    int  passthrough;                      /* symbol/dingbat/pi font: leave to X, wrong glyphs else */
+    double size;                           /* cairo em size, from the X pixel height */
+    const char *family;
+    cairo_font_slant_t  slant;
+    cairo_font_weight_t weight;
+} R5Font;
+static R5Font r5_ftab[32];
+
+/* Resolve a symbol from libX11/libXt DIRECTLY, never via RTLD_DEFAULT. This is essential for any
+ * symbol whose GOT slot we have taken over: dlsym(RTLD_DEFAULT, "XLoadQueryFont") in this host does
+ * NOT return libX11's function — it returns the executable's own PLT stub, which we redirected to
+ * our hook, so calling it re-enters us forever (proven: 174k-deep recursion -> stack overflow).
+ * dlopen(RTLD_NOLOAD) hands back the library that is already mapped, and dlsym on THAT handle
+ * returns the genuine implementation. */
+static void *r5_realsym(const char *name) {
+    static void *h11, *hxt;
+    void *p = 0;
+    if (!h11) h11 = dlopen("libX11.so.6", RTLD_NOLOAD | RTLD_NOW);
+    if (!hxt) hxt = dlopen("libXt.so.6",  RTLD_NOLOAD | RTLD_NOW);
+    if (h11) p = dlsym(h11, name);
+    if (!p && hxt) p = dlsym(hxt, name);
+    if (!p) p = dlsym(RTLD_DEFAULT, name);               /* last resort */
+    return p;
+}
+
+/* Real X calls we still need. r5_XQueryFont is one we TOOK OVER, so it must come from libX11
+ * directly (r5_realsym), or we would recurse into our own retro5_XQueryFont. */
+static XFontStruct *(*r5_XQueryFont)(Display *, XID);
+static Status (*r5_XGetGCValues)(Display *, GC, unsigned long, XGCValues *);
+static char *(*r5_XGetAtomName)(Display *, Atom);
+static int   (*r5_XFreeFontInfo)(char **, XFontStruct *, int);
+static void  r5_bind_helpers(void) {
+    if (r5_XQueryFont) return;
+    *(void **)&r5_XQueryFont    = r5_realsym("XQueryFont");
+    *(void **)&r5_XGetGCValues  = r5_realsym("XGetGCValues");
+    *(void **)&r5_XGetAtomName  = r5_realsym("XGetAtomName");
+    *(void **)&r5_XFreeFontInfo = r5_realsym("XFreeFontInfo");
+}
+
+/* Pull the XLFD family + charset out of a loaded font, so we can alias the family and spot the
+ * symbol fonts we must NOT re-render. XLFD: -fndry-FAMILY-wght-slant-...-spacing-...-CHARSET */
+static void r5_parse_xlfd(const char *xlfd, char *family, int fsz,
+                          int *bold, int *italic, int *symbolic) {
+    const char *f[14];
+    int n = 0, i;
+    const char *p = xlfd;
+    family[0] = 0; *bold = *italic = *symbolic = 0;
+    if (!xlfd || xlfd[0] != '-') return;
+    for (p = xlfd; *p && n < 14; p++) if (*p == '-') f[n++] = p + 1;
+    if (n < 3) return;
+    for (i = 0; f[1][i] && f[1][i] != '-' && i < fsz - 1; i++) family[i] = f[1][i];
+    family[i] = 0;
+    if (n > 2 && (!strncmp(f[2], "bold", 4) || !strncmp(f[2], "Bold", 4))) *bold = 1;
+    if (n > 3 && (f[3][0] == 'i' || f[3][0] == 'o' || f[3][0] == 'I' || f[3][0] == 'O')) *italic = 1;
+    /* charset is the tail after the last two hyphens; symbol/pi fonts carry these markers */
+    if (strstr(xlfd, "fontspecific") || strstr(xlfd, "ymbol") || strstr(xlfd, "dingbat") ||
+        strstr(xlfd, "ruler") || strstr(xlfd, "wpicon")) *symbolic = 1;
+}
+
+/* Build (or fetch cached) our cairo record for an already-loaded font, keyed by fs->fid. The
+ * XLFD is taken from `xlfd_hint` (the name WP passed to XLoadQueryFont) when known, else from the
+ * font's own XA_FONT property. Does NOT free fs — the caller owns it. */
+static R5Font *r5_font_intern(Display *dpy, XFontStruct *fs, const char *xlfd_hint) {
+    R5Font *slot = 0;
+    char family[64], *xlfd = 0;
+    int i, p, bold = 0, italic = 0, sym = 0, mono;
+    Atom nameatom = 0;
+    Font fid;
+
+    if (!fs) return 0;
+    fid = fs->fid;
+    for (i = 0; i < 32; i++) {
+        if (r5_ftab[i].used && r5_ftab[i].id == fid) return &r5_ftab[i];
+        if (!slot && !r5_ftab[i].used) slot = &r5_ftab[i];
+    }
+    if (!slot) return 0;
+
+    mono = (fs->max_bounds.width > 0 && fs->min_bounds.width == fs->max_bounds.width);
+    if (xlfd_hint && xlfd_hint[0] == '-') {
+        r5_parse_xlfd(xlfd_hint, family, (int)sizeof family, &bold, &italic, &sym);
+        if (r5_trace) { char b[220]; int k = snprintf(b, sizeof b, "retro5: font 0x%lx %s%s\n",
+                        (unsigned long)fid, xlfd_hint, sym ? "  [symbol->X]" : ""); if (k>0) write(2,b,k); }
+    } else {
+        r5_bind_helpers();
+        for (p = 0; p < fs->n_properties; p++)
+            if (fs->properties[p].name == R5_XA_FONT) { nameatom = (Atom)fs->properties[p].card32; break; }
+        if (nameatom && r5_XGetAtomName && (xlfd = r5_XGetAtomName(dpy, nameatom)) != 0)
+            r5_parse_xlfd(xlfd, family, (int)sizeof family, &bold, &italic, &sym);
+        else family[0] = 0;
+    }
+
+    slot->id = fid; slot->used = 1; slot->passthrough = sym;
+    slot->family = r5_family_for(family, mono);
+    slot->slant  = italic ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
+    slot->weight = bold ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL;
+    /* cairo em size from the X pixel height. 0.92 keeps our glyphs a touch tighter than the box,
+       matching how a modern UI font sits vs. a bitmap face of the same nominal height. */
+    { int hgt = fs->ascent + fs->descent; if (hgt < 6) hgt = 13; slot->size = hgt * 0.92; }
+    return slot;
+}
+
+/* Fetch the record for a Font XID (draw path has only the id). Cache hit is the norm — the record
+ * was interned when the font was loaded; this queries as a fallback for a font we never saw load. */
+static R5Font *r5_font_get(Display *dpy, Font fid) {
+    XFontStruct *fs;
+    R5Font *r;
+    int i;
+    if (!fid || !dpy) return 0;
+    for (i = 0; i < 32; i++)
+        if (r5_ftab[i].used && r5_ftab[i].id == fid) return &r5_ftab[i];
+    r5_bind_helpers();
+    if (!r5_XQueryFont || !(fs = r5_XQueryFont(dpy, fid))) return 0;
+    r = r5_font_intern(dpy, fs, 0);
+    if (r5_XFreeFontInfo) r5_XFreeFontInfo(0, fs, 1);
+    return r;
+}
+static void r5_font_free(Font fid) {
+    int i;
+    for (i = 0; i < 32; i++) if (r5_ftab[i].used && r5_ftab[i].id == fid) { r5_ftab[i].used = 0; return; }
+}
+
+static void r5_cairo_font(cairo_t *cr, const R5Font *fnt) {
+    cz.select_font_face(cr, fnt->family, fnt->slant, fnt->weight);
+    cz.set_font_size(cr, fnt->size);
+}
+
+/* X text is Latin-1; cairo wants UTF-8. Convert so a high byte can't poison the context. */
+static int r5_latin1_utf8(const char *s, int len, char *out, int outsz) {
+    int i, o = 0;
+    for (i = 0; i < len && o < outsz - 2; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) out[o++] = (char)c;
+        else { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* The Display, stashed from any call that carries one, so the no-Display metrics calls
+ * (XTextWidth/XTextExtents) can still query fonts. */
+static Display *r5_dpy;
+
+/* One persistent 1x1 image context for measuring (no per-call surface churn). */
+static cairo_t *r5_measure_cr;
+static double r5_advance(const R5Font *fnt, const char *s, int len) {
+    char buf[1100]; cairo_text_extents_t te;
+    if (!r5_measure_cr) {
+        cairo_surface_t *ms = cz.image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        if (!ms) return -1;
+        r5_measure_cr = cz.create(ms);
+        cz.surface_destroy(ms);
+        if (!r5_measure_cr) return -1;
+    }
+    if (len < 0) len = 0; if (len > 500) len = 500;
+    r5_latin1_utf8(s, len, buf, sizeof buf);
+    r5_cairo_font(r5_measure_cr, fnt);
+    cz.text_extents(r5_measure_cr, buf, &te);
+    if (cz.status(r5_measure_cr)) {                      /* poisoned -> rebuild next time */
+        cz.destroy(r5_measure_cr); r5_measure_cr = 0; return -1;
+    }
+    return te.x_advance;
+}
+
+static void r5_pixel_rgb(Display *dpy, unsigned long pixel, double *r, double *g, double *b) {
+    XColor c; c.pixel = pixel;
+    if (r5x.QueryColor(dpy, DefaultColormap(dpy, DefaultScreen(dpy)), &c))
+        { *r = c.red/65535.0; *g = c.green/65535.0; *b = c.blue/65535.0; }
+    else { *r = *g = *b = 0; }
+}
+
+/* The shared draw path for XDrawString / XDrawImageString. `image` fills the GC background first
+ * (that is the only difference between the two X calls). Returns 1 if we rendered it. */
+static int r5_draw_text(Display *dpy, Drawable d, GC gc, int x, int y,
+                        const char *s, int len, int image) {
+    XGCValues gv;
+    XFontStruct *fs;
+    R5Font *fnt;
+    cairo_surface_t *sf;
+    cairo_t *cr;
+    char buf[1100];
+    double fr, fg, fb;
+    Window root; int gx, gy; unsigned gw, gh, gbw, gdep;
+
+    if (!r5_skin || !r5_text_active || len <= 0 || !dpy || !d) return 0;   /* inert until main window up */
+    if (!r5_xlib() || !r5_cairo()) return 0;
+    r5_dpy = dpy;                                        /* stash for the no-Display metrics calls */
+    r5_bind_helpers();
+    if (!r5_XGetGCValues || !r5_XGetGCValues(dpy, gc,
+            GCFont | GCForeground | GCBackground, &gv)) return 0;
+    if (!(fnt = r5_font_get(dpy, gv.font)) || fnt->passthrough) return 0;   /* symbol font -> X */
+    if (!r5x.GetGeometry(dpy, d, &root, &gx, &gy, &gw, &gh, &gbw, &gdep)) return 0;
+
+    sf = cz.xlib_surface_create(dpy, d, DefaultVisual(dpy, DefaultScreen(dpy)),
+                                (int)gw, (int)gh);
+    if (!sf) return 0;
+    cr = cz.create(sf);
+    if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
+
+    if (image) {                                         /* XDrawImageString owns its background */
+        r5_pixel_rgb(dpy, gv.background, &fr, &fg, &fb);
+        (void)fs;
+        r5_cairo_font(cr, fnt);
+        { cairo_text_extents_t te; char mb[1100];
+          r5_latin1_utf8(s, len > 500 ? 500 : len, mb, sizeof mb);
+          cz.text_extents(cr, mb, &te);
+          cz.set_source_rgb(cr, fr, fg, fb);
+          cz.rectangle(cr, x, y - fnt->size, te.x_advance + 2, fnt->size * 1.3);
+          cz.fill(cr); }
+    }
+    r5_latin1_utf8(s, len > 500 ? 500 : len, buf, sizeof buf);
+    r5_pixel_rgb(dpy, gv.foreground, &fr, &fg, &fb);
+    r5_cairo_font(cr, fnt);
+    cz.set_source_rgb(cr, fr, fg, fb);
+    cz.move_to(cr, x, y);                                /* X (x,y) is the glyph baseline */
+    cz.show_text(cr, buf);
+    cz.surface_flush(sf);
+    cz.destroy(cr);
+    cz.surface_destroy(sf);
+    return 1;
+}
+
+/* --- the interposed X entry points --- */
+static void (*r5_real_DrawString)(Display *, Drawable, GC, int, int, const char *, int);
+static void (*r5_real_DrawImageString)(Display *, Drawable, GC, int, int, const char *, int);
+static int  (*r5_real_FreeFont)(Display *, XFontStruct *);
+static XFontStruct *(*r5_real_LoadQueryFont)(Display *, const char *);
+static XFontStruct *(*r5_real_QueryFont)(Display *, XID);
+
+void retro5_XDrawString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
+    if (r5_draw_text(dpy, d, gc, x, y, s, len, 0)) return;
+    if (!r5_real_DrawString) *(void **)&r5_real_DrawString = r5_realsym("XDrawString");
+    if (r5_real_DrawString) r5_real_DrawString(dpy, d, gc, x, y, s, len);
+}
+void retro5_XDrawImageString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
+    if (r5_draw_text(dpy, d, gc, x, y, s, len, 1)) return;
+    if (!r5_real_DrawImageString) *(void **)&r5_real_DrawImageString =
+                                      r5_realsym("XDrawImageString");
+    if (r5_real_DrawImageString) r5_real_DrawImageString(dpy, d, gc, x, y, s, len);
+}
+
+/* THE fix for the startup hang. Rewrite a just-loaded font's WIDTH metrics — per_char[].width plus
+ * min/max_bounds.width — to our cairo font's advances, in place. That makes WP see ONE consistent
+ * font model: native XTextWidth/XTextExtents (which merely sum per_char) now return cairo widths for
+ * free, and Motif's widget/menu geometry — which reads per_char AND max_bounds.width — agrees with
+ * them, so its size negotiation converges instead of re-measuring "Program" forever (root cause
+ * found in gdb: cairo XTextWidth vs native max_bounds.width disagreed -> non-convergent loop).
+ *
+ * Vertical metrics (ascent/descent) are left native, so line heights don't move. Symbol/pi fonts
+ * and multi-byte (fontset) fonts are left entirely alone. This runs at font-LOAD time, does only
+ * in-memory edits + cairo measurement on an image surface (no X traffic, no dlsym), so it is safe
+ * even inside WP's startup handshake — and it must run then, because that is when the fonts load. */
+static void r5_rewrite_metrics(Display *dpy, XFontStruct *fs, const char *xlfd_hint) {
+    R5Font *fnt;
+    unsigned c, first, last;
+    int minw = 0x7fff, maxw = 0;
+    if (!r5_skin || !r5_text || !fs || !r5_cairo()) return;
+    if (fs->min_byte1 || fs->max_byte1) return;          /* multi-byte grid: not our single-byte path */
+    r5_dpy = dpy;
+    fnt = r5_font_intern(dpy, fs, xlfd_hint);
+    if (!fnt || fnt->passthrough) return;                /* symbol/pi font -> keep native glyph metrics */
+
+    first = fs->min_char_or_byte2;
+    last  = fs->max_char_or_byte2;
+    if (fs->per_char && last >= first) {
+        for (c = first; c <= last; c++) {
+            char ch = (char)c;
+            double a = r5_advance(fnt, &ch, 1);
+            int w = a > 0 ? (int)(a + 0.5) : 0;
+            XCharStruct *cs = &fs->per_char[c - first];
+            cs->lbearing = 0; cs->rbearing = (short)w; cs->width = (short)w;
+            if (w < minw) minw = w;
+            if (w > maxw) maxw = w;
+        }
+        if (minw > maxw) minw = maxw = 0;
+        fs->min_bounds.width = (short)minw;
+        fs->max_bounds.width = (short)maxw;
+    } else {                                             /* fixed-width font: keep uniform, cairo-sized */
+        char ch = 'n';
+        double a = r5_advance(fnt, &ch, 1);
+        if (a > 0) fs->min_bounds.width = fs->max_bounds.width = (short)(a + 0.5);
+    }
+}
+
+XFontStruct *retro5_XLoadQueryFont(Display *dpy, const char *name) {
+    XFontStruct *fs = r5_real_LoadQueryFont ? r5_real_LoadQueryFont(dpy, name) : 0;
+    if (fs) r5_rewrite_metrics(dpy, fs, name);           /* name is the XLFD WP asked for */
+    return fs;
+}
+XFontStruct *retro5_XQueryFont(Display *dpy, XID fid) {
+    XFontStruct *fs = r5_real_QueryFont ? r5_real_QueryFont(dpy, fid) : 0;
+    if (fs) r5_rewrite_metrics(dpy, fs, 0);              /* XLFD from the font's own property */
+    return fs;
+}
+int retro5_XFreeFont(Display *dpy, XFontStruct *fs) {
+    if (fs) r5_font_free(fs->fid);
+    if (!r5_real_FreeFont) *(void **)&r5_real_FreeFont = r5_realsym("XFreeFont");
+    return r5_real_FreeFont ? r5_real_FreeFont(dpy, fs) : 0;
+}
+
+/* Resolve EVERYTHING our hooks could ever need, eagerly, at library init — before WP runs. This is
+ * the whole safety argument for the text layer: a hook that fires while WP's SIGALRM startup
+ * handshake is live must NOT touch the dynamic linker (dlsym / lazy PLT bind take dl_load_lock,
+ * which is not async-signal-safe -> deadlock). So we pre-bind the X vtable, the Xt/X helper calls,
+ * and the five real text entry points now, while nothing is racing. cairo is dlopen'd RTLD_NOW so
+ * its own PLTs are fully bound at load too. After this returns, no hook can reach the linker. */
+static void r5_resolve_reals(void) {
+    r5_xlib();                                            /* binds the whole X draw/query vtable */
+    r5_bind_helpers();                                    /* XQueryFont / XGetGCValues / ...      */
+    /* r5_realsym, NOT dlsym(RTLD_DEFAULT): every one of these is a symbol whose GOT we patch, so
+       RTLD_DEFAULT would return our own PLT stub and the hook would call itself. */
+    *(void **)&r5_real_DrawString      = r5_realsym("XDrawString");
+    *(void **)&r5_real_DrawImageString = r5_realsym("XDrawImageString");
+    *(void **)&r5_real_FreeFont        = r5_realsym("XFreeFont");
+    *(void **)&r5_real_LoadQueryFont   = r5_realsym("XLoadQueryFont");
+    *(void **)&r5_real_QueryFont       = r5_realsym("XQueryFont");
 }
 
 /* ---- the two reusable takeover tables ----
@@ -945,7 +1353,11 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     r5_get(w, args, 3);
 
     if ((custom = r5_icon_for(w, pm)) != 0) pm = custom;
-    if (!pm) return 0;                                    /* no pixmap -> let Motif draw it */
+    /* No pixmap -> hand back to Motif (it draws the text label). CRITICAL: Motif's "no pixmap"
+     * sentinel is XmUNSPECIFIED_PIXMAP == (Pixmap)2, NOT 0 — every text menu item / dialog button
+     * carries labelPixmap==2. Treating 2 as a real pixmap and XGetGeometry'ing it is a BadDrawable,
+     * which WP's error handler turns into an immediate exit (this is what crashed on menu open). */
+    if (!pm || pm == R5_UNSPECIFIED_PIXMAP) return 0;
 
     if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return 0;
     if (!r5x.GetGeometry(dpy, pm, &root, &px, &py, &pw, &ph, &pbw, &pdep)) return 0;
@@ -1050,16 +1462,48 @@ static void takeoverWP80(void) {
         { 0x087cfb68, 0x0866d00c, retro5_PushButtonExpose,
           (void **)&r5_orig_pushbutton_expose,  "XmPushButton"  },   /* dialog buttons  */
     };
-    /* Font selection. WP asks X for fonts by name; we rewrite the name (see r5_font_alias).
+    /* Text. We take over the font LOAD (XLoadQueryFont/XQueryFont) to rewrite each font's width
+       metrics to our cairo advances — after which WP's OWN XTextWidth/XTextExtents return cairo
+       widths for free (they sum per_char), so we do NOT hook the measure calls at all. That is the
+       fix for the geometry non-convergence hang: one consistent model, so Motif's size negotiation
+       settles. Then we hook the DRAW calls to render the glyphs, and XFreeFont to evict our record.
        PLT/GOT pairs from the binary's own stubs — the stub bytes are the guard. */
     static const R5Import imports[] = {
-        { 0x08050900, 0x087d8804, retro5_XLoadQueryFont, "XLoadQueryFont" },
-        { 0x08050620, 0x087d874c, retro5_XListFonts,     "XListFonts"     },
+        { 0x08050900, 0x087d8804, retro5_XLoadQueryFont,   "XLoadQueryFont"   },
+        { 0x08050fa0, 0x087d89ac, retro5_XQueryFont,       "XQueryFont"       },
+        { 0x0804f280, 0x087d8264, retro5_XDrawString,      "XDrawString"      },
+        { 0x0804f3d0, 0x087d82b8, retro5_XDrawImageString, "XDrawImageString" },
+        { 0x08050660, 0x087d875c, retro5_XFreeFont,        "XFreeFont"        },
     };
     r5_xsyms = 0;                       /* 8.0 is dynamic-X: resolve X/Xt entry points by name */
+
+    /* Appearance takeover — cheap (byte patches + one class-record word each), no library loads. */
     takeover_entries(entries, sizeof entries / sizeof entries[0]);
     takeover_methods(methods, sizeof methods / sizeof methods[0]);
-    takeover_imports(imports, sizeof imports / sizeof imports[0]);
+
+    /* The cairo text layer — the ONLY expensive part of retro5. Everything here is gated behind
+       RETRO5_TEXT so it can be switched off wholesale: with r5_text=0 we do NOT dlopen cairo, do
+       NOT warm fontconfig, and install NO text/metrics hooks, so startup pays nothing for it and
+       WP renders text with its own X path. That is the kill switch for isolating this layer from a
+       startup problem without touching the appearance work above. */
+    if (r5_text == 2) {                 /* DIAGNOSTIC: load the lib graph only, nothing else */
+        int ok = r5_cairo_load();
+        if (r5_trace) { const char *m = ok ? "retro5: DIAG loaded cairo libs (no warm, no hooks)\n"
+                                            : "retro5: DIAG cairo load FAILED\n";
+                        write(2, m, strlen(m)); }
+    } else if (r5_text == 3) {          /* DIAGNOSTIC: load + FcInit, still no hooks */
+        r5_cairo_load();
+        r5_cairo_warm();
+        if (r5_trace) { const char *m = "retro5: DIAG loaded + warmed fontconfig (no hooks)\n";
+                        write(2, m, strlen(m)); }
+    } else if (r5_text) {               /* full text layer — fully resolved before WP runs */
+        r5_desktop_init();              /* file reads only */
+        r5_cairo_load();                /* dlopen RTLD_NOW: cairo + deps fully bound at load */
+        r5_cairo_warm();                /* FcInit + first face: no lazy fontconfig later */
+        r5_resolve_reals();             /* every real X/Xt fn our hooks call — no runtime dlsym */
+        takeover_imports(imports, sizeof imports / sizeof imports[0]);
+        r5_text_active = 1;             /* hooks are pure now; safe to be live from WP's first call */
+    }
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
@@ -1093,7 +1537,13 @@ __attribute__((constructor))
 static void findBinaryFixes(void) {
     const struct known_binary *b = matchBinaryHash();
     const char *skin = getenv("RETRO5_SKIN");
+    const char *text = getenv("RETRO5_TEXT");
     if (skin && skin[0] == '0') r5_skin = 0;             /* stock Motif drawing, for A/B */
+    if (text) {
+        if (text[0] == '0')             r5_text = 0;     /* text layer off */
+        else if (!strcmp(text, "load")) r5_text = 2;     /* diagnostic: load cairo libs only */
+        else if (!strcmp(text, "warm")) r5_text = 3;     /* diagnostic: load + FcInit, no hooks */
+    }
     if (getenv("RETRO5_TRACE")) r5_trace = 1;
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
