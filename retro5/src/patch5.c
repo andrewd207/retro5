@@ -239,7 +239,9 @@ void retro5_guarded_XtVaGetValues(void *w, ...) {
 #define R5_COL_EDGE     0xb6bac0u   /* raised outline — buttons, frames, scrollbar at rest */
 #define R5_COL_SUNK     0x515a68u   /* SUNKEN outline — pressed/latched. Dark on purpose.   */
 #define R5_COL_SUNK_IN  0x9aa4b2u   /* sunken inner top/left line — sells the recess        */
-#define R5_COL_HAIRLINE 0xd2d6dbu   /* etched rules, separators, group boxes                */
+#define R5_COL_HAIRLINE 0xa6abb3u   /* etched rules, separators, group boxes. Must stay clearly
+                                     * darker than the ~#d3d3d3 chrome background or dividers vanish
+                                     * (the toolbar group separators did — #d2d6db was ~invisible). */
 #define R5_COL_GLYPH    0x5a6270u   /* arrow chevrons — soft slate, never black             */
 #define R5_COL_PRESS    0xccd4e0u   /* pressed/latched button FACE — only ownable from expose */
 
@@ -576,25 +578,29 @@ void retro5_XmDrawArrow(Display *dpy, Drawable d, GC top_gc, GC bottom_gc, GC ce
     r5x.SetLineAttributes(dpy, gc, 1, LineSolid, CapRound, JoinRound);   /* leave it as we found it */
 }
 
-/* _XmDrawSeparator — the etched double-rule between menu groups and dialog sections becomes a
- * single hairline, inset from the ends so it reads as a divider rather than a border.
- * cdecl (dpy, d, top_gc, bottom_gc, sep_gc, x, y, w, h, thickness, margin, orientation, type)
- * — 13 args. orientation: XmVERTICAL=0, XmHORIZONTAL=1. */
+/* _XmDrawSeparator — the etched double-rule between menu groups, toolbar groups and dialog sections
+ * becomes a single hairline, inset from the ends so it reads as a divider rather than a border.
+ * cdecl (dpy, d, top_gc, bottom_gc, sep_gc, x, y, w, h, thickness, margin, orientation, type).
+ *
+ * We derive the line direction from the GEOMETRY, not the `orientation` arg — the arg's constant
+ * encoding is not reliable across builds (drawing toolbar group separators horizontal instead of
+ * vertical), whereas the shape is unambiguous: a separator is a thin rectangle, so the long side is
+ * the line. Tall+narrow (h > w) is a vertical divider; wide+short is a horizontal rule. */
 void retro5_XmDrawSeparator(Display *dpy, Drawable d, GC top_gc, GC bottom_gc, GC sep_gc,
                             int x, int y, int w, int h, int thickness, int margin,
                             unsigned char orientation, unsigned char type) {
     XSegment s;
     GC gc;
-    (void)top_gc; (void)bottom_gc; (void)sep_gc; (void)thickness; (void)type;
+    (void)top_gc; (void)bottom_gc; (void)sep_gc; (void)thickness; (void)orientation; (void)type;
     if (w <= 0 || h <= 0 || !dpy || !d) return;
     if (!(gc = r5_pick(dpy, d, R5_GC_HAIRLINE))) return;
 
-    if (orientation == 1) {                               /* horizontal rule */
-        int cy = y + h / 2;
-        s.x1 = x + margin; s.y1 = cy; s.x2 = x + w - 1 - margin; s.y2 = cy;
-    } else {                                              /* vertical rule */
+    if (h > w) {                                          /* tall & narrow -> vertical divider */
         int cx = x + w / 2;
         s.x1 = cx; s.y1 = y + margin; s.x2 = cx; s.y2 = y + h - 1 - margin;
+    } else {                                              /* wide & short -> horizontal rule */
+        int cy = y + h / 2;
+        s.x1 = x + margin; s.y1 = cy; s.x2 = x + w - 1 - margin; s.y2 = cy;
     }
     r5x.DrawSegments(dpy, d, gc, &s, 1);
 }
