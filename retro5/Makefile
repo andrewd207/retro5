@@ -14,7 +14,7 @@ CC        := gcc
 # nbuckets==0), so we do same-length byte edits instead — nothing moves.
 SONAME    := retro5.so
 TARGET    := retro5.so
-CFLAGS    := -m32 -fPIC -O2 -Wall -Wno-unused-parameter -fno-stack-protector
+CFLAGS    := -m32 -fPIC -O2 -Wall -Wno-unused-parameter -fno-stack-protector -fno-omit-frame-pointer
 LDFLAGS   := -m32 -shared -Wl,-soname,$(SONAME) -Wl,--hash-style=both -ldl
 
 SRC_C     := $(wildcard src/*.c)
