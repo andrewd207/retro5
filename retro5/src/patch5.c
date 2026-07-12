@@ -126,6 +126,27 @@ static int patch_method(uintptr_t class_rec, unsigned off, uintptr_t expect,
 }
 #define R5_EXPOSE_OFF 68          /* offsetof(CoreClassPart, expose) on 32-bit Xt */
 
+/* Guarded IMPORT swap: redirect one of the host's calls into a shared library (XLoadQueryFont, ...)
+ * by rewriting its GOT slot. No code is patched at all — we just change where the PLT stub jumps.
+ *
+ * We cannot interpose these by exporting the symbol: retro5.so is LAST in the host's DT_NEEDED
+ * list, so libX11's definition always wins the lookup. The GOT is the only place the choice is
+ * actually made, and it is one word.
+ *
+ * The guard is the PLT stub itself: `ff 25 <got>` proves both that we have the right build AND
+ * that `got` really is this symbol's slot — the two facts that matter, checked against each other.
+ * Lazy binding means the slot may still point back into the PLT when we run (we are a constructor,
+ * before main); that is fine, we are replacing it wholesale and nothing re-resolves it later. */
+static int patch_import(uintptr_t plt_va, uintptr_t got_va, void *target) {
+    uint8_t guard[6];
+    if (range_unmapped((void *)plt_va, 6) || range_unmapped((void *)got_va, 4)) return 0;
+    guard[0] = 0xff; guard[1] = 0x25;                     /* jmp *disp32 */
+    memcpy(guard + 2, &got_va, 4);
+    if (memcmp((void *)plt_va, guard, 6) != 0) return 0;  /* wrong build / not this symbol's stub */
+    *(void **)got_va = target;                            /* .got.plt is writable by definition */
+    return 1;
+}
+
 /* ======================================================================================= *
  *  Fix helpers referenced by the per-binary routines
  * ======================================================================================= */
@@ -580,6 +601,157 @@ void retro5_XmDrawHighlight(Display *dpy, Drawable d, GC hl_gc,
     r5_round_rect(dpy, d, hl_gc, x, y, w, h);
 }
 
+/* ======================================================================================= *
+ *  Font aliasing — pointing WP's X core fonts at the system's
+ * ======================================================================================= *
+ * WP is pure X-core-font: it asks for fonts by XLFD (XLoadQueryFont / XListFonts) and measures
+ * them with XTextWidth. No Xft, no fontconfig — it predates both. Rather than rewrite the text
+ * rendering (which would mean owning metrics too, or every layout in the app shifts), we sit on the
+ * SELECTION calls and rewrite the font NAME. WP still measures exactly the font it draws, so
+ * spacing stays self-consistent — the font simply becomes a modern one.
+ *
+ * The mapping is a table, overridable by a config file so a skin can retune fonts without a
+ * rebuild:  ~/.config/retro5/fonts.conf  (or $RETRO5_FONTS), one rule per line:
+ *
+ *     # pattern                        replacement
+ *     -*-helvetica-*                   -*-dejavu sans-medium-r-normal--*-*-*-*-p-*-iso8859-1
+ *
+ * `*` matches any run of characters; first rule that matches wins. An alias that fails to load
+ * falls back to the font WP originally asked for — a bad config can make the UI ugly, never
+ * textless. (WP's bundled character-set bitmaps, shlib10/fonts/wc*.pcf, are deliberately NOT
+ * aliased by default: they carry WP's own glyph encodings, and substituting them would mangle
+ * symbols rather than modernise them.) */
+
+#define R5_FONT_RULES 32
+static struct { char pat[128], repl[192]; } r5_fonts[R5_FONT_RULES];
+static int r5_font_n;
+static int r5_font_loaded;
+
+/* glob with a single wildcard character: '*' matches any run (including empty). */
+static int r5_glob(const char *pat, const char *s) {
+    for (; *pat; pat++, s++) {
+        if (*pat == '*') {
+            if (!pat[1]) return 1;                        /* trailing * matches the rest */
+            for (; *s; s++)
+                if (r5_glob(pat + 1, s)) return 1;
+            return r5_glob(pat + 1, s);
+        }
+        if (!*s) return 0;
+        if (*pat != *s && !(*pat >= 'A' && *pat <= 'Z' && *pat + 32 == *s)
+                       && !(*s   >= 'A' && *s   <= 'Z' && *s   + 32 == *pat)) return 0;
+    }
+    return !*s;
+}
+
+static void r5_font_add(const char *pat, const char *repl) {
+    if (r5_font_n >= R5_FONT_RULES) return;
+    strncpy(r5_fonts[r5_font_n].pat,  pat,  sizeof r5_fonts[0].pat  - 1);
+    strncpy(r5_fonts[r5_font_n].repl, repl, sizeof r5_fonts[0].repl - 1);
+    r5_font_n++;
+}
+
+/* Read the config file, if there is one. Format: `pattern<whitespace>replacement`, # comments. */
+static void r5_font_config(void) {
+    char path[512], line[384];
+    const char *env = getenv("RETRO5_FONTS");
+    const char *home = getenv("HOME");
+    FILE *f;
+
+    if (env && *env) {
+        strncpy(path, env, sizeof path - 1); path[sizeof path - 1] = 0;
+    } else if (home) {
+        snprintf(path, sizeof path, "%s/.config/retro5/fonts.conf", home);
+    } else {
+        return;
+    }
+    if (!(f = fopen(path, "r"))) return;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *pat, *repl, *e;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || !*p) continue;
+        pat = p;
+        while (*p && *p != ' ' && *p != '\t') p++;        /* pattern ends at whitespace */
+        if (!*p) continue;
+        *p++ = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        repl = p;
+        e = repl + strlen(repl);
+        while (e > repl && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        if (*repl) r5_font_add(pat, repl);
+    }
+    fclose(f);
+    if (r5_trace) {
+        char b[160];
+        int n = snprintf(b, sizeof b, "retro5: loaded %d font rule(s) from %s\n", r5_font_n, path);
+        if (n > 0) write(2, b, (size_t)n);
+    }
+}
+
+/* No built-in rules, on purpose.
+ *
+ * The tempting default — alias helvetica -> DejaVu — cannot work, and it is worth writing down why
+ * so nobody adds it back: a modern X server has NO FreeType core-font backend and ships no
+ * fonts.dir for the system TTFs, so DejaVu is simply not among the ~1300 core fonts it will serve.
+ * The core font path contains legacy bitmaps and URW Type1 clones and nothing else. Aliasing one
+ * XLFD to another can therefore only swap a 1990s face for another 1990s face.
+ *
+ * Reaching the actual system fonts means bypassing core fonts entirely and drawing text with
+ * cairo/fontconfig — which also means owning the METRICS calls (XTextWidth, XTextExtents,
+ * XmbTextExtents) in the same breath, because WP measures with one call and draws with another and
+ * the two must agree or every layout in the app shifts. That is the next step; this table is the
+ * mapping it will consume, keyed the same way, with families instead of XLFDs.
+ *
+ * Until then the table stays empty by default and the config file is the only source of rules — so
+ * the font path is honest: it changes nothing unless you tell it to. */
+static void r5_font_init(void) {
+    if (r5_font_loaded) return;
+    r5_font_loaded = 1;
+    r5_font_config();
+}
+
+static const char *r5_font_alias(const char *name) {
+    int i;
+    if (!name || !*name) return 0;
+    r5_font_init();
+    for (i = 0; i < r5_font_n; i++)
+        if (r5_glob(r5_fonts[i].pat, name)) return r5_fonts[i].repl;
+    return 0;
+}
+
+/* The interposed selection calls. Both keep WP's original name as the fallback, so a font we
+ * cannot load costs us the restyle, never the text. */
+static XFontStruct *(*r5_real_LoadQueryFont)(Display *, const char *);
+static char **(*r5_real_ListFonts)(Display *, const char *, int, int *);
+
+XFontStruct *retro5_XLoadQueryFont(Display *dpy, const char *name) {
+    const char *alias;
+    XFontStruct *fs;
+    if (!r5_real_LoadQueryFont) *(void **)&r5_real_LoadQueryFont =
+                                    dlsym(RTLD_DEFAULT, "XLoadQueryFont");
+    if (!r5_real_LoadQueryFont) return 0;
+    if (r5_skin && (alias = r5_font_alias(name)) != 0) {
+        if ((fs = r5_real_LoadQueryFont(dpy, alias)) != 0) return fs;
+        if (r5_trace) {
+            char b[256];
+            int n = snprintf(b, sizeof b, "retro5: font alias failed, keeping %s\n", name);
+            if (n > 0) write(2, b, (size_t)n);
+        }
+    }
+    return r5_real_LoadQueryFont(dpy, name);              /* WP's own choice, always available */
+}
+
+char **retro5_XListFonts(Display *dpy, const char *pattern, int maxnames, int *count) {
+    const char *alias;
+    char **r;
+    if (!r5_real_ListFonts) *(void **)&r5_real_ListFonts = dlsym(RTLD_DEFAULT, "XListFonts");
+    if (!r5_real_ListFonts) { if (count) *count = 0; return 0; }
+    if (r5_skin && (alias = r5_font_alias(pattern)) != 0) {
+        if ((r = r5_real_ListFonts(dpy, alias, maxnames, count)) != 0 && count && *count > 0)
+            return r;
+    }
+    return r5_real_ListFonts(dpy, pattern, maxnames, count);
+}
+
 /* ---- the two reusable takeover tables ----
  * A per-binary takeoverXxx() is nothing but these two tables plus (for static hosts) an R5XSyms.
  * Everything they point at is shared, binary-independent code. */
@@ -589,6 +761,13 @@ typedef struct {
     unsigned    glen;
     void       *target;       /* our replacement                    */
 } R5Entry;
+
+typedef struct {
+    uintptr_t   plt;          /* the host's PLT stub for this import */
+    uintptr_t   got;          /* its GOT slot (proved by the stub)   */
+    void       *target;       /* our replacement                     */
+    const char *name;         /* for RETRO5_DEBUG                    */
+} R5Import;
 
 typedef struct {
     uintptr_t   class_rec;    /* widget class record                */
@@ -602,6 +781,19 @@ static void takeover_entries(const R5Entry *t, unsigned n) {
     unsigned i;
     for (i = 0; i < n; i++)
         patch_entry(t[i].va, t[i].guard, t[i].glen, t[i].target);
+}
+
+static void takeover_imports(const R5Import *t, unsigned n) {
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        int ok = patch_import(t[i].plt, t[i].got, t[i].target);
+        if (r5_trace) {
+            char b[96];
+            int k = snprintf(b, sizeof b, "retro5: import takeover %-16s %s\n",
+                             t[i].name, ok ? "ok" : "SKIPPED (guard mismatch)");
+            if (k > 0) write(2, b, (size_t)k);
+        }
+    }
 }
 
 static void takeover_methods(const R5Method *t, unsigned n) {
@@ -858,9 +1050,16 @@ static void takeoverWP80(void) {
         { 0x087cfb68, 0x0866d00c, retro5_PushButtonExpose,
           (void **)&r5_orig_pushbutton_expose,  "XmPushButton"  },   /* dialog buttons  */
     };
+    /* Font selection. WP asks X for fonts by name; we rewrite the name (see r5_font_alias).
+       PLT/GOT pairs from the binary's own stubs — the stub bytes are the guard. */
+    static const R5Import imports[] = {
+        { 0x08050900, 0x087d8804, retro5_XLoadQueryFont, "XLoadQueryFont" },
+        { 0x08050620, 0x087d874c, retro5_XListFonts,     "XListFonts"     },
+    };
     r5_xsyms = 0;                       /* 8.0 is dynamic-X: resolve X/Xt entry points by name */
-    takeover_entries(entries,  sizeof entries  / sizeof entries[0]);
+    takeover_entries(entries, sizeof entries / sizeof entries[0]);
     takeover_methods(methods, sizeof methods / sizeof methods[0]);
+    takeover_imports(imports, sizeof imports / sizeof imports[0]);
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
