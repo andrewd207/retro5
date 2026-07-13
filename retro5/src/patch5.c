@@ -1131,11 +1131,19 @@ static int  (*r5_real_FreeFont)(Display *, XFontStruct *);
 static XFontStruct *(*r5_real_LoadQueryFont)(Display *, const char *);
 static XFontStruct *(*r5_real_QueryFont)(Display *, XID);
 
+/* Text-draw redirection. When a taken-over expose wants a Motif routine's TEXT to land in its back
+ * buffer instead of on the window (so the whole widget can be presented in one flicker-free blit),
+ * it points r5_redir_from at the window and r5_redir_to at the pixmap for the duration of the call.
+ * Both X text entry points rewrite that one drawable, so the glyphs follow into the buffer. */
+static Drawable r5_redir_from, r5_redir_to;
+#define R5_REDIR(d) do { if (r5_redir_from && (d) == r5_redir_from) (d) = r5_redir_to; } while (0)
+
 /* XDrawString — TRANSPARENT, per X: paint only the glyphs, never touch the background. Whatever the
  * caller already put behind the text (a Motif expose clears the widget first; a double-buffered
  * painter of ours draws the label onto its own fresh face) shows through the antialiased edges. */
 void retro5_XDrawString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
     R5Text t;
+    R5_REDIR(d);
     if (r5_text_setup(dpy, d, gc, s, len, &t)) {
         r5_text_source(dpy, &t);
         cz.move_to(t.cr, x, y);                          /* X (x,y) is the glyph baseline */
@@ -1152,6 +1160,7 @@ void retro5_XDrawString(Display *dpy, Drawable d, GC gc, int x, int y, const cha
  * box each call it is inherently idempotent — a label redrawn in place never accumulates. */
 void retro5_XDrawImageString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
     R5Text t;
+    R5_REDIR(d);
     if (r5_text_setup(dpy, d, gc, s, len, &t)) {
         cairo_text_extents_t te;
         double br, bg, bb;
@@ -1750,11 +1759,13 @@ void retro5_DrawToggle(void *w) {
     }
 }
 
-/* Full XmToggleButton expose — background + indicator drawn by us and double-buffered; the LABEL is
- * then painted by Motif's own XmLabel expose (see the commit point below). This is what ends the
- * group flicker: Motif's own toggle expose clears each widget's background directly on the window, so
- * unsetting siblings in a radio group flashes a clear across every one of them; here the background
- * and indicator reach the screen in a single blit of the finished frame.
+/* Full XmToggleButton expose — background + indicator + label, ALL double-buffered. We draw the
+ * background and our cairo indicator into a back-buffer pixmap, then run Motif's own XmLabel expose
+ * with its text redirected into that SAME pixmap (so the label keeps Motif's exact font/size/position
+ * but lands off-screen), and blit the finished widget in ONE XCopyArea. This is what ends the group
+ * flicker: Motif's stock toggle expose clears each widget's background straight on the window, so
+ * unsetting siblings in a radio group flashes a clear across every one of them; here nothing — not
+ * even the label — reaches the screen until the single blit.
  *
  * Reentry guard: the Motif-fallback path calls the toggle's original Redisplay, which itself calls
  * the (now taken-over) XmLabel expose — see retro5_LabelExpose — which would route straight back here.
@@ -1810,13 +1821,26 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
 
     r5_paint_indicator(cr, x, y, sz, itype, set, bg);
 
-    /* Blit our background + indicator, then let Motif's own XmLabel expose paint the LABEL on top.
-     * The label thus comes out in the toggle's exact font, size and position (XmLabel draws only the
-     * TextRect via _XmStringDraw, whose glyphs flow through our cairo text hook — so it is our UI font
-     * yet perfectly consistent with every other label in the dialog, never a guessed/shrunk size).
-     * XmLabel touches only the text region, so our indicator to its left is untouched. */
-    r5_canvas_commit(&cv, 0, 0, ww, hh);
-    if (r5_orig_label_expose) r5_orig_label_expose(w, ev, region);
+    /* Solidify the background + indicator into the pixmap (flush cairo, then drop the cairo objects
+     * but KEEP the pixmap), so Motif's Xlib drawing lands on top of them. */
+    cz.surface_flush(cv.sf);
+    cz.destroy(cv.cr);
+    cz.surface_destroy(cv.sf);
+    cv.cr = 0; cv.sf = 0;
+
+    /* Paint the LABEL into the SAME back buffer via Motif's own XmLabel expose, with its text draws
+     * redirected from the window to our pixmap. The label thus comes out in the toggle's exact font,
+     * size and TextRect position (XmLabel draws the text via _XmStringDraw, whose glyphs flow through
+     * our cairo text hook), yet lands off-screen with the rest of the frame — so the whole toggle,
+     * label included, reaches the screen in ONE blit with no flicker and no double draw. */
+    if (r5_orig_label_expose) {
+        r5_redir_from = win;
+        r5_redir_to   = cv.buf;
+        r5_orig_label_expose(w, ev, region);
+        r5_redir_from = 0; r5_redir_to = 0;
+    }
+
+    r5_canvas_commit(&cv, 0, 0, ww, hh);                 /* present the whole toggle in one blit */
     return;
 
 fallback:
