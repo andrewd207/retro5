@@ -1331,6 +1331,17 @@ void retro5_XDrawImageString(Display *dpy, Drawable d, GC gc, int x, int y, cons
     if (r5_real_DrawImageString) r5_real_DrawImageString(dpy, d, gc, x, y, s, len);
 }
 
+/* XDrawLine — redirect-aware passthrough. The ONLY reason we hook it: Motif draws a menu item's
+ * mnemonic underline with XDrawLine (XmString.c: `XDrawLine(d,w,gc,ub,y,ue,y)`), and our menu
+ * double-buffer must catch that line into the back buffer or the blit erases it. Outside a redirect
+ * (r5_redir_from == 0) R5_REDIR is a no-op and this is an ordinary XDrawLine — no change anywhere. */
+static int (*r5_real_DrawLine)(Display *, Drawable, GC, int, int, int, int);
+void retro5_XDrawLine(Display *dpy, Drawable d, GC gc, int x1, int y1, int x2, int y2) {
+    R5_REDIR(d);
+    if (!r5_real_DrawLine) *(void **)&r5_real_DrawLine = r5_realsym("XDrawLine");
+    if (r5_real_DrawLine) r5_real_DrawLine(dpy, d, gc, x1, y1, x2, y2);
+}
+
 /* THE fix for the startup hang. Rewrite a just-loaded font's WIDTH metrics — per_char[].width plus
  * min/max_bounds.width — to our cairo font's advances, in place. That makes WP see ONE consistent
  * font model: native XTextWidth/XTextExtents (which merely sum per_char) now return cairo widths for
@@ -2113,6 +2124,91 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
  * Signature is Xt's XtExposeProc: (Widget, XEvent *, Region). */
 static void (*r5_orig_drawnbutton_expose)(void *, XEvent *, Region);
 static void (*r5_orig_pushbutton_expose)(void *, XEvent *, Region);
+static void (*r5_orig_cascade_expose)(void *, XEvent *, Region);
+
+/* ---- menu items (WIDGET path) ----
+ * WP dropdown menu entries are XmPushButton / XmCascadeButton WIDGETS, each in its own ~195x23 window
+ * inside the menu-pane RowColumn (which lives in an XmMenuShell). At rest such a button draws only
+ * its label; our cairo XDrawString hook renders it, but Motif redraws the item more than once, so the
+ * transparent antialiased glyphs stack and darken (the "bold / double-drawn" look). Because each item
+ * has its OWN window we double-buffer trivially: paint into a back buffer at (0,0), redirect Motif's
+ * exact label/accelerator draw into it, blit once. We also hot-track (subtle wash under the pointer,
+ * never on a disabled item) and draw our own submenu chevron for cascade items.
+ *
+ * A DROPDOWN item is recognised by its grandparent being an XmMenuShell — which excludes the
+ * horizontal menu BAR (whose RowColumn lives in the main window, not a shell); the bar is left to
+ * Motif so only the pop-up panes are reskinned. */
+static int (*r5_XQueryPointer)(Display *, Window, Window *, Window *, int *, int *, int *, int *, unsigned *);
+static int r5_in_menu_item;
+
+static int r5_pointer_in(Display *dpy, Window win, unsigned w, unsigned h) {
+    Window rr, cc; int prx, pry, pwx, pwy; unsigned pm;
+    if (!r5_XQueryPointer) *(void **)&r5_XQueryPointer = r5_realsym("XQueryPointer");
+    if (!r5_XQueryPointer) return 0;
+    if (!r5_XQueryPointer(dpy, win, &rr, &cc, &prx, &pry, &pwx, &pwy, &pm)) return 0;
+    return pwx >= 0 && pwx < (int)w && pwy >= 0 && pwy < (int)h;
+}
+static int r5_is_dropdown_item(void *w) {
+    void *parent, *gp, *cls; const char *nm;
+    if (!r5_XtClass) *(void **)&r5_XtClass = r5_realsym("XtClass");
+    if (!r5_XtClass) return 0;
+    parent = *(void **)((char *)w + 8);                  /* core.parent = the menu pane RowColumn */
+    if (!parent || range_unmapped(parent, 12)) return 0;
+    gp = *(void **)((char *)parent + 8);                 /* grandparent = the menu shell */
+    if (!gp || range_unmapped(gp, 12)) return 0;
+    cls = r5_XtClass(gp);
+    if (!cls || range_unmapped((char *)cls + 8, 4)) return 0;
+    nm = *(const char **)((char *)cls + 4);              /* class_name */
+    if (!nm || range_unmapped((void *)nm, 8)) return 0;
+    return strstr(nm, "MenuShell") != 0;
+}
+
+static int retro5_paint_menu_item(void *w, XEvent *ev, Region region, int cascade,
+                                  void (*orig)(void *, XEvent *, Region)) {
+    Display *dpy; Window win, root;
+    int wx, wy, hot;
+    unsigned ww, hh, bw, dep;
+    unsigned long bg = 0xd3d3d3, fill;
+    R5Canvas cv; GC face;
+
+    if (r5_in_menu_item || !r5_skin || !w || !r5_cairo() || !r5_xlib()) return 0;
+    if (!r5_is_dropdown_item(w)) return 0;               /* only pop-up panes, not the menu bar */
+    dpy = r5x.XtDisplayOfObject(w);
+    win = r5x.XtWindowOfObject(w);
+    if (!dpy || !win) return 0;
+    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return 0;
+    if (ww < 4 || hh < 4) return 0;
+    r5_bg_pixel(w, &bg);
+
+    hot  = !r5_insensitive(w) && r5_pointer_in(dpy, win, ww, hh);   /* highlight item under pointer */
+    fill = hot ? r5_blend_pixel(0x3a6ea5u, bg, 0.24) : bg;          /* subtle blue wash */
+
+    if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
+    face = r5_gc_for_pixel(dpy, cv.buf, fill);
+    if (face) r5x.FillRectangle(dpy, cv.buf, face, 0, 0, ww, hh);   /* fresh face */
+
+    r5_redir_from = win; r5_redir_to = cv.buf;           /* Motif's label/accel text -> the buffer */
+    r5_in_menu_item = 1;
+    if (orig) orig(w, ev, region);
+    r5_in_menu_item = 0;
+    r5_redir_from = 0; r5_redir_to = 0;
+
+    if (cascade) {                                       /* our submenu chevron, replacing Motif's > */
+        cairo_t *cr = r5_canvas_cairo(&cv);
+        if (cr) {
+            double s = hh * 0.18; if (s < 3) s = 3; if (s > 5) s = 5;
+            double ax = (double)ww - hh * 0.40, ay = hh / 2.0;
+            cz.set_source_rgb(cr, R5_RD(0x404040u), R5_GD(0x404040u), R5_BD(0x404040u));
+            cz.move_to(cr, ax - s * 0.55, ay - s);
+            cz.line_to(cr, ax + s * 0.55, ay);
+            cz.line_to(cr, ax - s * 0.55, ay + s);
+            cz.close_path(cr);
+            cz.fill(cr);
+        }
+    }
+    r5_canvas_commit(&cv, 0, 0, ww, hh);                 /* blit the whole item, once */
+    return 1;
+}
 
 void retro5_DrawnButtonExpose(void *w, XEvent *ev, Region region) {
     if (retro5_paint_button(w, 1)) return;                /* toolbar: frameless at rest */
@@ -2120,9 +2216,16 @@ void retro5_DrawnButtonExpose(void *w, XEvent *ev, Region region) {
     retro5_round_widget(w);
 }
 void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
+    if (retro5_paint_menu_item(w, ev, region, 0, r5_orig_pushbutton_expose)) return;  /* dropdown item */
     if (retro5_paint_button(w, 0)) return;                /* dialog buttons keep their frame */
     if (r5_orig_pushbutton_expose) r5_orig_pushbutton_expose(w, ev, region);
     retro5_round_widget(w);
+}
+/* XmCascadeButton — submenu entries in a pop-up pane (own our chevron); the menu BAR and option
+ * menus fall through to Motif unchanged (paint_menu_item declines when not under a MenuShell). */
+void retro5_CascadeButtonExpose(void *w, XEvent *ev, Region region) {
+    if (retro5_paint_menu_item(w, ev, region, 1, r5_orig_cascade_expose)) return;
+    if (r5_orig_cascade_expose) r5_orig_cascade_expose(w, ev, region);
 }
 
 /* ---- bigger icon toolbar buttons under the UI scale ----
@@ -2534,6 +2637,8 @@ static void takeoverWP80(void) {
           (void **)&r5_orig_pushbutton_expose,  "XmPushButton"  },   /* dialog buttons  */
         { 0x087d1ae8, 0x08695968, retro5_ToggleButtonExpose,
           (void **)&r5_orig_toggle_expose,      "XmToggleButton" }, /* radio + checkbox */
+        { 0x087cb7d4, 0x0863beec, retro5_CascadeButtonExpose,
+          (void **)&r5_orig_cascade_expose,     "XmCascadeButton" }, /* submenu items (dropdown) */
     };
     /* Text. We take over the font LOAD (XLoadQueryFont/XQueryFont) to rewrite each font's width
        metrics to our cairo advances — after which WP's OWN XTextWidth/XTextExtents return cairo
@@ -2546,6 +2651,7 @@ static void takeoverWP80(void) {
         { 0x08050fa0, 0x087d89ac, retro5_XQueryFont,       "XQueryFont"       },
         { 0x0804f280, 0x087d8264, retro5_XDrawString,      "XDrawString"      },
         { 0x0804f3d0, 0x087d82b8, retro5_XDrawImageString, "XDrawImageString" },
+        { 0x08050840, 0x087d87d4, retro5_XDrawLine,        "XDrawLine"        },  /* menu mnemonic underline */
         { 0x08050660, 0x087d875c, retro5_XFreeFont,        "XFreeFont"        },
     };
     r5_xsyms = 0;                       /* 8.0 is dynamic-X: resolve X/Xt entry points by name */
