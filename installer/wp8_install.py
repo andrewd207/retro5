@@ -876,33 +876,17 @@ for x in (tmp, os.path.splitext(tmp)[0] + ".afm", tmp + ".afm"):
                 d[o + 13] = (d[o + 13] & ~0x3) | 2      # STV_HIDDEN
         f.write_bytes(d)
 
-    # ---- step 4: guarded binary patches ---------------------------------
+    # ---- step 4: functional fixes (applied at RUNTIME by retro5.so) ------
+    # We deliberately no longer edit xwp's bytes on disk. The ONLY on-disk change to a WP binary
+    # is the DT_NEEDED retarget (libc.so.5 & friends -> retro5.so). All functional fixes -- the
+    # morpher OOB-strcpy NOP AND the table-QuickFill parser guard -- are applied in memory by
+    # retro5.so's constructor (src/patch5.c), byte-guarded per build. That keeps the binary's
+    # signature stable, avoids re-patching/upkeep as builds change, and no-ops on any binary we
+    # don't recognise. (Binaries patched on disk by an OLDER installer still work: retro5's guard
+    # simply finds the site already NOP'd and skips it.)
     def patches(self):
-        out = []
-        xwp = self.target / "wpbin/xwp"
-        if not xwp.is_file():
-            return ["xwp not found - skipped morph patch"]
-        b = bytearray(xwp.read_bytes())
-        applied = already = 0
-        for off, exp, new in MORPH_PATCHES:
-            if off + len(exp) > len(b):
-                continue
-            cur = bytes(b[off:off + len(exp)])
-            if cur == new:
-                already += 1
-            elif cur == exp:
-                b[off:off + len(new)] = new
-                applied += 1
-                out.append(f"morph patch: APPLIED at 0x{off:x} "
-                           f"(NOP dead OOB strcpy in mor_read_entry)")
-        if applied:
-            xwp.write_bytes(b)
-        elif already:
-            out.append("morph patch: already applied")
-        else:
-            out.append("morph patch: no known buggy signature matched "
-                       "(safe: xwp left untouched)")
-        return out
+        return ["functional fixes: applied at runtime by retro5.so "
+                "(morph OOB strcpy + table-QuickFill guard); binary left byte-identical"]
 
     # ---- step 4b: optional modern reskin (retroXt) ----------------------
     def _reskin_whitelist(self) -> set:
@@ -1342,6 +1326,49 @@ export XLOCALEDIR=/usr/share/X11/locale
 export WPIPEDELAY=60
 : "${{DISPLAY:=:0}}"; export DISPLAY
 # NB: do NOT set WPLANG (sends xwp down a broken admintxt path)
+# Per-instance print server: WP keys its xwp<->wpexc FIFO/manifest/lock on the
+# major version ("excmsg8", ".wpexc8.man", ".wpexc8.LCK") only, so two instances
+# collide. retro5.so rewrites those names per-instance using this shared token,
+# which the wpexc child inherits -- both sides then converge on the same names.
+export RETRO5_WPEXC_ID=$$
+# ---- retroXt feature toggles ----------------------------------------------------
+# Defaults set ONLY if the var isn't already in the environment, so an end user can
+# override any of them by exporting it before launch. The echo (to stderr) makes the
+# active settings obvious for debugging.
+# RETRO5_DOCFONT : 0 = WP's own 1-bit text; 1 = cairo-render the document canvas;
+#                  2 = also cairo-render the UI chrome (status bar + Font preview).
+# RETRO5_ALLFONTS: 1 = unfilter the font selector + merge system (fontconfig) fonts (WIP).
+# RETRO5_CUPS    : 1 = route printing through CUPS (printertocups.so) instead of xwpdest (WIP).
+: "${{RETRO5_DOCFONT:=2}}";  export RETRO5_DOCFONT
+: "${{RETRO5_ALLFONTS:=0}}"; export RETRO5_ALLFONTS
+: "${{RETRO5_CUPS:=0}}";     export RETRO5_CUPS
+echo "retroXt: DOCFONT=$RETRO5_DOCFONT ALLFONTS=$RETRO5_ALLFONTS CUPS=$RETRO5_CUPS ICONS=${{RETRO5_ICONS:+on}}" >&2
+# Stale-state cleanup: WP's /tmp/wpc-<user>-<host> dir accumulates dead-instance
+# lock/manifest/FIFO files. Remove _WP__<pid>a_ client locks whose pid is gone,
+# and print-server manifests whose server pid (manifest byte 0x140) is dead
+# (plus the FIFO they name at byte 0xA0 and their .LCK sibling), and orphan locks.
+for WPCDIR in /tmp/wpc-"$USER"-*/; do
+    [ -d "$WPCDIR" ] || continue
+    for f in "$WPCDIR"_WP__*a_; do
+        [ -e "$f" ] || continue
+        raw=${{f##*/_WP__}}; raw=${{raw%a_}}
+        case $raw in ""|*[!0-9]*) continue;; esac
+        pid=$((10#$raw))
+        {{ [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; }} || rm -f "$f"
+    done
+    for m in "$WPCDIR".wpexc8*.man "$WPCDIR".wpexc.man; do
+        [ -f "$m" ] || continue
+        spid=$(od -An -tu4 -j320 -N4 "$m" 2>/dev/null | tr -d ' ')
+        if [ -z "$spid" ] || ! kill -0 "$spid" 2>/dev/null; then
+            fifo=$(dd if="$m" bs=1 skip=160 count=160 2>/dev/null | tr -d '\\0')
+            [ -n "$fifo" ] && rm -f "$fifo"
+            rm -f "$m" "${{m%.man}}.LCK"
+        fi
+    done
+    for l in "$WPCDIR".wpexc8*.LCK "$WPCDIR".wpexc.LCK; do
+        [ -e "$l" ] && [ ! -e "${{l%.LCK}}.man" ] && rm -f "$l"
+    done
+done
 # Bigger menus: WP's default Motif font is a tiny 8pt helvetica (unreadable on
 # modern high-res displays). -fontSize scales the whole UI; default to a
 # readable 17, override with $WPFONTSIZE (or pass your own -fontSize after).
