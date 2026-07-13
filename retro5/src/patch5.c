@@ -834,6 +834,18 @@ static struct {
     void (*show_text)(cairo_t *, const char *);
     void (*text_extents)(cairo_t *, const char *, cairo_text_extents_t *);
     cairo_status_t (*status)(cairo_t *);
+    /* icon rendering (optional — bound separately so a miss cannot fail the text layer) */
+    int icons_ok;
+    void (*paint)(cairo_t *);
+    void (*set_source_surface)(cairo_t *, cairo_surface_t *, double, double);
+    void (*scale)(cairo_t *, double, double);
+    void (*translate)(cairo_t *, double, double);
+    void (*save)(cairo_t *);
+    void (*restore)(cairo_t *);
+    cairo_surface_t *(*png_create)(const char *);
+    int (*img_w)(cairo_surface_t *);
+    int (*img_h)(cairo_surface_t *);
+    cairo_status_t (*surface_status)(cairo_surface_t *);
 } cz;
 
 /* Non-blocking check used by the draw/measure hot path: is cairo ready to use? We NEVER dlopen from
@@ -867,8 +879,72 @@ static int r5_cairo_load(void) {
           CZ(status, "cairo_status")))
         return 0;
 #undef CZ
+    /* Icon-render symbols: OPTIONAL. Bound after cz.ready so a missing one (e.g. cairo built
+     * without PNG) only disables icon replacement, never the text layer. */
+#define CZ2(m, s) (*(void **)&cz.m = dlsym(h, s))
+    CZ2(paint, "cairo_paint");                 CZ2(set_source_surface, "cairo_set_source_surface");
+    CZ2(scale, "cairo_scale");                 CZ2(translate, "cairo_translate");
+    CZ2(save, "cairo_save");                   CZ2(restore, "cairo_restore");
+    CZ2(png_create, "cairo_image_surface_create_from_png");
+    CZ2(img_w, "cairo_image_surface_get_width");  CZ2(img_h, "cairo_image_surface_get_height");
+    CZ2(surface_status, "cairo_surface_status");
+#undef CZ2
+    cz.icons_ok = (cz.paint && cz.set_source_surface && cz.scale && cz.translate && cz.save &&
+                   cz.restore && cz.png_create && cz.img_w && cz.img_h && cz.surface_status);
     cz.ready = 1;
     return 1;
+}
+
+/* --- librsvg, dlopen'd at init (see the preload call), never inside an expose. Only loaded when
+ * RETRO5_ICONS is set. We build handles from an IN-MEMORY buffer (rsvg_handle_new_from_data), NOT
+ * from a path: rsvg_handle_new_from_file goes through GFile -> g_vfs_get_default -> a GIO module
+ * directory scan that stalls at 100% CPU (observed hanging WP inside a startup expose). The memory
+ * API uses a GMemoryInputStream and never touches the VFS. render_document scales the SVG into a
+ * viewport; g_object_unref frees the handle (a GObject, from libgobject pulled in by librsvg). --- */
+static struct {
+    int   ready;
+    void *(*new_from_data)(const unsigned char *data, size_t len, void **err);
+    int   (*render_document)(void *handle, cairo_t *cr, const void *viewport, void **err);
+    void  (*g_unref)(void *);
+} rvz;
+
+static int r5_rsvg(void) { return rvz.ready > 0; }
+
+static int r5_rsvg_load(void) {
+    void *h, *g;
+    if (rvz.ready) return rvz.ready > 0;
+    rvz.ready = -1;
+    if (!(h = dlopen("librsvg-2.so.2", RTLD_NOW | RTLD_DEEPBIND))) return 0;
+    if (!(g = dlopen("libgobject-2.0.so.0", RTLD_NOW | RTLD_DEEPBIND | RTLD_NOLOAD)) &&
+        !(g = dlopen("libgobject-2.0.so.0", RTLD_NOW | RTLD_DEEPBIND))) return 0;
+    *(void **)&rvz.new_from_data   = dlsym(h, "rsvg_handle_new_from_data");
+    *(void **)&rvz.render_document = dlsym(h, "rsvg_handle_render_document");
+    *(void **)&rvz.g_unref         = dlsym(g, "g_object_unref");
+    if (!rvz.new_from_data || !rvz.render_document || !rvz.g_unref) return 0;
+    rvz.ready = 1;
+    /* Warm the gtype/parser machinery once, here at init (off any expose), with a trivial doc. */
+    {
+        static const char tiny[] = "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>";
+        void *err = 0, *hd = rvz.new_from_data((const unsigned char *)tiny, sizeof tiny - 1, &err);
+        if (hd) rvz.g_unref(hd);
+    }
+    return 1;
+}
+
+/* Read a whole file into a malloc'd buffer (caller frees). Returns NULL on any error. */
+static unsigned char *r5_read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    unsigned char *buf;
+    long n;
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0 || n > (16 << 20)) { fclose(f); return 0; }
+    rewind(f);
+    if (!(buf = (unsigned char *)malloc((size_t)n + 1))) { fclose(f); return 0; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return 0; }
+    fclose(f);
+    buf[n] = 0;
+    *out_len = (size_t)n;
+    return buf;
 }
 
 /* STEP 2 — force FcInit + first face load (the font-info part), on an image surface so no X is
@@ -1738,21 +1814,102 @@ static const char *r5_widget_hint(void *w) {
     return p;
 }
 
+static int r5_ends_with(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcasecmp(s + ls - lf, suf) == 0;
+}
+
 /* ---- the icon seam ----
- * Every button icon flows through here. Compute its content hash (for discovery / the replacement
- * map), log it under RETRO5_ICON_DUMP, and consult the hash->file map. Returns 0 = "use WP's own
- * pixmap" (today's behaviour and the fallback until file rendering lands). */
-static Pixmap r5_icon_for(void *w, Pixmap original, uint32_t hash) {
-    (void)w;
-    if (hash) {
-        const char *rep = r5_icon_lookup(hash);
-        if (rep && r5_trace) {
-            char b[320]; int k = snprintf(b, sizeof b, "icon %08x -> %s (render pending)\n", hash, rep);
-            if (k > 0) write(2, b, (size_t)k);
+ * If the icon's content hash is mapped (RETRO5_ICONS), render the mapped file to an X Pixmap of the
+ * target size and hand it back to replace WP's own bitmap; a miss returns 0 (WP's pixmap is kept).
+ * A PNG is scaled (aspect preserved, centred); an SVG is rendered into the target viewport. The
+ * pixmap is backfilled with the button face colour so transparent icon areas blend on the blit.
+ * Cached by (hash, tw, th) for process life — each distinct icon+size renders once. */
+static struct { uint32_t hash; unsigned tw, th; Pixmap pm; } r5_icon_cache[128];
+static int r5_icon_cache_n;
+
+static Pixmap r5_icon_render(Display *dpy, Window win, unsigned dep,
+                             uint32_t hash, unsigned tw, unsigned th, unsigned long bg) {
+    const char *path;
+    int i, drew = 0;
+    Pixmap P;
+    cairo_surface_t *sf;
+    cairo_t *cr;
+    Visual *vis;
+
+    if (!hash || !r5_cairo() || !cz.icons_ok) return 0;
+    if (tw < 2 || th < 2 || tw > 512 || th > 512) return 0;
+    if (!(path = r5_icon_lookup(hash))) return 0;
+
+    for (i = 0; i < r5_icon_cache_n; i++)                /* cached render? */
+        if (r5_icon_cache[i].hash == hash && r5_icon_cache[i].tw == tw && r5_icon_cache[i].th == th)
+            return r5_icon_cache[i].pm;
+
+    if (!(P = r5x.CreatePixmap(dpy, win, tw, th, dep))) return 0;
+    vis = DefaultVisual(dpy, DefaultScreen(dpy));
+    sf = cz.xlib_surface_create(dpy, P, vis, (int)tw, (int)th);
+    cr = (sf && !cz.surface_status(sf)) ? cz.create(sf) : 0;
+    if (!cr || cz.status(cr)) {
+        if (cr) cz.destroy(cr);
+        if (sf) cz.surface_destroy(sf);
+        r5x.FreePixmap(dpy, P);
+        return 0;
+    }
+
+    cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));   /* face backfill for transparency */
+    cz.paint(cr);
+
+    if (r5_ends_with(path, ".png")) {
+        cairo_surface_t *img = cz.png_create(path);
+        if (img && !cz.surface_status(img)) {
+            int iw = cz.img_w(img), ih = cz.img_h(img);
+            if (iw > 0 && ih > 0) {
+                double s = (double)tw / iw, s2 = (double)th / ih;
+                double dw, dh;
+                if (s2 < s) s = s2;                      /* fit inside, preserve aspect */
+                dw = iw * s; dh = ih * s;
+                cz.save(cr);
+                cz.translate(cr, (tw - dw) / 2.0, (th - dh) / 2.0);
+                cz.scale(cr, s, s);
+                cz.set_source_surface(cr, img, 0, 0);
+                cz.paint(cr);
+                cz.restore(cr);
+                drew = 1;
+            }
+        }
+        if (img) cz.surface_destroy(img);
+    } else if (r5_rsvg()) {                              /* .svg (and anything non-.png) */
+        size_t len = 0;
+        unsigned char *data = r5_read_file(path, &len);  /* read bytes ourselves -> no GIO/GFile */
+        if (data) {
+            void *err = 0, *hdl = rvz.new_from_data(data, len, &err);
+            if (hdl) {
+                double viewport[4];                      /* RsvgRectangle {x,y,w,h} */
+                viewport[0] = 0; viewport[1] = 0; viewport[2] = (double)tw; viewport[3] = (double)th;
+                if (rvz.render_document(hdl, cr, viewport, &err)) drew = 1;
+                rvz.g_unref(hdl);
+            }
+            free(data);
         }
     }
-    (void)original;
-    return 0;                                            /* rendering of the mapped file: next step */
+
+    cz.surface_flush(sf);
+    cz.destroy(cr);
+    cz.surface_destroy(sf);
+    if (!drew) { r5x.FreePixmap(dpy, P); return 0; }     /* load/parse failed -> keep WP's own */
+
+    if (r5_trace) {
+        char b[320]; int k = snprintf(b, sizeof b, "icon %08x -> %s  %ux%u\n", hash, path, tw, th);
+        if (k > 0) write(2, b, (size_t)k);
+    }
+    if (r5_icon_cache_n < 128) {
+        r5_icon_cache[r5_icon_cache_n].hash = hash;
+        r5_icon_cache[r5_icon_cache_n].tw   = tw;
+        r5_icon_cache[r5_icon_cache_n].th   = th;
+        r5_icon_cache[r5_icon_cache_n].pm   = P;
+        r5_icon_cache_n++;
+    }
+    return P;
 }
 
 /* ---- highlight takeover ----
@@ -1855,9 +2012,12 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
             char b[320]; int k = snprintf(b, sizeof b, "%08x - %s\n", hash, lbl);
             if (k > 0) write(2, b, (size_t)k);
         }
-        if ((custom = r5_icon_for(w, pm, hash)) != 0) {
-            if (r5x.GetGeometry(dpy, custom, &root, &px, &py, &pw, &ph, &pbw, &pdep))
-                pm = custom;                              /* replacement icon; use its geometry */
+        if (r5_icon_map_n > 0) {                          /* a map is active -> try a replacement */
+            double s = r5_scale();
+            unsigned tw = (unsigned)(pw * s + 0.5), th = (unsigned)(ph * s + 0.5);
+            if ((custom = r5_icon_render(dpy, win, dep, hash, tw, th, bg)) != 0) {
+                pm = custom; pw = tw; ph = th; pdep = dep;  /* replacement: full-colour, known size */
+            }
         }
     }
 
@@ -2395,6 +2555,14 @@ static void takeoverWP80(void) {
         r5_resolve_reals();             /* every real X/Xt fn our hooks call — no runtime dlsym */
         takeover_imports(imports, sizeof imports / sizeof imports[0]);
         r5_text_active = 1;             /* hooks are pure now; safe to be live from WP's first call */
+        /* Preload librsvg here (before WP's main), NOT lazily in an expose: a heavy dlopen inside a
+         * startup expose stalls WP mid-IPC and hangs it. Only when an icon map is configured. */
+        if (r5_icons_cfg && r5_icons_cfg[0]) {
+            int ok = r5_rsvg_load();
+            if (r5_trace) { const char *m = ok ? "retro5: librsvg loaded (SVG icons enabled)\n"
+                                               : "retro5: librsvg NOT loaded (PNG icons only)\n";
+                            write(2, m, strlen(m)); }
+        }
     }
 }
 
