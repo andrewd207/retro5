@@ -1136,14 +1136,17 @@ static void r5_text_finish(R5Text *t) {
     t->cr = 0; t->sf = 0;
 }
 
-/* Glyph color = GC foreground, dimmed when the GC is stippled. Motif renders insensitive text by
- * STIPPLING the label GC (fill_style FillStippled/FillOpaqueStippled) so only ~half the glyph pixels
- * land; our solid cairo glyphs ignore the stipple, so we reproduce the dim by blending the
- * foreground halfway to the background. True of both calls, so it is shared. */
+/* Glyph color = GC foreground, dimmed when the GC is INSENSITIVE. Motif draws disabled text with a
+ * non-solid fill: XmLabel's insensitive_GC is FillTiled with the "50_foreground" pixmap (a 50%
+ * foreground-over-background dither); other widgets use a stipple. Either way X paints the glyph in a
+ * half-tone. Our solid cairo glyphs ignore the pattern, so we detect any non-FillSolid GC and
+ * reproduce the look by blending the foreground halfway to the background — which is exactly the 50%
+ * the "50_foreground" tile encodes. This is what makes disabled menu items, buttons and labels read
+ * as greyed. Shared by both text calls. */
 static void r5_text_source(Display *dpy, R5Text *t) {
     double fr, fg, fb;
     r5_pixel_rgb(dpy, t->gv.foreground, &fr, &fg, &fb);
-    if (t->gv.fill_style == FillStippled || t->gv.fill_style == FillOpaqueStippled) {
+    if (t->gv.fill_style != FillSolid) {                 /* FillTiled / FillStippled = insensitive */
         double br, bgc, bb;
         r5_pixel_rgb(dpy, t->gv.background, &br, &bgc, &bb);
         fr = fr * 0.5 + br * 0.5; fg = fg * 0.5 + bgc * 0.5; fb = fb * 0.5 + bb * 0.5;
@@ -1651,13 +1654,30 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
     retro5_round_widget(w);
 }
 
+/* True when a widget is insensitive (disabled). XtIsSensitive is the correct test — it folds in
+ * ancestor sensitivity — and is a genuine libXt symbol, unlike the XmNsensitive resource read which
+ * proved unreliable here. Resolved directly from libXt (never RTLD_DEFAULT). */
+static int (*r5_XtIsSensitive)(void *);
+static int r5_insensitive(void *w) {
+    if (!r5_XtIsSensitive) *(void **)&r5_XtIsSensitive = r5_realsym("XtIsSensitive");
+    return r5_XtIsSensitive ? !r5_XtIsSensitive(w) : 0;  /* unknown -> treat as sensitive */
+}
+
+/* Set a cairo source from a 0xRRGGBB constant, blended halfway to `bg` when `dim` — the same 50%
+ * fade Motif's insensitive text uses, so a disabled toggle's indicator greys with its label. */
+static void r5_ind_col(cairo_t *cr, uint32_t rgb, int dim, unsigned long bg) {
+    double r = R5_RD(rgb), g = R5_GD(rgb), b = R5_BD(rgb);
+    if (dim) { r = r * 0.5 + R5_RD(bg) * 0.5; g = g * 0.5 + R5_GD(bg) * 0.5; b = b * 0.5 + R5_BD(bg) * 0.5; }
+    cz.set_source_rgb(cr, r, g, b);
+}
+
 /* Paint one radio/checkbox indicator into an existing cairo context, at cell (x,y) size sz. Shared
  * by the full toggle EXPOSE (which also draws the background + label) and by DrawToggle (the
  * arm/select/disarm redraw path, which repaints just this cell). itype: XmONE_OF_MANY=2 -> radio
- * circle, XmN_OF_MANY=1 -> checkbox square; set -> filled/accented. bg fills the cell first so a
- * repaint erases whatever was underneath. */
+ * circle, XmN_OF_MANY=1 -> checkbox square; set -> filled/accented; dim -> insensitive (greyed). bg
+ * fills the cell first so a repaint erases whatever was underneath. */
 static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, long set,
-                               unsigned long bg) {
+                               unsigned long bg, int dim) {
     double cx, cy, r;
     cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));
     cz.rectangle(cr, x - 1, y - 1, sz + 2, sz + 2);
@@ -1671,17 +1691,17 @@ static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, lo
         r = sz / 2.0 - 1.5;
         cz.new_sub_path(cr);
         cz.arc(cr, cx, cy, r, 0, 6.2832);
-        cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE), R5_GD(R5_COL_WHITE), R5_BD(R5_COL_WHITE));
+        r5_ind_col(cr, R5_COL_WHITE, dim, bg);
         cz.fill(cr);
         cz.new_sub_path(cr);
         cz.arc(cr, cx, cy, r, 0, 6.2832);
         cz.set_line_width(cr, 1.3);
-        cz.set_source_rgb(cr, R5_RD(R5_COL_EDGE), R5_GD(R5_COL_EDGE), R5_BD(R5_COL_EDGE));
+        r5_ind_col(cr, R5_COL_EDGE, dim, bg);
         cz.stroke(cr);
         if (set) {                                       /* filled accent dot */
             cz.new_sub_path(cr);
             cz.arc(cr, cx, cy, r * 0.48, 0, 6.2832);
-            cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT));
+            r5_ind_col(cr, R5_COL_ACCENT, dim, bg);
             cz.fill(cr);
         }
     } else {                                             /* XmN_OF_MANY -> checkbox square */
@@ -1693,8 +1713,7 @@ static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, lo
         cz.arc(cr, bx + rr,      by + bs - rr, rr, 1.5708,  3.1416);
         cz.arc(cr, bx + rr,      by + rr,      rr, 3.1416,  4.7124);
         cz.close_path(cr);
-        if (set) { cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT)); }
-        else     { cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE),  R5_GD(R5_COL_WHITE),  R5_BD(R5_COL_WHITE)); }
+        r5_ind_col(cr, set ? R5_COL_ACCENT : R5_COL_WHITE, dim, bg);
         cz.fill(cr);
         /* outline: same path again */
         cz.new_sub_path(cr);
@@ -1704,8 +1723,7 @@ static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, lo
         cz.arc(cr, bx + rr,      by + rr,      rr, 3.1416,  4.7124);
         cz.close_path(cr);
         cz.set_line_width(cr, 1.3);
-        if (set) { cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT)); }
-        else     { cz.set_source_rgb(cr, R5_RD(R5_COL_EDGE),   R5_GD(R5_COL_EDGE),   R5_BD(R5_COL_EDGE)); }
+        r5_ind_col(cr, set ? R5_COL_ACCENT : R5_COL_EDGE, dim, bg);
         cz.stroke(cr);
         if (set) {                                       /* white checkmark */
             cz.new_sub_path(cr);
@@ -1713,7 +1731,7 @@ static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, lo
             cz.line_to(cr, bx + bs * 0.44, by + bs * 0.72);
             cz.line_to(cr, bx + bs * 0.78, by + bs * 0.28);
             cz.set_line_width(cr, 1.6);
-            cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE), R5_GD(R5_COL_WHITE), R5_BD(R5_COL_WHITE));
+            r5_ind_col(cr, R5_COL_WHITE, dim, bg);
             cz.stroke(cr);
         }
     }
@@ -1789,7 +1807,7 @@ void retro5_DrawToggle(void *w) {
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return;
     if (!(cr = r5_canvas_cairo(&cv))) { r5_canvas_commit(&cv, 0, 0, 0, 0); return; }
 
-    r5_paint_indicator(cr, x, y, sz, itype, set, bg);
+    r5_paint_indicator(cr, x, y, sz, itype, set, bg, r5_insensitive(w));
     {
         /* blit just the indicator cell (the region we cleared + drew), clamped to the widget */
         int bx = x - 1, by = y - 1;
@@ -1865,7 +1883,7 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     cz.rectangle(cr, 0, 0, (double)ww, (double)hh);
     cz.fill(cr);
 
-    r5_paint_indicator(cr, x, y, sz, itype, set, bg);
+    r5_paint_indicator(cr, x, y, sz, itype, set, bg, r5_insensitive(w));
 
     /* Solidify the background + indicator into the pixmap (flush cairo, then drop the cairo objects
      * but KEEP the pixmap), so Motif's Xlib drawing lands on top of them. */
