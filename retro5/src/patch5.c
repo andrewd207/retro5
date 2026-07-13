@@ -1694,18 +1694,31 @@ static int r5_dump_first_time(uint32_t h) {
 
 static void r5_icon_map_load(void) {
     FILE *f; char line[400];
+    char dir[256]; size_t dirlen = 0;
+    const char *slash;
     if (r5_icon_map_n >= 0) return;                      /* load once */
     r5_icon_map_n = 0;
     if (!r5_icons_cfg || !r5_icons_cfg[0] || !(f = fopen(r5_icons_cfg, "r"))) return;
+    /* Directory of the config file — RELATIVE icon paths resolve against it, so the map file is
+     * portable (commit it next to its icons; no absolute /home/... paths needed). */
+    if ((slash = strrchr(r5_icons_cfg, '/')) != 0) {
+        dirlen = (size_t)(slash - r5_icons_cfg) + 1;     /* keep the trailing '/' */
+        if (dirlen < sizeof dir) memcpy(dir, r5_icons_cfg, dirlen); else dirlen = 0;
+    }
     while (fgets(line, sizeof line, f) && r5_icon_map_n < 128) {
-        unsigned long h; char path[256];
+        unsigned long h; char path[256]; char *dst;
         if (line[0] == '#' || line[0] == '\n') continue;
         /* "<hexhash> <file-or-'-'> [hint...]" — '-' means not mapped yet (skeleton row); the hint
          * text after the file is documentation for the human and ignored here. */
         if (sscanf(line, "%lx %255s", &h, path) == 2 && strcmp(path, "-") != 0) {
+            dst = r5_icon_map[r5_icon_map_n].file;
+            if (path[0] != '/' && dirlen) {              /* relative -> prefix the config's dir */
+                int k = snprintf(dst, 256, "%.*s%s", (int)dirlen, dir, path);
+                if (k <= 0 || k >= 256) continue;
+            } else {
+                strncpy(dst, path, 255); dst[255] = 0;
+            }
             r5_icon_map[r5_icon_map_n].hash = (uint32_t)h;
-            strncpy(r5_icon_map[r5_icon_map_n].file, path, 255);
-            r5_icon_map[r5_icon_map_n].file[255] = 0;
             r5_icon_map_n++;
         }
     }
