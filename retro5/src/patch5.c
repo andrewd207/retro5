@@ -280,7 +280,8 @@ static int r5_text_active;
 typedef struct {
     uintptr_t CreateGC, SetLineAttributes, SetDashes, DrawSegments, DrawPoints, DrawLines,
               DrawRectangle, FillRectangle, AllocColor, GetGCValues, QueryColor, GetGeometry,
-              CopyArea, CopyPlane, CreatePixmap, FreePixmap, XtDisplayOfObject, XtWindowOfObject;
+              CopyArea, CopyPlane, CreatePixmap, FreePixmap, GetImage, PutImage,
+              XtDisplayOfObject, XtWindowOfObject;
 } R5XSyms;
 
 static struct {
@@ -304,6 +305,8 @@ static struct {
                         unsigned, unsigned, int, int, unsigned long);
     Pixmap (*CreatePixmap)(Display *, Drawable, unsigned, unsigned, unsigned);
     int    (*FreePixmap)(Display *, Pixmap);
+    XImage *(*GetImage)(Display *, Drawable, int, int, unsigned, unsigned, unsigned long, int);
+    int    (*PutImage)(Display *, Drawable, GC, XImage *, int, int, int, int, unsigned, unsigned);
     Display *(*XtDisplayOfObject)(void *);
     Window   (*XtWindowOfObject)(void *);
 } r5x;
@@ -333,6 +336,7 @@ static int r5_xlib(void) {
             R5_ADDR(AllocColor) && R5_ADDR(GetGCValues) && R5_ADDR(QueryColor) &&
             R5_ADDR(GetGeometry) && R5_ADDR(CopyArea) && R5_ADDR(CopyPlane) &&
             R5_ADDR(CreatePixmap) && R5_ADDR(FreePixmap) &&
+            R5_ADDR(GetImage) && R5_ADDR(PutImage) &&
             R5_ADDR(XtDisplayOfObject) && R5_ADDR(XtWindowOfObject))
             r5x.ready = 1;
     } else {                                              /* dynamic host: resolve by name */
@@ -352,6 +356,8 @@ static int r5_xlib(void) {
             R5_SYM(CopyPlane,         "XCopyPlane")         &&
             R5_SYM(CreatePixmap,      "XCreatePixmap")      &&
             R5_SYM(FreePixmap,        "XFreePixmap")        &&
+            R5_SYM(GetImage,          "XGetImage")          &&
+            R5_SYM(PutImage,          "XPutImage")          &&
             R5_SYM(XtDisplayOfObject, "XtDisplayOfObject")  &&
             R5_SYM(XtWindowOfObject,  "XtWindowOfObject"))
             r5x.ready = 1;
@@ -1586,15 +1592,121 @@ static void r5_get(void *w, R5Arg *args, unsigned n) {
     if (g_XtGetValues) g_XtGetValues(w, args, n);
 }
 
-/* ---- the icon seam ----
- * Every button icon in the app now flows through here on its way to the screen, which is the
- * whole point of owning expose: return a different Pixmap and the button wears a different icon.
- * A future skin can key off the widget name (XtName) or the original pixmap's id to substitute
- * rendered SVG, a hi-dpi bitmap, whatever — nothing else in the paint path has to change.
- * Returning 0 means "use WP's own pixmap", which is what we do today. */
-static Pixmap r5_icon_for(void *w, Pixmap original) {
-    (void)w; (void)original;
+/* ======================================================================================= *
+ *  Icon system — content-addressed replacement + disabled greying
+ * ======================================================================================= *
+ * Icons are matched by the PIXEL CONTENT of WP's own bitmap (a hash), not by button identity, so a
+ * mapping is stable across button position, name and build. RETRO5_ICON_DUMP logs each icon's hash
+ * so a `hash -> file` map can be built by eye; RETRO5_ICONS points at that map file (lines:
+ * "<hexhash> <path>", '#' comments). A matched icon is replaced by the file (rendering wired in a
+ * following step); either way a disabled button's icon is drawn greyed — native OR replacement. */
+static int         r5_icon_dump;            /* RETRO5_ICON_DUMP: log icon hashes */
+static const char *r5_icons_cfg;            /* RETRO5_ICONS: hash->file map path */
+static struct { uint32_t hash; char file[256]; } r5_icon_map[128];
+static int         r5_icon_map_n = -1;      /* -1 = not yet loaded */
+
+static void r5_icon_map_load(void) {
+    FILE *f; char line[400];
+    if (r5_icon_map_n >= 0) return;                      /* load once */
+    r5_icon_map_n = 0;
+    if (!r5_icons_cfg || !r5_icons_cfg[0] || !(f = fopen(r5_icons_cfg, "r"))) return;
+    while (fgets(line, sizeof line, f) && r5_icon_map_n < 128) {
+        unsigned long h; char path[256];
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (sscanf(line, "%lx %255s", &h, path) == 2) {
+            r5_icon_map[r5_icon_map_n].hash = (uint32_t)h;
+            strncpy(r5_icon_map[r5_icon_map_n].file, path, 255);
+            r5_icon_map[r5_icon_map_n].file[255] = 0;
+            r5_icon_map_n++;
+        }
+    }
+    fclose(f);
+}
+static const char *r5_icon_lookup(uint32_t h) {
+    int i;
+    r5_icon_map_load();
+    for (i = 0; i < r5_icon_map_n; i++) if (r5_icon_map[i].hash == h) return r5_icon_map[i].file;
     return 0;
+}
+
+/* FNV-1a over the icon's pixels (via XGetPixel, so row padding can't destabilise it) + dims/depth.
+ * Same WP icon -> same hash, regardless of where or when it is drawn. */
+static uint32_t r5_pixmap_hash(Display *dpy, Pixmap pm, unsigned pw, unsigned ph, unsigned pdep) {
+    XImage *im;
+    uint32_t h = 2166136261u;
+    unsigned x, y;
+    if (!r5x.GetImage) return 0;
+    im = r5x.GetImage(dpy, pm, 0, 0, pw, ph, AllPlanes, ZPixmap);
+    if (!im) return 0;
+#define R5_FNV(b) do { h ^= (uint32_t)(unsigned char)(b); h *= 16777619u; } while (0)
+    R5_FNV(pw); R5_FNV(pw >> 8); R5_FNV(ph); R5_FNV(ph >> 8); R5_FNV(pdep);
+    for (y = 0; y < ph; y++)
+        for (x = 0; x < pw; x++) {
+            unsigned long p = XGetPixel(im, (int)x, (int)y);
+            R5_FNV(p); R5_FNV(p >> 8); R5_FNV(p >> 16);
+        }
+#undef R5_FNV
+    XDestroyImage(im);
+    return h;
+}
+
+/* Blend a 0xRRGGBB toward a bg pixel (TrueColor 24-bit) — t=weight of `rgb`. Returns a pixel value. */
+static unsigned long r5_blend_pixel(unsigned rgb, unsigned long bg, double t) {
+    double u = 1.0 - t;
+    int r = (int)(((rgb >> 16) & 0xff) * t + ((bg >> 16) & 0xff) * u + 0.5);
+    int g = (int)(((rgb >>  8) & 0xff) * t + ((bg >>  8) & 0xff) * u + 0.5);
+    int b = (int)(((rgb      ) & 0xff) * t + ((bg      ) & 0xff) * u + 0.5);
+    return ((unsigned long)r << 16) | ((unsigned long)g << 8) | (unsigned)b;
+}
+
+/* Blit a COLOUR icon into `dst` at (ix,iy) GREYED: read it, desaturate each pixel to luminance and
+ * fade it toward the widget background, put it back. (TrueColor 24-bit assumed — the WP visual.) */
+static int r5_blit_gray_color(Display *dpy, Pixmap pm, Drawable dst, GC gc,
+                              unsigned pw, unsigned ph, int ix, int iy, unsigned long bg) {
+    XImage *im;
+    unsigned x, y;
+    double bgr = (bg >> 16) & 0xff, bgg = (bg >> 8) & 0xff, bgb = bg & 0xff;
+    if (!r5x.GetImage || !r5x.PutImage) return 0;
+    if (!(im = r5x.GetImage(dpy, pm, 0, 0, pw, ph, AllPlanes, ZPixmap))) return 0;
+    for (y = 0; y < ph; y++)
+        for (x = 0; x < pw; x++) {
+            unsigned long p = XGetPixel(im, (int)x, (int)y);
+            int lum = (int)((((p >> 16) & 0xff) * 30 + ((p >> 8) & 0xff) * 59 + (p & 0xff) * 11) / 100);
+            int r = (int)(lum * 0.55 + bgr * 0.45);      /* desaturate + fade toward bg */
+            int g = (int)(lum * 0.55 + bgg * 0.45);
+            int b = (int)(lum * 0.55 + bgb * 0.45);
+            XPutPixel(im, (int)x, (int)y, ((unsigned long)r << 16) | ((unsigned long)g << 8) | (unsigned)b);
+        }
+    r5x.PutImage(dpy, dst, gc, im, 0, 0, ix, iy, pw, ph);
+    XDestroyImage(im);
+    return 1;
+}
+
+static int r5_insensitive(void *w);                      /* defined below (toggle section) */
+
+/* The widget's instance name (XtName) — used to label icon hashes in the discovery dump so they can
+ * be matched to files (e.g. name "Save" -> a save icon). Resolved straight from libXt. */
+static char *(*r5_XtName)(void *);
+static const char *r5_widget_name(void *w) {
+    if (!r5_XtName) *(void **)&r5_XtName = r5_realsym("XtName");
+    return r5_XtName ? r5_XtName(w) : 0;
+}
+
+/* ---- the icon seam ----
+ * Every button icon flows through here. Compute its content hash (for discovery / the replacement
+ * map), log it under RETRO5_ICON_DUMP, and consult the hash->file map. Returns 0 = "use WP's own
+ * pixmap" (today's behaviour and the fallback until file rendering lands). */
+static Pixmap r5_icon_for(void *w, Pixmap original, uint32_t hash) {
+    (void)w;
+    if (hash) {
+        const char *rep = r5_icon_lookup(hash);
+        if (rep && r5_trace) {
+            char b[320]; int k = snprintf(b, sizeof b, "icon %08x -> %s (render pending)\n", hash, rep);
+            if (k > 0) write(2, b, (size_t)k);
+        }
+    }
+    (void)original;
+    return 0;                                            /* rendering of the mapped file: next step */
 }
 
 /* Paint a Label-derived button end to end: face, border, icon. Nothing of Motif's drawing survives
@@ -1610,7 +1722,7 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     Pixmap pm = 0, custom;
     unsigned long bg = 0;
     long shadow_type = 0;
-    int wx, wy, px, py, sunk;
+    int wx, wy, px, py, sunk, dim;
     unsigned int ww, hh, bw, dep, pw, ph, pbw, pdep;
     R5Canvas cv;
     Drawable dst;
@@ -1627,7 +1739,6 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     args[2].name = (char *)"shadowType";  args[2].value = (long)&shadow_type;
     r5_get(w, args, 3);
 
-    if ((custom = r5_icon_for(w, pm)) != 0) pm = custom;
     /* No pixmap -> hand back to Motif (it draws the text label). CRITICAL: Motif's "no pixmap"
      * sentinel is XmUNSPECIFIED_PIXMAP == (Pixmap)2, NOT 0 — every text menu item / dialog button
      * carries labelPixmap==2. Treating 2 as a real pixmap and XGetGeometry'ing it is a BadDrawable,
@@ -1638,6 +1749,24 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     if (!r5x.GetGeometry(dpy, pm, &root, &px, &py, &pw, &ph, &pbw, &pdep)) return 0;
     if (ww < 4 || hh < 4) return 0;
     if (pdep != 1 && pdep != dep) return 0;               /* depth we don't understand -> defer */
+
+    /* Icon identity: hash the content (only when discovery or a map is active), log it under
+     * RETRO5_ICON_DUMP with the widget name/hint so hashes can be mapped to files by eye, and consult
+     * the hash->file map. A hit would give a replacement pixmap; a miss (or no map) keeps WP's own. */
+    r5_icon_map_load();
+    if (r5_icon_dump || r5_icon_map_n > 0) {
+        uint32_t hash = r5_pixmap_hash(dpy, pm, pw, ph, pdep);
+        if (r5_icon_dump && hash) {
+            const char *nm = r5_widget_name(w);
+            char b[256]; int k = snprintf(b, sizeof b, "icon %08x %ux%u dep=%u name=%s\n",
+                                          hash, pw, ph, pdep, nm ? nm : "?");
+            if (k > 0) write(2, b, (size_t)k);
+        }
+        if ((custom = r5_icon_for(w, pm, hash)) != 0) {
+            if (r5x.GetGeometry(dpy, custom, &root, &px, &py, &pw, &ph, &pbw, &pdep))
+                pm = custom;                              /* replacement icon; use its geometry */
+        }
+    }
 
     sunk = (shadow_type == R5_SHADOW_IN);
 
@@ -1659,15 +1788,23 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
         if (e) r5_round_rect(dpy, dst, e, 0, 0, (int)ww, (int)hh);
     }
 
-    /* 3. the icon, centered; nudged a pixel down-right while pressed, so the press is felt. */
+    /* 3. the icon, centered; nudged a pixel down-right while pressed, so the press is felt. A
+     *    disabled button draws its icon GREYED (desaturated + faded toward the face), so inactive
+     *    tools read as inactive — applies to the native pixmap and to any replacement alike. */
     px = ((int)ww - (int)pw) / 2 + (sunk ? 1 : 0);
     py = ((int)hh - (int)ph) / 2 + (sunk ? 1 : 0);
-    if (pdep == 1) {                                      /* bitmap: stencil it in the fg color */
-        GC g = r5_pick(dpy, dst, R5_GC_GLYPH);
+    dim = r5_insensitive(w);
+    if (pdep == 1) {                                      /* bitmap: stencil in glyph colour */
+        GC g = dim ? r5_gc_for_pixel(dpy, dst, r5_blend_pixel(R5_COL_GLYPH, bg, 0.5))
+                   : r5_pick(dpy, dst, R5_GC_GLYPH);
         if (g) r5x.CopyPlane(dpy, pm, dst, g, 0, 0, pw, ph, px, py, 1);
     } else {                                              /* pdep == dep: full-color icon */
         GC g = r5_gc_for_pixel(dpy, dst, bg);
-        if (g) r5x.CopyArea(dpy, pm, dst, g, 0, 0, pw, ph, px, py);
+        if (dim && r5_blit_gray_color(dpy, pm, dst, g, pw, ph, px, py, bg)) {
+            /* greyed via the image path */
+        } else if (g) {
+            r5x.CopyArea(dpy, pm, dst, g, 0, 0, pw, ph, px, py);
+        }
     }
 
     r5_carve_corners(dpy, dst, w, ww, hh);                /* carve the corners into the buffer, last */
@@ -2210,6 +2347,8 @@ static void findBinaryFixes(void) {
         else if (!strcmp(text, "warm")) r5_text = 3;     /* diagnostic: load + FcInit, no hooks */
     }
     if (getenv("RETRO5_TRACE")) r5_trace = 1;
+    if (getenv("RETRO5_ICON_DUMP")) r5_icon_dump = 1;    /* log each toolbar icon's content hash */
+    r5_icons_cfg = getenv("RETRO5_ICONS");               /* hash->file replacement map (NULL = off) */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
         write(2, p, strlen(p));
