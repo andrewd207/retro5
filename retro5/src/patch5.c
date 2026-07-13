@@ -1872,7 +1872,35 @@ static Pixmap r5_icon_render(Display *dpy, Window win, unsigned dep,
     cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));   /* face backfill for transparency */
     cz.paint(cr);
 
-    if (r5_ends_with(path, ".png")) {
+    if (strncmp(path, "font:", 5) == 0) {
+        /* "font:<glyph>[:flags]" — render a character in the UI font, centred. flags: b=bold,
+         * i=italic, u=underline. For B/I/U these beat any bitmap: crisp, hinted, theme-matched. */
+        const char *spec = path + 5, *p;
+        char glyph[16]; int gi = 0, bold = 0, ital = 0, under = 0;
+        for (p = spec; *p && *p != ':' && gi < 15; p++) glyph[gi++] = *p;
+        glyph[gi] = 0;
+        if (*p == ':') for (p++; *p; p++) { if (*p=='b') bold=1; else if (*p=='i') ital=1; else if (*p=='u') under=1; }
+        if (gi > 0) {
+            cairo_text_extents_t te;
+            double fs = th * 0.80, gx, gy;
+            cz.select_font_face(cr, r5_family_for(0, 0),
+                                ital ? CAIRO_FONT_SLANT_ITALIC  : CAIRO_FONT_SLANT_NORMAL,
+                                bold ? CAIRO_FONT_WEIGHT_BOLD    : CAIRO_FONT_WEIGHT_NORMAL);
+            cz.set_font_size(cr, fs);
+            cz.text_extents(cr, glyph, &te);
+            gx = (tw - te.width) / 2.0 - te.x_bearing;       /* centre by ink box */
+            gy = (th - te.height) / 2.0 - te.y_bearing;
+            cz.set_source_rgb(cr, R5_RD(0x303030u), R5_GD(0x303030u), R5_BD(0x303030u));
+            cz.move_to(cr, gx, gy);
+            cz.show_text(cr, glyph);
+            if (under) {                                     /* underline bar just below the glyph */
+                double uw = te.width > 0 ? te.width : tw * 0.5;
+                cz.rectangle(cr, gx + te.x_bearing, gy + fs * 0.14, uw, fs * 0.09 + 1.0);
+                cz.fill(cr);
+            }
+            drew = 1;
+        }
+    } else if (r5_ends_with(path, ".png")) {
         cairo_surface_t *img = cz.png_create(path);
         if (img && !cz.surface_status(img)) {
             int iw = cz.img_w(img), ih = cz.img_h(img);
