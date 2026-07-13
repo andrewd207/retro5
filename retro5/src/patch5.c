@@ -2336,6 +2336,7 @@ typedef struct {
     uintptr_t metric_ptr;         /* -> current metric struct; +0x00 = face-name char*            */
     uintptr_t font_ctx;           /* -> current font context; +0x04 hi16 = device px size          */
     uintptr_t fontrec_arr, fontrec_cnt;                  /* font-record ptr array + live count u16 */
+    uintptr_t fontrec_snap;       /* base-count SNAPSHOT u16 — what the F9 list builder iterates    */
     unsigned (*glyphtab_get)(void);                      /* returns the current glyph table         */
     uintptr_t sel_filter_jne;     /* the "record+0x1e != 0" list filter jne to NOP (all-fonts)     */
     unsigned char sel_filter_bytes[2];                   /* guard: expected `75 XX`                 */
@@ -3033,11 +3034,19 @@ static void r5_inject_fonts(void) {
         if (r5s.remap_cap) *(unsigned short *)r5s.remap_cap = (unsigned short)(cnt + n);
     }
     r5_inj_base = (int)cnt;                                    /* first injected slot (for the render hook) */
+    /* Template = a real base record: the list builder dereferences several fields (flags/source
+     * pointers), so inherit them all from a known-good record, then override only what we own. */
+    { extern void *memcpy(void *, const void *, size_t);
+    unsigned char *tmpl = (arr[0] && !range_unmapped((void *)(uintptr_t)arr[0], 0x20))
+                        ? (unsigned char *)(uintptr_t)arr[0] : 0;
     for (i = 0; i < n; i++) {
         unsigned char *rec = (unsigned char *)calloc(1, 0x20);
         if (!rec) break;
+        if (tmpl) memcpy(rec, tmpl, 0x20);                     /* inherit valid fields from a real font */
         *(char **)(rec + 0x08) = strdup("wphv____.pfb");       /* stock face; resolver never faults */
         *(char **)(rec + 0x10) = strdup(r5_fcfam[i]);          /* system family (selector display name) */
+        *(char **)(rec + 0x14) = 0;                            /* no aux name */
+        *(unsigned *)(rec + 0x18) = 0;                         /* lazy metric cache */
         *(unsigned short *)(rec + 0x1c) = 0xffff;              /* alias = self */
         *(unsigned char  *)(rec + 0x1e) = 0;                   /* category 0 -> lists */
         arr[cnt] = (uint32_t)(uintptr_t)rec;
@@ -3045,8 +3054,11 @@ static void r5_inject_fonts(void) {
         code--;
         cnt++;
     }
+    }
     *(unsigned short *)r5s.fontrec_cnt  = (unsigned short)cnt;
     *(unsigned short *)r5s.freecode     = (unsigned short)code;
+    if (r5s.fontrec_snap && !range_unmapped((void *)r5s.fontrec_snap, 2))
+        *(unsigned short *)r5s.fontrec_snap = (unsigned short)cnt;   /* the F9 list iterates THIS */
     if (r5_trace) { char b[80]; int k = snprintf(b, sizeof b,
         "retro5: injected %d font(s), table count now %u\n", n, cnt);
         if (k > 0) write(2, b, (size_t)k); }
@@ -3133,7 +3145,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.xcp_plt = 0x0804f2d0; r5s.xcp_got = 0x087d8278; r5s.xcp_fn = 0;   /* dynamic XCopyPlane */
     r5s.pen_x = 0x087bdd5c; r5s.pen_y = 0x087bdd60;
     r5s.metric_ptr = 0x0880878c; r5s.font_ctx = 0x08808798;
-    r5s.fontrec_arr = 0x08808754; r5s.fontrec_cnt = 0x0880875a;
+    r5s.fontrec_arr = 0x08808754; r5s.fontrec_cnt = 0x0880875a; r5s.fontrec_snap = 0x0880875c;
     r5s.glyphtab_get = (unsigned (*)(void))0x085b9840;
     r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
     r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
@@ -3327,7 +3339,7 @@ static void applyWp8_1_Fixes(void) {
     r5s.xcp_plt = 0; r5s.xcp_got = 0; r5s.xcp_fn = 0x08677d60;   /* static XCopyPlane */
     r5s.pen_x = 0x087d9f54; r5s.pen_y = 0x087d9f58;
     r5s.metric_ptr = 0x088281f8; r5s.font_ctx = 0x08828204;
-    r5s.fontrec_arr = 0x088281c0; r5s.fontrec_cnt = 0x088281c6;
+    r5s.fontrec_arr = 0x088281c0; r5s.fontrec_cnt = 0x088281c6; r5s.fontrec_snap = 0x088281c8;
     r5s.glyphtab_get = (unsigned (*)(void))0x08539db8;
     r5s.sel_filter_jne = 0x08538408; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4d;
     r5s.fontrec_cap = 0x088281c4; r5s.remap_arr = 0x088281d8; r5s.remap_cap = 0x088281dc;
