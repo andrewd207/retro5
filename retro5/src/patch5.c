@@ -1847,9 +1847,10 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     int wx, wy, x, y, sz;
     R5Canvas cv;
     cairo_t *cr;
-    R5Arg a[6];
+    R5Arg a[7];
     long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, height, edge;
     unsigned long bg = 0xd3d3d3;
+    Pixmap pm = 0;
 
     if (r5_in_toggle_expose) return;                     /* never recurse via the fallback path */
 
@@ -1865,7 +1866,39 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
     a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
     a[5].name = (char *)"background";         a[5].value = (long)&bg;
-    r5_get(w, a, 6);
+    a[6].name = (char *)"labelPixmap";        a[6].value = (long)&pm;
+    r5_get(w, a, 7);
+
+    /* PIXMAP toggle (a toolbar icon toggle like the "as-you-type" abc buttons): it has no radio/
+     * checkbox indicator — the whole face is an icon that latches pressed when set. Motif redraws its
+     * pixmap via redisplayPixmap (XClearArea + XCopyArea straight on the window), which flickers on
+     * every repaint and which our text redirect does not catch. So we own it here: draw the face
+     * (pressed/inset when set) and blit the icon centered, entirely in the back buffer — one flicker-
+     * free frame, no bogus indicator, no Motif drawing. */
+    if (pm && pm != R5_UNSPECIFIED_PIXMAP) {
+        Pixmap root2; int ppx, ppy, ix, iy; unsigned pw, ph, pbw, pdep;
+        if (!r5x.GetGeometry(dpy, pm, &root2, &ppx, &ppy, &pw, &ph, &pbw, &pdep)) goto fallback;
+        if ((pdep != 1 && pdep != dep) || ww < 4 || hh < 4) goto fallback;
+        if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) goto fallback;
+        {
+            Drawable dst = cv.buf;
+            GC face = set ? r5_pick(dpy, dst, R5_GC_PRESS) : r5_gc_for_pixel(dpy, dst, bg);
+            if (face) r5x.FillRectangle(dpy, dst, face, 0, 0, ww, hh);
+            if (set) r5_inset(dpy, dst, 0, 0, (int)ww, (int)hh);   /* latched -> pressed frame */
+            ix = ((int)ww - (int)pw) / 2 + (set ? 1 : 0);
+            iy = ((int)hh - (int)ph) / 2 + (set ? 1 : 0);
+            if (pdep == 1) {
+                GC g = r5_pick(dpy, dst, R5_GC_GLYPH);
+                if (g) r5x.CopyPlane(dpy, pm, dst, g, 0, 0, pw, ph, ix, iy, 1);
+            } else {
+                GC g = r5_gc_for_pixel(dpy, dst, bg);
+                if (g) r5x.CopyArea(dpy, pm, dst, g, 0, 0, pw, ph, ix, iy);
+            }
+            r5_carve_corners(dpy, dst, w, ww, hh);
+        }
+        r5_canvas_commit(&cv, 0, 0, ww, hh);
+        return;
+    }
 
     hlt &= 0xffff; st &= 0xffff; mw &= 0xffff;
     height = (long)hh;
