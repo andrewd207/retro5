@@ -1997,6 +1997,21 @@ static void r5_take_highlight(void *w) {
     }
 }
 
+/* Give a window a None background so the server never auto-fills it. WP hot-tracks toolbar buttons
+ * on hover by calling XtVaSetValues on enter/leave; when the widget's set_values asks for redisplay,
+ * Xt runs XClearArea(win, 0,0,0,0, exposures=True) — which clears the WHOLE window to its (grey)
+ * background and then generates an Expose. That grey clear is a visible flash before our expose
+ * repaints (confirmed by gdb backtrace: XClearArea <- XtSetValues <- XtVaSetValues <- WP enter/leave).
+ * Per the X spec, XClearArea on a None-background window changes NO contents but still generates the
+ * exposures, so our expose redraws over the intact previous frame: the Expose survives, the flash
+ * does not. We do this only for buttons we fully own (below), never for widgets handed back to Motif. */
+static int (*r5_XSetWindowBackgroundPixmap)(Display *, Window, Pixmap);
+static void r5_win_no_autoclear(Display *dpy, Window win) {
+    if (!r5_XSetWindowBackgroundPixmap)
+        *(void **)&r5_XSetWindowBackgroundPixmap = r5_realsym("XSetWindowBackgroundPixmap");
+    if (r5_XSetWindowBackgroundPixmap) r5_XSetWindowBackgroundPixmap(dpy, win, (Pixmap)None);
+}
+
 /* Paint a Label-derived button end to end: face, border, icon. Nothing of Motif's drawing survives
  * — we do not call the original — so the appearance is entirely ours, including the icon blit.
  *
@@ -2071,6 +2086,7 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
      * screen until the single commit. */
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
     dst = cv.buf;
+    r5_win_no_autoclear(dpy, win);                        /* kill the grey enter/leave clear flash */
 
     /* 1. face. Filling is safe here (unlike inside _XmDrawShadows) precisely because we own the
      *    order: the icon has not been drawn yet — we draw it, below, on top. */
