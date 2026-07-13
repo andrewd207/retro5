@@ -2477,13 +2477,24 @@ static const char *r5_doc_family(int *slant, int *weight, int *symbolic) {
     unsigned key = (!r5s.metric_ptr || range_unmapped((void *)r5s.metric_ptr, 4))
                  ? 0 : *(unsigned *)r5s.metric_ptr;
     const char *face, *fam;
-    /* An injected system font is active (resolver hook set the family): render it in its REAL face,
-     * not the wphv fallback the metric name would map to. Derive slant/weight from the family name;
-     * not cached (r5_cur_family tracks the current run and metric_ptr may be the shared fallback). */
+    /* The resolver hook captured the SELECTED font's record name (WP may substitute its metric to a
+     * stock face, so the metric name is unreliable for display/injected fonts). Render from the record
+     * name: a real fontconfig family (DejaVu Sans, Inter Display, Courier, Times...) is used VERBATIM
+     * so fontconfig resolves the true face; a WP-stock name (…-WP, "WP …") maps to a generic and takes
+     * its slant/weight from the metric PS name (which carries -Bold/-Italic). */
     if (r5_cur_family[0]) {
-        int sym; const char *g = r5_face_to_family(r5_cur_family, slant, weight, &sym);
-        (void)g; *symbolic = 0;                       /* injected families are real text faces */
-        return r5_cur_family;
+        int s = 0, w = 0, sym = 0;
+        const char *b = r5_cur_family, *p;
+        int wpstock = 0;
+        for (p = b; p[0] && p[1]; p++) if (p[0]=='-' && (p[1]=='W'||p[1]=='w') && (p[2]=='P'||p[2]=='p')) wpstock = 1;
+        if ((b[0]=='W'||b[0]=='w') && (b[1]=='P'||b[1]=='p') && b[2]==' ') wpstock = 1;   /* "WP …" */
+        r5_face_to_family(b, &s, &w, &sym);           /* slant/weight/symbolic from the record name  */
+        *slant = s; *weight = w; *symbolic = sym;
+        if (sym) return "Serif";                      /* symbolic -> caller passes through to WP      */
+        if (!wpstock) return r5_cur_family;           /* real family: verbatim (fontconfig resolves)  */
+        { const char *face = r5_doc_face();           /* WP stock: generic family + metric-derived style */
+          const char *gen = r5_face_to_family(face && *face ? face : b, slant, weight, symbolic);
+          return gen; }
     }
     if (r5_doc_facecache.has && r5_doc_facecache.key == key) {
         *slant = r5_doc_facecache.slant; *weight = r5_doc_facecache.weight;
@@ -3101,18 +3112,24 @@ static void r5_install_injection(void) {
 static int (*r5_resolver_orig)(unsigned);
 int retro5_resolver(unsigned codeattr) {
     r5_cur_family[0] = 0;
-    if (r5_inj_base && r5s.remap_arr && r5s.fontrec_cnt && !range_unmapped((void *)r5s.remap_arr, 4)) {
+    /* Capture the SELECTED font's own record name (+0x10) — WP substitutes display/injected fonts to
+     * a stock face for its Type1 engine (e.g. "DejaVu Sans" -> BroadwayEngraved metric), so the metric
+     * name is wrong; the record name is what the user picked. r5_doc_family renders from this. */
+    if (r5s.remap_arr && r5s.fontrec_arr && r5s.fontrec_cnt
+        && !range_unmapped((void *)r5s.remap_arr, 4) && !range_unmapped((void *)r5s.fontrec_arr, 4)) {
         unsigned short *remap = *(unsigned short **)r5s.remap_arr;
+        uint32_t *arr = *(uint32_t **)r5s.fontrec_arr;
         unsigned cnt = *(unsigned short *)r5s.fontrec_cnt;
         unsigned idx = 0x0fff - ((codeattr >> 16) & 0x0fff);
-        if (remap && !range_unmapped(&remap[idx], 2)) {
-            int slot = remap[idx];
-            if (slot >= r5_inj_base && slot < r5_inj_base + r5_fcfam_n && (unsigned)slot < cnt) {
-                strncpy(r5_cur_family, r5_fcfam[slot - r5_inj_base], sizeof r5_cur_family - 1);
-                r5_cur_family[sizeof r5_cur_family - 1] = 0;
-                if (r5_trace) { char b[120]; int k = snprintf(b, sizeof b,
-                    "retro5: resolver injected slot %d -> '%s'\n", slot, r5_cur_family);
-                    if (k > 0) write(2, b, (size_t)k); }
+        if (remap && arr && !range_unmapped(&remap[idx], 2)) {
+            unsigned slot = remap[idx];
+            if (slot < cnt && !range_unmapped(&arr[slot], 4) && arr[slot]
+                && !range_unmapped((void *)(uintptr_t)(arr[slot] + 0x10), 4)) {
+                const char *nm = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(arr[slot] + 0x10));
+                if (nm && !range_unmapped(nm, 1)) {
+                    strncpy(r5_cur_family, nm, sizeof r5_cur_family - 1);
+                    r5_cur_family[sizeof r5_cur_family - 1] = 0;
+                }
             }
         }
     }
