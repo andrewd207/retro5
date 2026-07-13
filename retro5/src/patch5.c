@@ -2935,33 +2935,56 @@ static int (*r5_builder_orig)(void);                 /* trampoline to the real f
  * calls bind to glibc, not our libc5 shims. Best-effort: 0 families on any failure -> nothing injected. */
 static char r5_fcfam[2048][64];
 static int  r5_fcfam_n;
+/* A family name WP can actually store & reproduce: its .wpd font storage is a legacy
+ * codepage, not UTF-8, so names with non-ASCII bytes (CJK, many localized names) would be mangled.
+ * Skip anything outside printable ASCII until/unless we do a two-way codepage conversion. */
+static int r5_wp_storable_name(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) if ((unsigned char)*s < 0x20 || (unsigned char)*s > 0x7e) return 0;
+    return 1;
+}
 static void r5_fc_enumerate(void) {
-    void *h; int (*FcInit)(void); void *(*FcPatternCreate)(void);
+    void *h; void *(*FcInitLoadConfigAndFonts)(void); void *(*FcPatternCreate)(void);
     void *(*FcObjectSetBuild)(const char *, void *); void *(*FcFontList)(void *, void *, void *);
     int (*FcPatternGetString)(void *, const char *, int, unsigned char **);
-    void *pat, *os, *fs; int nfont, i, j;
+    void *cfg, *pat, *os, *fs; int nfont, i, j;
     unsigned char **fonts;
     if (r5_fcfam_n) return;                              /* once */
     h = dlopen("libfontconfig.so.1", RTLD_NOLOAD | RTLD_NOW);
     if (!h) h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_DEEPBIND);
     if (!h) return;
-    FcInit             = (int (*)(void))dlsym(h, "FcInit");
+    /* FcInitLoadConfigAndFonts builds a FRESH config AND scans every configured font dir, so we see
+     * the whole library — not the partial current config cairo warmed (which showed only ~230). */
+    FcInitLoadConfigAndFonts = (void *(*)(void))dlsym(h, "FcInitLoadConfigAndFonts");
     FcPatternCreate    = (void *(*)(void))dlsym(h, "FcPatternCreate");
     FcObjectSetBuild   = (void *(*)(const char *, void *))dlsym(h, "FcObjectSetBuild");
     FcFontList         = (void *(*)(void *, void *, void *))dlsym(h, "FcFontList");
     FcPatternGetString = (int (*)(void *, const char *, int, unsigned char **))dlsym(h, "FcPatternGetString");
-    if (!FcInit || !FcPatternCreate || !FcObjectSetBuild || !FcFontList || !FcPatternGetString) return;
-    FcInit();
+    if (!FcInitLoadConfigAndFonts || !FcPatternCreate || !FcObjectSetBuild || !FcFontList
+        || !FcPatternGetString) return;
+    /* WP is 32-bit; the system fontconfig cache in ~/.cache/fontconfig is 64-bit (le64) only, so the
+     * in-process 32-bit fontconfig can't use it and returns a stale partial set (~230 of 2446 fonts).
+     * Point it at a retro5-owned cache dir so it builds its OWN full 32-bit cache: first launch scans
+     * everything (~2s extra), every launch after reads the le32 cache (fast). Env only affects our
+     * fresh config below; not restored (WP is pre-XDG and creates no further fontconfig configs). */
+    { const char *home = getenv("HOME"); static char xe[256];
+      if (home) { char d[220]; extern int mkdir(const char *, unsigned int); extern int putenv(char *);
+        snprintf(d, sizeof d, "%s/.cache/retro5-fc", home); mkdir(d, 0755);
+        snprintf(xe, sizeof xe, "XDG_CACHE_HOME=%s", d); putenv(xe); } }
+    cfg = FcInitLoadConfigAndFonts();
     pat = FcPatternCreate();
     os  = FcObjectSetBuild("family", (void *)0);        /* variadic, NULL-terminated */
-    if (!pat || !os) return;
-    fs = FcFontList(0, pat, os);                        /* config 0 => current */
+    if (!cfg || !pat || !os) return;
+    fs = FcFontList(cfg, pat, os);                      /* full config -> all font dirs */
     if (!fs) return;
     nfont = *(int *)fs;                                 /* FcFontSet: {int nfont; int sfont; FcPattern**} */
     fonts = *(unsigned char ***)((char *)fs + 8);
+    if (r5_trace) { char b[80]; int k = snprintf(b, sizeof b, "retro5: fontconfig nfont=%d\n", nfont);
+                    if (k > 0) write(2, b, (size_t)k); }
     for (i = 0; i < nfont && r5_fcfam_n < (int)(sizeof r5_fcfam / sizeof r5_fcfam[0]); i++) {
         unsigned char *fam = 0;
         if (FcPatternGetString(fonts[i], "family", 0, &fam) != 0 || !fam || !fam[0]) continue;
+        if (!r5_wp_storable_name((const char *)fam)) continue;   /* WP codepage can't store it */
         for (j = 0; j < r5_fcfam_n; j++)                /* dedup, case-insensitive */
             if (!strcasecmp(r5_fcfam[j], (const char *)fam)) break;
         if (j < r5_fcfam_n) continue;
