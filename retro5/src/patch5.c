@@ -1052,13 +1052,36 @@ static void r5_cairo_font(cairo_t *cr, const R5Font *fnt) {
     cz.set_font_size(cr, fnt->size);
 }
 
-/* X text is Latin-1; cairo wants UTF-8. Convert so a high byte can't poison the context. */
+/* WP's UI strings are NOT plain Latin-1: some high bytes are WordPerfect codepage / fill characters
+ * that Latin-1 would render as garbage. Map the known ones to their intended Unicode here; anything
+ * unmapped falls back to Latin-1 (best-effort until a full WP-charset table exists — the RETRO5_TRACE
+ * "hibyte" log lists offending bytes to extend this from). 0xFE is WP's field-alignment fill: dialog
+ * status lines pad columns with a RUN of it (e.g. "Files: 3<0xFE…>Dirs: 7"), so it must be a SPACE,
+ * not Latin-1 'þ'. */
+static unsigned r5_wp_codepoint(unsigned char c) {
+    switch (c) {
+        case 0xFE: return 0x20;                          /* WP fill / hard space -> space (not 'þ') */
+        default:   return c;                             /* Latin-1 fallback */
+    }
+}
+
+/* X text is a WP codepage; cairo wants UTF-8. Convert so a high byte can't poison the context. This
+ * is the SINGLE conversion point, used by both the metric rewrite and rendering, so any remap here
+ * keeps measured widths and drawn glyphs consistent. */
 static int r5_latin1_utf8(const char *s, int len, char *out, int outsz) {
     int i, o = 0;
-    for (i = 0; i < len && o < outsz - 2; i++) {
+    for (i = 0; i < len && o < outsz - 3; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (c < 0x80) out[o++] = (char)c;
-        else { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+        unsigned cp = (c < 0x80) ? (unsigned)c : r5_wp_codepoint(c);
+        if (cp < 0x80) out[o++] = (char)cp;
+        else if (cp < 0x800) {
+            out[o++] = (char)(0xC0 | (cp >> 6));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[o++] = (char)(0xE0 | (cp >> 12));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
     }
     out[o] = 0;
     return o;
@@ -1129,6 +1152,18 @@ static int r5_text_setup(Display *dpy, Drawable d, GC gc, const char *s, int len
     }
     r5_cairo_font(t->cr, t->fnt);
     r5_latin1_utf8(s, len > 500 ? 500 : len, t->buf, sizeof t->buf);
+    if (r5_trace) {                                      /* codepage probe: log strings with high bytes */
+        int i, hi = 0;
+        for (i = 0; i < len && i < 64; i++) if ((unsigned char)s[i] >= 0x80) { hi = 1; break; }
+        if (hi) {
+            char hex[160]; int o = 0, j, n = len < 32 ? len : 32;
+            for (j = 0; j < n && o < 150; j++)
+                o += snprintf(hex + o, sizeof hex - o, "%02x ", (unsigned char)s[j]);
+            char b[300]; int k = snprintf(b, sizeof b, "hibyte fam=%s len=%d hex=%s\n",
+                t->fnt->family ? t->fnt->family : "?", len, hex);
+            if (k > 0) write(2, b, (size_t)k);
+        }
+    }
     return 1;
 }
 
