@@ -2449,8 +2449,51 @@ typedef struct {
     uintptr_t freecode;           /* next-free 12-bit fontcode counter u16 (inits 0xfff, counts down) */
     uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
     uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
+    /* printer subsystem takeover (RETRO5_CUPS) — see FONT-RENDERING-MAP §15/§19. Addresses only;
+       the array-injection detour is wired once §19 confirms the flat/rich array fill relationship. */
+    uintptr_t printer_scan_va;    /* printer-list scan-core: int(void *ctx, int category) cdecl     */
+    uintptr_t printer_rich_arr, printer_rich_cnt;  /* rich entry buffer calloc(cnt,0x9c) + count u16 */
+    uintptr_t printer_flat_arr, printer_flat_cnt;  /* flat display-name char** + count u16 (dialog)  */
+    uintptr_t cur_printer_name;   /* current-printer record name (+0x4c): the selected queue        */
 } R5Syms;
 static R5Syms r5s;
+
+/* --- printertocups bridge (RETRO5_CUPS) ---------------------------------------------------------
+ * retro5 deep-loads printertocups.so (RTLD_DEEPBIND, like cairo/librsvg) so libcups' modern glibc/
+ * gnutls deps never collide with WP's libc5 shim. The interface is async + thread-safe: p2c_submit
+ * queues and returns, and p2c_enum serves a prefetched cache — nothing here blocks WP's UI thread,
+ * exactly as the old print IPC returned before spooling. Loaded once when CUPS mode is on; on load
+ * we p2c_init (starts the worker) and p2c_prefetch (warms the destination cache in the background),
+ * so the Select-Printer dialog is instant. */
+static int r5_cups;                               /* RETRO5_CUPS: back WP's printer subsystem with CUPS */
+typedef struct { char name[128]; char info[128]; int is_default; } R5P2CPrinter;  /* == P2CPrinter */
+static struct {
+    int   ready;
+    void *h;
+    int   (*init)(void);
+    int   (*prefetch)(void);
+    int   (*enumerate)(R5P2CPrinter *, int);
+    long  (*submit)(const char *, const char *, const char *, const void *, size_t, const void *, int);
+    void  (*shutdown)(void);
+} r5p2c;
+
+static int r5_p2c_load(void) {
+    void *h;
+    if (r5p2c.ready) return 1;
+    if (!(h = dlopen("printertocups.so", RTLD_NOW | RTLD_DEEPBIND))) return 0;
+    *(void **)&r5p2c.init      = dlsym(h, "p2c_init");
+    *(void **)&r5p2c.prefetch  = dlsym(h, "p2c_prefetch");
+    *(void **)&r5p2c.enumerate = dlsym(h, "p2c_enum");
+    *(void **)&r5p2c.submit    = dlsym(h, "p2c_submit");
+    *(void **)&r5p2c.shutdown  = dlsym(h, "p2c_shutdown");
+    if (!r5p2c.init || !r5p2c.enumerate || !r5p2c.submit) return 0;
+    r5p2c.h = h;
+    r5p2c.ready = 1;
+    if (r5p2c.init() == 0 && r5p2c.prefetch) r5p2c.prefetch();   /* worker up + dest cache warming */
+    if (r5_trace) { const char *m = "retro5: printertocups loaded (CUPS backend ready)\n";
+                    write(2, m, strlen(m)); }
+    return 1;
+}
 
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
 static int r5_doc_active;                                /* set only during our draw_text_run call */
@@ -3282,6 +3325,11 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
     r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
     r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500; r5s.resolver_va = 0x085b7860;
+    /* printer subsystem (RETRO5_CUPS) — FONT-RENDERING-MAP §15/§19 */
+    r5s.printer_scan_va  = 0x0852cb40;
+    r5s.printer_rich_arr = 0x08803140; r5s.printer_rich_cnt = 0x08803144;
+    r5s.printer_flat_arr = 0x08803120; r5s.printer_flat_cnt = 0x08803124;
+    r5s.cur_printer_name = 0x08812608;
 
     /* Table QuickFill (Insert Table -> "Extend the pattern in the current selection"):
        guard the code-stream parser's copy at 0x08430205 (orig: call FUN_085c5dd0). */
@@ -3298,6 +3346,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_apply_allfonts();
     r5_install_injection();
     r5_install_resolver_hook();
+    if (r5_cups) r5_p2c_load();          /* bring up the CUPS backend + warm the dest cache */
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -3490,11 +3539,17 @@ static void applyWp8_1_Fixes(void) {
     r5s.sel_filter_jne = 0x08538408; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4d;
     r5s.fontrec_cap = 0x088281c4; r5s.remap_arr = 0x088281d8; r5s.remap_cap = 0x088281dc;
     r5s.freecode = 0x087da1da; r5s.builder_va = 0x08538b6c; r5s.resolver_va = 0x0853803c;
+    /* printer subsystem (RETRO5_CUPS) — FONT-RENDERING-MAP §15/§19 (8.1 twins of the 8.0 table) */
+    r5s.printer_scan_va  = 0x084bb0c4;
+    r5s.printer_rich_arr = 0x08822a38; r5s.printer_rich_cnt = 0x08822a48;
+    r5s.printer_flat_arr = 0x08822a18; r5s.printer_flat_cnt = 0x08822a1c;
+    r5s.cur_printer_name = 0x08832b88;
     /* 8.1 doc-font port (static-X). Motif appearance reskin not yet ported. */
     takeoverWP81();
     r5_apply_allfonts();
     r5_install_injection();
     r5_install_resolver_hook();
+    if (r5_cups) r5_p2c_load();          /* bring up the CUPS backend + warm the dest cache */
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
@@ -3549,6 +3604,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_DOCFONT81"); if (e && *e && e[0] != '0') r5_docfont81 = 1; }  /* EXPERIMENTAL 8.1 canvas */
     { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
+    { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";

@@ -71,8 +71,14 @@ typedef struct {
 int  p2c_init(void);
 
 /* Enumerate CUPS destinations into out[0..max-1]; returns the count written (>=0) or -1 on error.
- * Thread-safe. */
+ * Thread-safe. Returns the PREFETCHED cache when warm (instant, non-blocking) — see p2c_prefetch;
+ * only the very first call before any prefetch does a live (blocking) cupsGetDests. */
 int  p2c_enum(P2CPrinter *out, int max);
+
+/* Warm the destination cache on a detached background thread so a later p2c_enum never blocks WP's
+ * UI thread (the enumeration hook must return as fast as the old IPC did). Idempotent; safe to call
+ * at library init. Returns 0 if the refresh was started (or already warm), -1 if libcups is absent. */
+int  p2c_prefetch(void);
 
 /* Resolve one queue's capabilities into *out (media/page-sizes, resolutions, sources, color,
  * duplex) via CUPS IPP. `dest` NULL/"" = the CUPS default destination. Returns 0 on success

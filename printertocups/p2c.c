@@ -180,20 +180,54 @@ int p2c_init(void) {
     return rc;
 }
 
-int p2c_enum(P2CPrinter *out, int max) {
-    cups_dest_t *dests = 0; int n, i, got = 0;
-    if (!p2c_load_cups() || !out || max <= 0) return -1;
+/* --- destination cache (so the enumeration hook is non-blocking) --------------------------------
+ * cupsGetDests can be slow (network/DNS-SD discovery). WP calls the enumeration hook synchronously
+ * on its UI thread when the Select-Printer dialog opens, so we serve a prefetched snapshot instead of
+ * querying live there. The snapshot is a flat P2CPrinter[] (no cups_dest_t lifetimes to manage),
+ * swapped in under q_mtx after a background refresh completes. */
+static P2CPrinter *dc_list;      /* cached snapshot */
+static int         dc_n;         /* entries in dc_list */
+static int         dc_valid;     /* 1 once a refresh has populated it */
+
+/* Query CUPS live and swap the result into the cache. Does the slow call OUTSIDE the lock, then
+ * takes q_mtx only to publish — so a concurrent p2c_submit never waits on cupsGetDests. */
+static void p2c_refresh_dests(void) {
+    cups_dest_t *dests = 0; P2CPrinter *snap = 0; int n, i, m = 0;
+    if (!p2c_load_cups()) return;
     n = cu.GetDests(&dests);
-    for (i = 0; i < n && got < max; i++) {
-        const char *info = cu.GetOption ? cu.GetOption("printer-info", dests[i].num_options, dests[i].options) : 0;
-        strncpy(out[got].name, dests[i].name ? dests[i].name : "", sizeof out[got].name - 1);
-        out[got].name[sizeof out[got].name - 1] = 0;
-        strncpy(out[got].info, info ? info : "", sizeof out[got].info - 1);
-        out[got].info[sizeof out[got].info - 1] = 0;
-        out[got].is_default = dests[i].is_default ? 1 : 0;
-        got++;
+    if (n > 0) snap = (P2CPrinter *)calloc((size_t)n, sizeof *snap);
+    if (snap) {
+        for (i = 0; i < n; i++) {
+            const char *info = cu.GetOption ? cu.GetOption("printer-info", dests[i].num_options, dests[i].options) : 0;
+            strncpy(snap[m].name, dests[i].name ? dests[i].name : "", sizeof snap[m].name - 1);
+            strncpy(snap[m].info, info ? info : "",                    sizeof snap[m].info - 1);
+            snap[m].is_default = dests[i].is_default ? 1 : 0;
+            m++;
+        }
     }
     if (dests && cu.FreeDests) cu.FreeDests(n, dests);
+    pthread_mutex_lock(&q_mtx);
+    { P2CPrinter *old = dc_list; dc_list = snap; dc_n = m; dc_valid = 1; free(old); }
+    pthread_mutex_unlock(&q_mtx);
+}
+
+static void *p2c_prefetch_thread(void *arg) { (void)arg; p2c_refresh_dests(); return 0; }
+
+int p2c_prefetch(void) {
+    pthread_t t;
+    if (!p2c_load_cups()) return -1;
+    if (pthread_create(&t, 0, p2c_prefetch_thread, 0) == 0) pthread_detach(t);
+    else p2c_refresh_dests();                              /* fall back to synchronous warm */
+    return 0;
+}
+
+int p2c_enum(P2CPrinter *out, int max) {
+    int got = 0, i;
+    if (!p2c_load_cups() || !out || max <= 0) return -1;
+    pthread_mutex_lock(&q_mtx);
+    if (!dc_valid) { pthread_mutex_unlock(&q_mtx); p2c_refresh_dests(); pthread_mutex_lock(&q_mtx); }
+    for (i = 0; i < dc_n && got < max; i++) out[got++] = dc_list[i];
+    pthread_mutex_unlock(&q_mtx);
     return got;
 }
 
