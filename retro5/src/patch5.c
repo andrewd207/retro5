@@ -2344,12 +2344,14 @@ typedef struct {
     uintptr_t remap_arr, remap_cap;  /* remap[0xfff-code]->index ptr + capacity u16               */
     uintptr_t freecode;           /* next-free 12-bit fontcode counter u16 (inits 0xfff, counts down) */
     uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
+    uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
 } R5Syms;
 static R5Syms r5s;
 
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
 static int r5_doc_active;                                /* set only during our draw_text_run call */
 static double r5_doc_px;                                 /* RETRO5_DOCFONT_PX size override (0 = auto) */
+static char r5_cur_family[80];                           /* Phase 3: current run's injected family, or "" */
 /* Reverse map: WP rasterises glyphs LAZILY (pixmap at glyphTable[c*12]->+0x18 is 0 until first draw),
  * so pre-filtering the buffer by pixmap!=0 dropped not-yet-rendered chars and desynced the mapping.
  * At BLIT time the pixmap IS populated and uniquely identifies the char, so recover the char from the
@@ -2473,6 +2475,14 @@ static const char *r5_doc_family(int *slant, int *weight, int *symbolic) {
     unsigned key = (!r5s.metric_ptr || range_unmapped((void *)r5s.metric_ptr, 4))
                  ? 0 : *(unsigned *)r5s.metric_ptr;
     const char *face, *fam;
+    /* An injected system font is active (resolver hook set the family): render it in its REAL face,
+     * not the wphv fallback the metric name would map to. Derive slant/weight from the family name;
+     * not cached (r5_cur_family tracks the current run and metric_ptr may be the shared fallback). */
+    if (r5_cur_family[0]) {
+        int sym; const char *g = r5_face_to_family(r5_cur_family, slant, weight, &sym);
+        (void)g; *symbolic = 0;                       /* injected families are real text faces */
+        return r5_cur_family;
+    }
     if (r5_doc_facecache.has && r5_doc_facecache.key == key) {
         *slant = r5_doc_facecache.slant; *weight = r5_doc_facecache.weight;
         *symbolic = r5_doc_facecache.symbolic;
@@ -2929,6 +2939,7 @@ extern void *realloc(void *, size_t);
 extern char *strdup(const char *);
 
 static int (*r5_builder_orig)(void);                 /* trampoline to the real font-table builder */
+static int  r5_inj_base;                             /* table count just before our injection */
 
 /* Enumerate installed system font FAMILIES via libfontconfig (deduped, case-insensitive). Fills
  * r5_fcfam. dlopen'd RTLD_DEEPBIND (NOLOAD first — cairo has usually already loaded it) so its libc
@@ -3021,6 +3032,7 @@ static void r5_inject_fonts(void) {
         *(unsigned short *)r5s.fontrec_cap = (unsigned short)(cnt + n);
         if (r5s.remap_cap) *(unsigned short *)r5s.remap_cap = (unsigned short)(cnt + n);
     }
+    r5_inj_base = (int)cnt;                                    /* first injected slot (for the render hook) */
     for (i = 0; i < n; i++) {
         unsigned char *rec = (unsigned char *)calloc(1, 0x20);
         if (!rec) break;
@@ -3057,6 +3069,43 @@ static void r5_install_injection(void) {
         patch_entry(r5s.builder_va, (const char *)g, sizeof g, (void *)retro5_font_builder);
 }
 
+/* ---- injected-font rendering (Phase 3) -------------------------------------------------------
+ * Injected records all share WP's fallback (wphv) metric, so they can't be told apart at blit time
+ * by metric name. Instead, hook the font RESOLVER (called with the packed fontcode on every font
+ * activation): reproduce its own remap index (idx = 0xfff - ((code>>16) & 0xfff)), look up the slot,
+ * and if it is one we injected, stash its real fontconfig family in r5_cur_family. r5_doc_family()
+ * then renders the cairo glyph in that family. Cleared for stock fonts so they keep metric-name
+ * matching. Gated with the doc-font canvas (RETRO5_DOCFONT) + injection (RETRO5_ALLFONTS). */
+static int (*r5_resolver_orig)(unsigned);
+int retro5_resolver(unsigned codeattr) {
+    r5_cur_family[0] = 0;
+    if (r5_inj_base && r5s.remap_arr && r5s.fontrec_cnt && !range_unmapped((void *)r5s.remap_arr, 4)) {
+        unsigned short *remap = *(unsigned short **)r5s.remap_arr;
+        unsigned cnt = *(unsigned short *)r5s.fontrec_cnt;
+        unsigned idx = 0x0fff - ((codeattr >> 16) & 0x0fff);
+        if (remap && !range_unmapped(&remap[idx], 2)) {
+            int slot = remap[idx];
+            if (slot >= r5_inj_base && slot < r5_inj_base + r5_fcfam_n && (unsigned)slot < cnt) {
+                strncpy(r5_cur_family, r5_fcfam[slot - r5_inj_base], sizeof r5_cur_family - 1);
+                r5_cur_family[sizeof r5_cur_family - 1] = 0;
+                if (r5_trace) { char b[120]; int k = snprintf(b, sizeof b,
+                    "retro5: resolver injected slot %d -> '%s'\n", slot, r5_cur_family);
+                    if (k > 0) write(2, b, (size_t)k); }
+            }
+        }
+    }
+    return r5_resolver_orig ? r5_resolver_orig(codeattr) : 0;
+}
+static void r5_install_resolver_hook(void) {
+    static const unsigned char g[] = {0x55,0x89,0xe5,0x83,0xec,0x08};
+    if (!(r5_docfont || r5_docfont81) || !r5_allfonts || !r5s.resolver_va) return;
+    if (range_unmapped((void *)r5s.resolver_va, sizeof g) || memcmp((void *)r5s.resolver_va, g, sizeof g))
+        return;
+    r5_resolver_orig = (int (*)(unsigned))r5_make_trampoline(r5s.resolver_va, 6);
+    if (r5_resolver_orig)
+        patch_entry(r5s.resolver_va, (const char *)g, sizeof g, (void *)retro5_resolver);
+}
+
 /* Font-selector takeover (RETRO5_ALLFONTS): the F9 "Font Face" list builder shows an entry only if
  * record+0x1e == 0 (a printer-available-vs-display-only category byte). Normal mode leaves only the
  * current printer's font(s) at 0, so the list shows ~1; NOP the filter jne and ALL enumerated fonts
@@ -3088,7 +3137,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.glyphtab_get = (unsigned (*)(void))0x085b9840;
     r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
     r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
-    r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500;
+    r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500; r5s.resolver_va = 0x085b7860;
 
     /* Table QuickFill (Insert Table -> "Extend the pattern in the current selection"):
        guard the code-stream parser's copy at 0x08430205 (orig: call FUN_085c5dd0). */
@@ -3104,6 +3153,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     if (r5_skin) takeoverWP80();
     r5_apply_allfonts();
     r5_install_injection();
+    r5_install_resolver_hook();
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -3281,11 +3331,12 @@ static void applyWp8_1_Fixes(void) {
     r5s.glyphtab_get = (unsigned (*)(void))0x08539db8;
     r5s.sel_filter_jne = 0x08538408; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4d;
     r5s.fontrec_cap = 0x088281c4; r5s.remap_arr = 0x088281d8; r5s.remap_cap = 0x088281dc;
-    r5s.freecode = 0x087da1da; r5s.builder_va = 0x08538b6c;
+    r5s.freecode = 0x087da1da; r5s.builder_va = 0x08538b6c; r5s.resolver_va = 0x0853803c;
     /* 8.1 doc-font port (static-X). Motif appearance reskin not yet ported. */
     takeoverWP81();
     r5_apply_allfonts();
     r5_install_injection();
+    r5_install_resolver_hook();
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
