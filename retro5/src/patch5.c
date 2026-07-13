@@ -278,8 +278,8 @@ static int r5_text_active;
  * binaries hand us a table of absolute VAs instead, and everything above this line stays identical.
  * That is the whole reason this is a vtable and not a pile of direct calls. */
 typedef struct {
-    uintptr_t CreateGC, SetLineAttributes, DrawSegments, DrawPoints, DrawLines,
-              FillRectangle, AllocColor, GetGCValues, QueryColor, GetGeometry,
+    uintptr_t CreateGC, SetLineAttributes, SetDashes, DrawSegments, DrawPoints, DrawLines,
+              DrawRectangle, FillRectangle, AllocColor, GetGCValues, QueryColor, GetGeometry,
               CopyArea, CopyPlane, XtDisplayOfObject, XtWindowOfObject;
 } R5XSyms;
 
@@ -287,9 +287,11 @@ static struct {
     int      ready;                 /* 0 = untried, 1 = usable, -1 = unavailable */
     GC     (*CreateGC)(Display *, Drawable, unsigned long, XGCValues *);
     int    (*SetLineAttributes)(Display *, GC, unsigned, int, int, int);
+    int    (*SetDashes)(Display *, GC, int, const char *, int);
     int    (*DrawSegments)(Display *, Drawable, GC, XSegment *, int);
     int    (*DrawPoints)(Display *, Drawable, GC, XPoint *, int, int);
     int    (*DrawLines)(Display *, Drawable, GC, XPoint *, int, int);
+    int    (*DrawRectangle)(Display *, Drawable, GC, int, int, unsigned, unsigned);
     int    (*FillRectangle)(Display *, Drawable, GC, int, int, unsigned, unsigned);
     Status (*AllocColor)(Display *, Colormap, XColor *);
     Status (*GetGCValues)(Display *, GC, unsigned long, XGCValues *);
@@ -322,8 +324,10 @@ static int r5_xlib(void) {
     if (r5x.ready) return r5x.ready > 0;
     r5x.ready = -1;                                       /* try once; never retry on failure */
     if (r5_xsyms) {                                       /* static host: absolute addresses */
-        if (R5_ADDR(CreateGC) && R5_ADDR(SetLineAttributes) && R5_ADDR(DrawSegments) &&
-            R5_ADDR(DrawPoints) && R5_ADDR(DrawLines) && R5_ADDR(FillRectangle) &&
+        if (R5_ADDR(CreateGC) && R5_ADDR(SetLineAttributes) && R5_ADDR(SetDashes) &&
+            R5_ADDR(DrawSegments) &&
+            R5_ADDR(DrawPoints) && R5_ADDR(DrawLines) && R5_ADDR(DrawRectangle) &&
+            R5_ADDR(FillRectangle) &&
             R5_ADDR(AllocColor) && R5_ADDR(GetGCValues) && R5_ADDR(QueryColor) &&
             R5_ADDR(GetGeometry) && R5_ADDR(CopyArea) && R5_ADDR(CopyPlane) &&
             R5_ADDR(XtDisplayOfObject) && R5_ADDR(XtWindowOfObject))
@@ -331,9 +335,11 @@ static int r5_xlib(void) {
     } else {                                              /* dynamic host: resolve by name */
         if (R5_SYM(CreateGC,          "XCreateGC")          &&
             R5_SYM(SetLineAttributes, "XSetLineAttributes") &&
+            R5_SYM(SetDashes,         "XSetDashes")         &&
             R5_SYM(DrawSegments,      "XDrawSegments")      &&
             R5_SYM(DrawPoints,        "XDrawPoints")        &&
             R5_SYM(DrawLines,         "XDrawLines")         &&
+            R5_SYM(DrawRectangle,     "XDrawRectangle")     &&
             R5_SYM(FillRectangle,     "XFillRectangle")     &&
             R5_SYM(AllocColor,        "XAllocColor")        &&
             R5_SYM(GetGCValues,       "XGetGCValues")       &&
@@ -617,22 +623,32 @@ void retro5_XmDrawSeparator(Display *dpy, Drawable d, GC top_gc, GC bottom_gc, G
     r5x.DrawSegments(dpy, d, gc, &s, 1);
 }
 
-/* _XmDrawHighlight — the focus/arm border. Motif draws a heavy solid box (highlightThickness deep,
- * usually black); ours is a 1px rounded ring.
- *
- * We draw with the GC MOTIF PASSED, not a palette GC of our own, and that is load-bearing: Motif
- * *erases* a highlight by calling this same function again with the widget's BACKGROUND gc. Impose
- * our own color and every unfocused widget keeps a permanent ring. Honoring hl_gc preserves the
- * draw/erase pairing exactly — the erase repaints the identical rounded path in the background
- * color — and leaves the ring's COLOR where it belongs: retroXt's `highlightColor` resource, which
- * feeds this GC. cdecl (dpy, d, gc, x, y, w, h, thickness, line_style) — 9 args. */
+/* _XmDrawHighlight — the focus indicator. Motif draws a heavy solid box (highlightThickness deep,
+ * usually black) around the widget; we draw the modern equivalent — a thin DOTTED rectangle inset
+ * just inside the widget edge. Motif calls this on every focus change (BorderHighlight /
+ * BorderUnhighlight), passing the highlight GC to DRAW and the widget-background GC to ERASE, so by
+ * drawing with hl_gc we inherit that pairing exactly: focus-on paints the dotted ring in the
+ * highlight color, focus-off repaints the identical path in the background (erasing it). We
+ * temporarily set dashes on hl_gc and restore solid afterward. cdecl (dpy, d, gc, x, y, w, h,
+ * thickness, line_style) — 9 args. */
 void retro5_XmDrawHighlight(Display *dpy, Drawable d, GC hl_gc,
                             int x, int y, int w, int h, int thickness, int line_style) {
+    static const char dots[2] = { 1, 2 };                 /* 1 on, 2 off -> fine dotted */
+    int inset = thickness > 1 ? thickness : 2;
+    int rx, ry, rw, rh;
     (void)line_style;
     if (thickness <= 0 || w <= 0 || h <= 0) return;       /* nothing asked for -> nothing drawn */
     if (!dpy || !d || !hl_gc) return;
     if (!r5_xlib()) return;
-    r5_round_rect(dpy, d, hl_gc, x, y, w, h);
+
+    rx = x + inset; ry = y + inset;
+    rw = w - 1 - 2 * inset; rh = h - 1 - 2 * inset;
+    if (rw < 3 || rh < 3) { rx = x; ry = y; rw = w - 1; rh = h - 1; }  /* too small -> full edge */
+
+    r5x.SetLineAttributes(dpy, hl_gc, 1, LineOnOffDash, CapButt, JoinMiter);
+    r5x.SetDashes(dpy, hl_gc, 0, dots, 2);
+    r5x.DrawRectangle(dpy, d, hl_gc, rx, ry, (unsigned)rw, (unsigned)rh);
+    r5x.SetLineAttributes(dpy, hl_gc, 1, LineSolid, CapButt, JoinMiter);  /* leave it as Motif expects */
 }
 
 /* ======================================================================================= *
@@ -1061,7 +1077,7 @@ static int r5_draw_text(Display *dpy, Drawable d, GC gc, int x, int y,
     r5_dpy = dpy;                                        /* stash for the no-Display metrics calls */
     r5_bind_helpers();
     if (!r5_XGetGCValues || !r5_XGetGCValues(dpy, gc,
-            GCFont | GCForeground | GCBackground, &gv)) return 0;
+            GCFont | GCForeground | GCBackground | GCFillStyle, &gv)) return 0;
     if (!(fnt = r5_font_get(dpy, gv.font)) || fnt->passthrough) return 0;   /* symbol font -> X */
     if (!r5x.GetGeometry(dpy, d, &root, &gx, &gy, &gw, &gh, &gbw, &gdep)) return 0;
 
@@ -1090,6 +1106,15 @@ static int r5_draw_text(Display *dpy, Drawable d, GC gc, int x, int y,
         cz.fill(cr);
     }
     r5_pixel_rgb(dpy, gv.foreground, &fr, &fg, &fb);
+    /* Disabled (insensitive) text: Motif renders it by STIPPLING the label GC (fill_style
+     * FillStippled/FillOpaqueStippled) so only ~half the glyph pixels land, giving a dimmed look.
+     * Our solid cairo glyphs ignore the stipple, so disabled text came out identical to enabled.
+     * Reproduce the dim by blending the foreground halfway to the background instead. */
+    if (gv.fill_style == FillStippled || gv.fill_style == FillOpaqueStippled) {
+        double br, bgc, bb;
+        r5_pixel_rgb(dpy, gv.background, &br, &bgc, &bb);
+        fr = fr * 0.5 + br * 0.5; fg = fg * 0.5 + bgc * 0.5; fb = fb * 0.5 + bb * 0.5;
+    }
     cz.set_source_rgb(cr, fr, fg, fb);
     cz.move_to(cr, x, y);                                /* X (x,y) is the glyph baseline */
     cz.show_text(cr, buf);
