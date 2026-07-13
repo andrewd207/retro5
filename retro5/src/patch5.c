@@ -1997,21 +1997,6 @@ static void r5_take_highlight(void *w) {
     }
 }
 
-/* Give a window a None background so the server never auto-fills it. WP hot-tracks toolbar buttons
- * on hover by calling XtVaSetValues on enter/leave; when the widget's set_values asks for redisplay,
- * Xt runs XClearArea(win, 0,0,0,0, exposures=True) — which clears the WHOLE window to its (grey)
- * background and then generates an Expose. That grey clear is a visible flash before our expose
- * repaints (confirmed by gdb backtrace: XClearArea <- XtSetValues <- XtVaSetValues <- WP enter/leave).
- * Per the X spec, XClearArea on a None-background window changes NO contents but still generates the
- * exposures, so our expose redraws over the intact previous frame: the Expose survives, the flash
- * does not. We do this only for buttons we fully own (below), never for widgets handed back to Motif. */
-static int (*r5_XSetWindowBackgroundPixmap)(Display *, Window, Pixmap);
-static void r5_win_no_autoclear(Display *dpy, Window win) {
-    if (!r5_XSetWindowBackgroundPixmap)
-        *(void **)&r5_XSetWindowBackgroundPixmap = r5_realsym("XSetWindowBackgroundPixmap");
-    if (r5_XSetWindowBackgroundPixmap) r5_XSetWindowBackgroundPixmap(dpy, win, (Pixmap)None);
-}
-
 /* Paint a Label-derived button end to end: face, border, icon. Nothing of Motif's drawing survives
  * — we do not call the original — so the appearance is entirely ours, including the icon blit.
  *
@@ -2086,7 +2071,6 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
      * screen until the single commit. */
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
     dst = cv.buf;
-    r5_win_no_autoclear(dpy, win);                        /* kill the grey enter/leave clear flash */
 
     /* 1. face. Filling is safe here (unlike inside _XmDrawShadows) precisely because we own the
      *    order: the icon has not been drawn yet — we draw it, below, on top. */
@@ -2140,65 +2124,6 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
     if (r5_orig_pushbutton_expose) r5_orig_pushbutton_expose(w, ev, region);
     retro5_round_widget(w);
 }
-
-/* ---- menu items (Motif GADGETS) ----
- * Dropdown menu entries are windowless gadgets drawn into the menu-pane window. At rest a menu
- * PushButton/Cascade/Label gadget's Redisplay draws ONLY its label (no background fill, no shadows —
- * verified in Motif 1.2.4 PushBG.c), so the transparent antialiased text our cairo XDrawString hook
- * produces STACKS and darkens when the gadget is redrawn more than once — the "bold / double-drawn"
- * look. Fix: own the gadget expose and double-buffer it. Gadget `expose` is at class_rec+68, same as
- * a widget (RectObjClassPart is laid out to match CoreClassPart), so the same patch_method works.
- *
- * A gadget has no window; it draws at its RectObj (x,y) INTO the pane window (XtWindowOfObject). So
- * we back-buffer at PANE size (same coordinate space), fill just this gadget's row with the pane
- * background, redirect the label text into the buffer (reusing Motif's exact string/accelerator
- * layout via r5_redir), then blit only the gadget's rect — one clean, single-strength frame. */
-static int r5_in_menu_gadget;
-static void (*r5_orig_pbg_expose)(void *, XEvent *, Region);   /* XmPushButtonGadget */
-static void (*r5_orig_cbg_expose)(void *, XEvent *, Region);   /* XmCascadeButtonGadget */
-static void (*r5_orig_lg_expose)(void *, XEvent *, Region);    /* XmLabelGadget */
-
-static void r5_menu_gadget_paint(void *g, XEvent *ev, Region region,
-                                 void (*orig)(void *, XEvent *, Region)) {
-    Display *dpy; Window win, root;
-    int rx, ry, x, y;
-    unsigned pw, ph, bw, dep, w, h;
-    unsigned long bg = 0xd3d3d3;
-    void *parent;
-    R5Canvas cv;
-    GC face;
-
-    if (r5_in_menu_gadget || !r5_skin || !g || !r5_cairo() || !r5_xlib()) goto fallback;
-    dpy = r5x.XtDisplayOfObject(g);
-    win = r5x.XtWindowOfObject(g);                        /* the shared menu-pane window */
-    if (!dpy || !win) goto fallback;
-    x = *(short *)((char *)g + 24);                       /* RectObj x, y (Position = short) */
-    y = *(short *)((char *)g + 26);
-    w = *(unsigned short *)((char *)g + 28);              /* width, height (Dimension = ushort) */
-    h = *(unsigned short *)((char *)g + 30);
-    if (w < 2 || h < 2) goto fallback;
-    if (!r5x.GetGeometry(dpy, win, &root, &rx, &ry, &pw, &ph, &bw, &dep)) goto fallback;
-    parent = *(void **)((char *)g + 8);                   /* ObjectPart.parent = the menu pane */
-    r5_bg_pixel(parent, &bg);
-
-    if (!r5_canvas_begin(&cv, dpy, win, pw, ph)) goto fallback;   /* pane-sized: window coord space */
-    face = r5_gc_for_pixel(dpy, cv.buf, bg);
-    if (face) r5x.FillRectangle(dpy, cv.buf, face, x, y, (unsigned)w, (unsigned)h);  /* fresh face */
-
-    r5_redir_from = win; r5_redir_to = cv.buf;            /* Motif's label text lands in the buffer */
-    r5_in_menu_gadget = 1;
-    if (orig) orig(g, ev, region);
-    r5_in_menu_gadget = 0;
-    r5_redir_from = 0; r5_redir_to = 0;
-
-    r5_canvas_commit(&cv, x, y, (unsigned)w, (unsigned)h);         /* blit just this item, once */
-    return;
-fallback:
-    if (orig) orig(g, ev, region);
-}
-void retro5_PBGadgetExpose(void *g, XEvent *ev, Region r) { r5_menu_gadget_paint(g, ev, r, r5_orig_pbg_expose); }
-void retro5_CBGadgetExpose(void *g, XEvent *ev, Region r) { r5_menu_gadget_paint(g, ev, r, r5_orig_cbg_expose); }
-void retro5_LGadgetExpose(void *g, XEvent *ev, Region r)  { r5_menu_gadget_paint(g, ev, r, r5_orig_lg_expose); }
 
 /* ---- bigger icon toolbar buttons under the UI scale ----
  * An XmDrawnButton with a pixmap sizes itself in Motif's XmLabel SetSize: core = TextRect(pixmap) +
@@ -2609,14 +2534,6 @@ static void takeoverWP80(void) {
           (void **)&r5_orig_pushbutton_expose,  "XmPushButton"  },   /* dialog buttons  */
         { 0x087d1ae8, 0x08695968, retro5_ToggleButtonExpose,
           (void **)&r5_orig_toggle_expose,      "XmToggleButton" }, /* radio + checkbox */
-        /* menu items (gadgets): double-buffer the label so it stops double-drawing bold. Class
-         * records + expose fns found live; expose is at +68 like widgets (RectObjClassPart). */
-        { 0x087cfecc, 0x08670160, retro5_PBGadgetExpose,
-          (void **)&r5_orig_pbg_expose,         "XmPushButtonGadget" },
-        { 0x087cba8c, 0x0863e2c4, retro5_CBGadgetExpose,
-          (void **)&r5_orig_cbg_expose,         "XmCascadeButtonGadget" },
-        { 0x087ce96c, 0x086599ac, retro5_LGadgetExpose,
-          (void **)&r5_orig_lg_expose,          "XmLabelGadget" },
     };
     /* Text. We take over the font LOAD (XLoadQueryFont/XQueryFont) to rewrite each font's width
        metrics to our cairo advances — after which WP's OWN XTextWidth/XTextExtents return cairo
