@@ -244,6 +244,13 @@ void retro5_guarded_XtVaGetValues(void *w, ...) {
                                      * (the toolbar group separators did — #d2d6db was ~invisible). */
 #define R5_COL_GLYPH    0x5a6270u   /* arrow chevrons — soft slate, never black             */
 #define R5_COL_PRESS    0xccd4e0u   /* pressed/latched button FACE — only ownable from expose */
+#define R5_COL_ACCENT   0x3a7bd5u   /* selected/checked indicator fill — the one saturated color */
+#define R5_COL_WHITE    0xffffffu   /* unchecked indicator interior + the checkmark            */
+
+/* 0xRRGGBB -> cairo's 0..1 doubles */
+#define R5_RD(c) (((double)(((c) >> 16) & 0xff)) / 255.0)
+#define R5_GD(c) (((double)(((c) >>  8) & 0xff)) / 255.0)
+#define R5_BD(c) (((double)( (c)        & 0xff)) / 255.0)
 
 enum { R5_GC_EDGE, R5_GC_SUNK, R5_GC_SUNK_IN, R5_GC_HAIRLINE, R5_GC_GLYPH, R5_GC_PRESS, R5_GC_N };
 static const uint32_t R5_RGB[R5_GC_N] = {
@@ -510,21 +517,26 @@ void retro5_XmDrawShadows(Display *dpy, Drawable d, GC top_gc, GC bottom_gc,
     GC gc;
     int sunk;
     const char *cls;
+    void *cw;
     if (thickness <= 0 || w <= 0 || h <= 0) return;       /* Motif asks for nothing -> draw nothing */
     if (!dpy || !d) return;
     if (!r5_xlib()) return;
 
     sunk = r5_sunken(dpy, top_gc, bottom_gc, type);
-    cls  = r5_widget_class(r5_caller_widget());           /* who is being painted? */
-
+    cw   = r5_caller_widget();                            /* who is being painted? */
+    cls  = r5_widget_class(cw);
     if (r5_trace) {
-        char b[200];
+        char b[220];
+        void *ccls = cw ? *(void **)((char *)cw + 4) : 0;
+        void *exp  = (ccls && !range_unmapped((char *)ccls + R5_EXPOSE_OFF, 4))
+                     ? *(void **)((char *)ccls + R5_EXPOSE_OFF) : 0;
         int n = snprintf(b, sizeof b,
-                         "shadow %-22s w=%3d h=%3d thick=%d type=%u sunk=%2d\n",
-                         cls ? cls : "(unknown)", w, h, thickness, type, sunk);
+                         "shadow %-22s w=%3d h=%3d thick=%d type=%u sunk=%2d class=%p expose=%p\n",
+                         cls ? cls : "(unknown)", w, h, thickness, type, sunk, ccls, exp);
         if (n > 0) write(2, b, (size_t)n);
     }
 
+    (void)cw;
     if (sunk == 1) {                                      /* pressed / latched / recessed */
         r5_inset(dpy, d, x, y, w, h);
         return;
@@ -780,8 +792,16 @@ static struct {
     void (*surface_flush)(cairo_surface_t *);
     void (*set_source_rgb)(cairo_t *, double, double, double);
     void (*move_to)(cairo_t *, double, double);
+    void (*line_to)(cairo_t *, double, double);
     void (*rectangle)(cairo_t *, double, double, double, double);
+    void (*arc)(cairo_t *, double, double, double, double, double);
+    void (*new_sub_path)(cairo_t *);
+    void (*close_path)(cairo_t *);
     void (*fill)(cairo_t *);
+    void (*stroke)(cairo_t *);
+    void (*set_line_width)(cairo_t *, double);
+    void (*set_line_cap)(cairo_t *, cairo_line_cap_t);
+    void (*set_line_join)(cairo_t *, cairo_line_join_t);
     void (*select_font_face)(cairo_t *, const char *, cairo_font_slant_t, cairo_font_weight_t);
     void (*set_font_size)(cairo_t *, double);
     void (*show_text)(cairo_t *, const char *);
@@ -810,7 +830,11 @@ static int r5_cairo_load(void) {
           CZ(create, "cairo_create") && CZ(destroy, "cairo_destroy") &&
           CZ(surface_destroy, "cairo_surface_destroy") && CZ(surface_flush, "cairo_surface_flush") &&
           CZ(set_source_rgb, "cairo_set_source_rgb") && CZ(move_to, "cairo_move_to") &&
-          CZ(rectangle, "cairo_rectangle") && CZ(fill, "cairo_fill") &&
+          CZ(line_to, "cairo_line_to") && CZ(rectangle, "cairo_rectangle") &&
+          CZ(arc, "cairo_arc") && CZ(new_sub_path, "cairo_new_sub_path") &&
+          CZ(close_path, "cairo_close_path") && CZ(fill, "cairo_fill") &&
+          CZ(stroke, "cairo_stroke") && CZ(set_line_width, "cairo_set_line_width") &&
+          CZ(set_line_cap, "cairo_set_line_cap") && CZ(set_line_join, "cairo_set_line_join") &&
           CZ(select_font_face, "cairo_select_font_face") && CZ(set_font_size, "cairo_set_font_size") &&
           CZ(show_text, "cairo_show_text") && CZ(text_extents, "cairo_text_extents") &&
           CZ(status, "cairo_status")))
@@ -1047,20 +1071,25 @@ static int r5_draw_text(Display *dpy, Drawable d, GC gc, int x, int y,
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
 
-    if (image) {                                         /* XDrawImageString owns its background */
-        r5_pixel_rgb(dpy, gv.background, &fr, &fg, &fb);
-        (void)fs;
-        r5_cairo_font(cr, fnt);
-        { cairo_text_extents_t te; char mb[1100];
-          r5_latin1_utf8(s, len > 500 ? 500 : len, mb, sizeof mb);
-          cz.text_extents(cr, mb, &te);
-          cz.set_source_rgb(cr, fr, fg, fb);
-          cz.rectangle(cr, x, y - fnt->size, te.x_advance + 2, fnt->size * 1.3);
-          cz.fill(cr); }
-    }
-    r5_latin1_utf8(s, len > 500 ? 500 : len, buf, sizeof buf);
-    r5_pixel_rgb(dpy, gv.foreground, &fr, &fg, &fb);
+    /* Clear the glyph box to the GC background on EVERY draw — for plain XDrawString too, not just
+     * XDrawImageString. Plain XDrawString is transparent in X, but WP redraws chrome labels in
+     * place (toggle/radio items repaint on every arm and focus change, and Motif double-draws text
+     * one pixel offset to fake bold), and compositing antialiased cairo glyphs over the previous
+     * pass makes the text pile up and darken (very visible on radio/checkbox labels). Establishing
+     * an opaque background first makes each draw idempotent. For chrome the GC background equals the
+     * widget's own background, so the fill is invisible; it only removes the accumulation. */
+    (void)fs; (void)image;
     r5_cairo_font(cr, fnt);
+    r5_latin1_utf8(s, len > 500 ? 500 : len, buf, sizeof buf);
+    {
+        cairo_text_extents_t te;
+        cz.text_extents(cr, buf, &te);
+        r5_pixel_rgb(dpy, gv.background, &fr, &fg, &fb);
+        cz.set_source_rgb(cr, fr, fg, fb);
+        cz.rectangle(cr, x - 1, y - fnt->size, te.x_advance + 3, fnt->size * 1.35);
+        cz.fill(cr);
+    }
+    r5_pixel_rgb(dpy, gv.foreground, &fr, &fg, &fb);
     cz.set_source_rgb(cr, fr, fg, fb);
     cz.move_to(cr, x, y);                                /* X (x,y) is the glyph baseline */
     cz.show_text(cr, buf);
@@ -1417,6 +1446,132 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
     retro5_round_widget(w);
 }
 
+/* ---- radio / checkbox indicators, drawn with cairo (antialiased) ----
+ * This REPLACES Motif's DrawToggle (the function that draws the indicator, called from expose AND
+ * from every arm/select/disarm redraw). So the indicator is 100% ours on every path — Motif never
+ * draws it, which is why there is no flicker and no click artifact (mixing our drawing with Motif's
+ * on the same element is the thing that goes badly; here Motif draws none of it). Motif's expose
+ * still paints the widget background + label (label glyphs via our cairo text hook); DrawToggle
+ * only ever drew the indicator, so replacing it leaves those intact.
+ *
+ * cdecl (Widget w) — 1 arg, plain ret, verified. XmNindicatorType picks the shape (XmONE_OF_MANY=2
+ * -> circle, XmN_OF_MANY=1 -> square); XmNset picks filled vs empty. Geometry mirrors Motif: the
+ * cell is at highlightThickness+shadowThickness+marginWidth, the drawn indicator is clamped to the
+ * widget height (Motif draws well under indicatorSize) and centered in the cell. */
+void retro5_DrawToggle(void *w) {
+    Display *dpy;
+    Window win, root;
+    unsigned int ww, hh, bwid, dep;
+    int wx, wy, x, y, sz;
+    cairo_surface_t *sf;
+    cairo_t *cr;
+    R5Arg a[7];
+    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, dim = 0, height = 0, edge;
+    unsigned long bg = 0xd3d3d3;
+    double cx, cy, r;
+
+    if (!r5_skin || !w || !r5_cairo()) return;
+    dpy = r5x.XtDisplayOfObject(w);
+    win = r5x.XtWindowOfObject(w);
+    if (!dpy || !win) return;
+    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bwid, &dep)) return;
+
+    a[0].name = (char *)"set";                a[0].value = (long)&set;
+    a[1].name = (char *)"indicatorType";      a[1].value = (long)&itype;
+    a[2].name = (char *)"highlightThickness"; a[2].value = (long)&hlt;
+    a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
+    a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
+    a[5].name = (char *)"indicatorSize";      a[5].value = (long)&dim;
+    a[6].name = (char *)"background";         a[6].value = (long)&bg;
+    r5_get(w, a, 7);
+
+    /* Dimension resources are 16-bit; mask off any high-word garbage. */
+    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff; dim &= 0xffff;
+    height = (long)hh;
+    if (dim <= 0 || dim >= 0xffff) dim = 13;
+    /* Size the indicator from the widget height so it scales with the font (Motif grows the toggle
+     * with the font). Fill most of the usable height for a modern look, but stay inside the cell
+     * Motif reserved (indicatorSize) so the label — placed by Motif after that cell — is never
+     * clipped. */
+    edge = height - 2 * (hlt + st);
+    if (edge > 13) edge = 13;                            /* Motif's label sits close; stay clear of it */
+    if (edge < 10) edge = 10;
+    sz = (int)edge;
+    /* Hug the widget's left edge (drop the highlight margin) so a clear gap opens before the label,
+     * which Motif has already placed for its own smaller indicator and which we don't move. */
+    x  = (int)(st + mw);
+    y  = (int)((height - edge) / 2);
+    if (sz < 6 || x < 0 || y < 0) return;
+
+    sf = cz.xlib_surface_create(dpy, win, DefaultVisual(dpy, DefaultScreen(dpy)), (int)ww, (int)hh);
+    if (!sf) return;
+    cr = cz.create(sf);
+    if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return; }
+
+    /* clear the indicator cell to the widget background — erases Motif's own indicator underneath */
+    cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));
+    cz.rectangle(cr, x - 1, y - 1, sz + 2, sz + 2);
+    cz.fill(cr);
+    cz.set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cz.set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
+    cx = x + sz / 2.0; cy = y + sz / 2.0;
+
+    if ((itype & 0xff) == 2) {                           /* XmONE_OF_MANY -> radio circle */
+        r = sz / 2.0 - 1.5;
+        cz.new_sub_path(cr);
+        cz.arc(cr, cx, cy, r, 0, 6.2832);
+        cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE), R5_GD(R5_COL_WHITE), R5_BD(R5_COL_WHITE));
+        cz.fill(cr);
+        cz.new_sub_path(cr);
+        cz.arc(cr, cx, cy, r, 0, 6.2832);
+        cz.set_line_width(cr, 1.3);
+        cz.set_source_rgb(cr, R5_RD(R5_COL_EDGE), R5_GD(R5_COL_EDGE), R5_BD(R5_COL_EDGE));
+        cz.stroke(cr);
+        if (set) {                                       /* filled accent dot */
+            cz.new_sub_path(cr);
+            cz.arc(cr, cx, cy, r * 0.48, 0, 6.2832);
+            cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT));
+            cz.fill(cr);
+        }
+    } else {                                             /* XmN_OF_MANY -> checkbox square */
+        double bx = x + 1.0, by = y + 1.0, bs = sz - 2.0, rr = 2.5;
+        /* rounded-square path */
+        cz.new_sub_path(cr);
+        cz.arc(cr, bx + bs - rr, by + rr,      rr, -1.5708, 0);
+        cz.arc(cr, bx + bs - rr, by + bs - rr, rr, 0,       1.5708);
+        cz.arc(cr, bx + rr,      by + bs - rr, rr, 1.5708,  3.1416);
+        cz.arc(cr, bx + rr,      by + rr,      rr, 3.1416,  4.7124);
+        cz.close_path(cr);
+        if (set) { cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT)); }
+        else     { cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE),  R5_GD(R5_COL_WHITE),  R5_BD(R5_COL_WHITE)); }
+        cz.fill(cr);
+        /* outline: same path again */
+        cz.new_sub_path(cr);
+        cz.arc(cr, bx + bs - rr, by + rr,      rr, -1.5708, 0);
+        cz.arc(cr, bx + bs - rr, by + bs - rr, rr, 0,       1.5708);
+        cz.arc(cr, bx + rr,      by + bs - rr, rr, 1.5708,  3.1416);
+        cz.arc(cr, bx + rr,      by + rr,      rr, 3.1416,  4.7124);
+        cz.close_path(cr);
+        cz.set_line_width(cr, 1.3);
+        if (set) { cz.set_source_rgb(cr, R5_RD(R5_COL_ACCENT), R5_GD(R5_COL_ACCENT), R5_BD(R5_COL_ACCENT)); }
+        else     { cz.set_source_rgb(cr, R5_RD(R5_COL_EDGE),   R5_GD(R5_COL_EDGE),   R5_BD(R5_COL_EDGE)); }
+        cz.stroke(cr);
+        if (set) {                                       /* white checkmark */
+            cz.new_sub_path(cr);
+            cz.move_to(cr, bx + bs * 0.24, by + bs * 0.52);
+            cz.line_to(cr, bx + bs * 0.44, by + bs * 0.72);
+            cz.line_to(cr, bx + bs * 0.78, by + bs * 0.28);
+            cz.set_line_width(cr, 1.6);
+            cz.set_source_rgb(cr, R5_RD(R5_COL_WHITE), R5_GD(R5_COL_WHITE), R5_BD(R5_COL_WHITE));
+            cz.stroke(cr);
+        }
+    }
+    cz.surface_flush(sf);
+    cz.destroy(cr);
+    cz.surface_destroy(sf);
+}
+
 /* ======================================================================================= *
  *  Per-binary fix routines — each concentrated, self-contained, and obvious
  * ======================================================================================= */
@@ -1459,6 +1614,7 @@ static void takeoverWP80(void) {
         { 0x086bf600, "\x55\x89\xe5\x83\xec\x58", 6, retro5_XmDrawArrow     },  /* chevrons   */
         { 0x086bebf8, "\x55\x89\xe5\x83\xec\x6c", 6, retro5_XmDrawSeparator },  /* hairlines  */
         { 0x086bf468, "\x55\x89\xe5\x83\xec\x2c", 6, retro5_XmDrawHighlight },  /* focus ring */
+        { 0x08695018, "\x55\x89\xe5\x83\xec\x0c", 6, retro5_DrawToggle      },  /* radio+check indicator */
     };
     /* Widget class methods. class_rec + expected current expose fn (read live off the running
        binary's class records — see MOTIF-DRAW-TAKEOVER-PLAN.md). */
