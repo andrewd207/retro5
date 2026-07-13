@@ -2399,14 +2399,28 @@ static double r5_doc_pixsize(void) {
     return 0.0;                                          /* no doc run size -> let WP draw it */
 }
 
-static const char *r5_face_to_family(const char *face, int *slant, int *weight) {
+/* Map a WP face name -> cairo family, deriving slant/weight from style suffixes. Also sets *symbolic
+ * for faces cairo cannot render from a raw WP byte: symbol/pi/dingbat fonts and non-Latin scripts use
+ * a font-specific encoding, so feeding cairo the byte as Latin would draw the wrong glyph (the "N"
+ * bug). Those pass through to WP's native blit until we build per-encoding->Unicode maps. */
+static const char *r5_face_to_family(const char *face, int *slant, int *weight, int *symbolic) {
     char b[128]; int n = 0; const char *p, *base;
-    *slant = CAIRO_FONT_SLANT_NORMAL; *weight = CAIRO_FONT_WEIGHT_NORMAL;
+    *slant = CAIRO_FONT_SLANT_NORMAL; *weight = CAIRO_FONT_WEIGHT_NORMAL; *symbolic = 0;
     if (!face || !*face) return "Serif";
     for (base = face, p = face; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;   /* basename */
     for (n = 0; base[n] && n < (int)sizeof b - 1; n++)
         b[n] = (base[n] >= 'A' && base[n] <= 'Z') ? base[n] + 32 : base[n];
     b[n] = 0;
+    /* Symbol / pi / dingbat / iconic + non-Latin scripts: cairo-from-byte is wrong -> passthrough. */
+    if (strstr(b,"symbol")||strstr(b,"dingbat")||strstr(b,"iconic")||strstr(b,"wingding")
+        ||strstr(b,"webding")||strstr(b,"boxdraw")||strstr(b,"phonetic")||strstr(b,"mathext")
+        ||strstr(b,"wpmath")||strstr(b,"wpicon")||strstr(b,"zapf")||strstr(b,"wpmex")
+        ||strstr(b,"greek")||strstr(b,"cyrillic")||strstr(b,"hebrew")||strstr(b,"arabic")
+        ||strstr(b,"japan")||strstr(b,"hiragana")||strstr(b,"katakana")||strstr(b,"hangul")
+        ||strstr(b,"thai")||strstr(b,"sihafa")) {
+        *symbolic = 1;
+        return "Serif";                                  /* family unused; caller passes through */
+    }
     if (strstr(b,"italic") || strstr(b,"oblique")) *slant = CAIRO_FONT_SLANT_ITALIC;
     if (strstr(b,"bold") || strstr(b,"demi") || strstr(b,"black") || strstr(b,"heavy"))
         *weight = CAIRO_FONT_WEIGHT_BOLD;
@@ -2436,23 +2450,26 @@ static const char *r5_doc_face(void) {
 
 /* Family + slant/weight for the current document run, cached by the metric-struct pointer (which
  * changes on every face/size/attribute switch). */
-static struct { unsigned key; char fam[64]; int slant, weight; int has; } r5_doc_facecache;
-static const char *r5_doc_family(int *slant, int *weight) {
+static struct { unsigned key; char fam[64]; int slant, weight, symbolic; int has; } r5_doc_facecache;
+static const char *r5_doc_family(int *slant, int *weight, int *symbolic) {
     unsigned key = range_unmapped((void *)(uintptr_t)R5_METRIC_PTR, 4)
                  ? 0 : *(unsigned *)(uintptr_t)R5_METRIC_PTR;
     const char *face, *fam;
     if (r5_doc_facecache.has && r5_doc_facecache.key == key) {
         *slant = r5_doc_facecache.slant; *weight = r5_doc_facecache.weight;
+        *symbolic = r5_doc_facecache.symbolic;
         return r5_doc_facecache.fam;
     }
     face = r5_doc_face();
-    fam = r5_face_to_family(face, slant, weight);
+    fam = r5_face_to_family(face, slant, weight, symbolic);
     if (r5_trace) {
-        char m[192]; int k = snprintf(m, sizeof m, "retro5: doc face '%s' -> %s%s%s\n",
-            face ? face : "(none)", fam, *weight ? " bold" : "", *slant ? " italic" : "");
+        char m[192]; int k = snprintf(m, sizeof m, "retro5: doc face '%s' -> %s%s%s%s\n",
+            face ? face : "(none)", fam, *weight ? " bold" : "", *slant ? " italic" : "",
+            *symbolic ? " [symbol->native]" : "");
         if (k > 0) write(2, m, (size_t)k);
     }
     r5_doc_facecache.key = key; r5_doc_facecache.slant = *slant; r5_doc_facecache.weight = *weight;
+    r5_doc_facecache.symbolic = *symbolic;
     strncpy(r5_doc_facecache.fam, fam, sizeof r5_doc_facecache.fam - 1);
     r5_doc_facecache.fam[sizeof r5_doc_facecache.fam - 1] = 0; r5_doc_facecache.has = 1;
     return r5_doc_facecache.fam;
@@ -2491,10 +2508,11 @@ static void r5_doc_text_color(Display *dpy, GC gc, double *r, double *g, double 
  * height (a rough cap-height -> em). Face is matched from the current font record's .pfb (+0x10);
  * colour comes from the blit GC's foreground. */
 static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, unsigned h, unsigned char c) {
-    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight; double cr_, cg, cb;
-    const char *fam = r5_doc_family(&slant, &weight);
+    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight, symbolic; double cr_, cg, cb;
+    const char *fam = r5_doc_family(&slant, &weight, &symbolic);
     int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
     double sz = r5_doc_pixsize();
+    if (symbolic) return 0;                               /* symbol/pi/non-Latin -> WP's native glyph */
     if (sz <= 0) return 0;                                /* not a sized doc run -> WP draws it */
     if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
     if (penx < 0 || peny < 0 || penx > 20000 || peny > 20000) return 0;   /* sanity */
