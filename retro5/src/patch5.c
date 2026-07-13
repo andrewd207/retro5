@@ -1882,23 +1882,34 @@ static Pixmap r5_icon_render(Display *dpy, Window win, unsigned dep,
         if (*p == ':') for (p++; *p; p++) { if (*p=='b') bold=1; else if (*p=='i') ital=1; else if (*p=='u') under=1; }
         if (gi > 0) {
             cairo_text_extents_t te;
-            double fs = th * 0.80, gx, gy;
-            cz.select_font_face(cr, r5_family_for(0, 0),
-                                ital ? CAIRO_FONT_SLANT_ITALIC  : CAIRO_FONT_SLANT_NORMAL,
-                                bold ? CAIRO_FONT_WEIGHT_BOLD    : CAIRO_FONT_WEIGHT_NORMAL);
-            cz.set_font_size(cr, fs);
+            double fs, gx, gy;
+            const char *fam = r5_family_for(0, 0);
+            cairo_font_slant_t  sl = ital ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
+            cairo_font_weight_t wt = bold ? CAIRO_FONT_WEIGHT_BOLD  : CAIRO_FONT_WEIGHT_NORMAL;
+            /* Auto-fit: font SIZE != glyph INK (a cap fills ~0.7 of the em). Measure the ink at a
+             * reference size, then scale so the ink fills the target box — the glyph then reads at
+             * a consistent visual size whatever its cap-height/width, no hand-tuned multiplier. */
+            cz.select_font_face(cr, fam, sl, wt);
+            cz.set_font_size(cr, (double)th);                /* reference size */
             cz.text_extents(cr, glyph, &te);
-            gx = (tw - te.width) / 2.0 - te.x_bearing;       /* centre by ink box */
-            gy = (th - te.height) / 2.0 - te.y_bearing;
-            cz.set_source_rgb(cr, R5_RD(0x303030u), R5_GD(0x303030u), R5_BD(0x303030u));
-            cz.move_to(cr, gx, gy);
-            cz.show_text(cr, glyph);
-            if (under) {                                     /* underline bar just below the glyph */
-                double uw = te.width > 0 ? te.width : tw * 0.5;
-                cz.rectangle(cr, gx + te.x_bearing, gy + fs * 0.14, uw, fs * 0.09 + 1.0);
-                cz.fill(cr);
+            if (te.height > 0.5 && te.width > 0.5) {
+                double sh = (th * 0.66) / te.height;         /* fill ~66% of height ... */
+                double sw = (tw * 0.74) / te.width;          /* ... or 74% of width, whichever binds */
+                fs = (double)th * (sh < sw ? sh : sw);
+                cz.set_font_size(cr, fs);
+                cz.text_extents(cr, glyph, &te);             /* re-measure at the real size */
+                gx = (tw - te.width) / 2.0 - te.x_bearing;   /* centre by ink box */
+                gy = (th - te.height) / 2.0 - te.y_bearing;
+                cz.set_source_rgb(cr, R5_RD(0x303030u), R5_GD(0x303030u), R5_BD(0x303030u));
+                cz.move_to(cr, gx, gy);
+                cz.show_text(cr, glyph);
+                if (under) {                                 /* underline bar just below the glyph */
+                    double uh = fs * 0.09 + 1.0;
+                    cz.rectangle(cr, gx + te.x_bearing, gy + fs * 0.12, te.width, uh);
+                    cz.fill(cr);
+                }
+                drew = 1;
             }
-            drew = 1;
         }
     } else if (r5_ends_with(path, ".png")) {
         cairo_surface_t *img = cz.png_create(path);
