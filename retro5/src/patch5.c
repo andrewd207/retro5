@@ -280,7 +280,7 @@ static int r5_text_active;
 typedef struct {
     uintptr_t CreateGC, SetLineAttributes, SetDashes, DrawSegments, DrawPoints, DrawLines,
               DrawRectangle, FillRectangle, AllocColor, GetGCValues, QueryColor, GetGeometry,
-              CopyArea, CopyPlane, XtDisplayOfObject, XtWindowOfObject;
+              CopyArea, CopyPlane, CreatePixmap, FreePixmap, XtDisplayOfObject, XtWindowOfObject;
 } R5XSyms;
 
 static struct {
@@ -302,6 +302,8 @@ static struct {
                        unsigned, unsigned, int, int);
     int    (*CopyPlane)(Display *, Drawable, Drawable, GC, int, int,
                         unsigned, unsigned, int, int, unsigned long);
+    Pixmap (*CreatePixmap)(Display *, Drawable, unsigned, unsigned, unsigned);
+    int    (*FreePixmap)(Display *, Pixmap);
     Display *(*XtDisplayOfObject)(void *);
     Window   (*XtWindowOfObject)(void *);
 } r5x;
@@ -330,6 +332,7 @@ static int r5_xlib(void) {
             R5_ADDR(FillRectangle) &&
             R5_ADDR(AllocColor) && R5_ADDR(GetGCValues) && R5_ADDR(QueryColor) &&
             R5_ADDR(GetGeometry) && R5_ADDR(CopyArea) && R5_ADDR(CopyPlane) &&
+            R5_ADDR(CreatePixmap) && R5_ADDR(FreePixmap) &&
             R5_ADDR(XtDisplayOfObject) && R5_ADDR(XtWindowOfObject))
             r5x.ready = 1;
     } else {                                              /* dynamic host: resolve by name */
@@ -347,6 +350,8 @@ static int r5_xlib(void) {
             R5_SYM(GetGeometry,       "XGetGeometry")       &&
             R5_SYM(CopyArea,          "XCopyArea")          &&
             R5_SYM(CopyPlane,         "XCopyPlane")         &&
+            R5_SYM(CreatePixmap,      "XCreatePixmap")      &&
+            R5_SYM(FreePixmap,        "XFreePixmap")        &&
             R5_SYM(XtDisplayOfObject, "XtDisplayOfObject")  &&
             R5_SYM(XtWindowOfObject,  "XtWindowOfObject"))
             r5x.ready = 1;
@@ -1059,69 +1064,72 @@ static void r5_pixel_rgb(Display *dpy, unsigned long pixel, double *r, double *g
     else { *r = *g = *b = 0; }
 }
 
-/* The shared draw path for XDrawString / XDrawImageString. `image` fills the GC background first
- * (that is the only difference between the two X calls). Returns 1 if we rendered it. */
-static int r5_draw_text(Display *dpy, Drawable d, GC gc, int x, int y,
-                        const char *s, int len, int image) {
-    XGCValues gv;
-    XFontStruct *fs;
-    R5Font *fnt;
+/* XDrawString and XDrawImageString are TWO DIFFERENT X calls and we keep them as two functions,
+ * not one with a mode flag: their whole difference — the background — is exactly the thing each
+ * ought to own. What they genuinely share is plumbing (resolve the cairo font, read the GC, build a
+ * cairo context on the target drawable, transcode the bytes), and only that lives here.
+ *
+ * r5_text_setup returns 1 with *t populated — the caller draws, then MUST call r5_text_finish — or 0
+ * to fall back to real X. */
+typedef struct {
     cairo_surface_t *sf;
-    cairo_t *cr;
-    char buf[1100];
-    double fr, fg, fb;
-    Window root; int gx, gy; unsigned gw, gh, gbw, gdep;
+    cairo_t         *cr;
+    R5Font          *fnt;
+    XGCValues        gv;
+    char             buf[1100];
+} R5Text;
 
+/* The most recent font our text hook rendered, captured so the toggle expose can draw its OWN label
+ * in the identical font. That matters because Motif sized each toggle's width from that font's
+ * (rewritten-to-cairo) metrics — matching the font is what makes our label fit instead of clipping. */
+static R5Font r5_last_label;
+static int    r5_have_last_label;
+
+static int r5_text_setup(Display *dpy, Drawable d, GC gc, const char *s, int len, R5Text *t) {
+    Window root; int gx, gy; unsigned gw, gh, gbw, gdep;
+    t->sf = 0; t->cr = 0;
     if (!r5_skin || !r5_text_active || len <= 0 || !dpy || !d) return 0;   /* inert until main window up */
     if (!r5_xlib() || !r5_cairo()) return 0;
     r5_dpy = dpy;                                        /* stash for the no-Display metrics calls */
     r5_bind_helpers();
     if (!r5_XGetGCValues || !r5_XGetGCValues(dpy, gc,
-            GCFont | GCForeground | GCBackground | GCFillStyle, &gv)) return 0;
-    if (!(fnt = r5_font_get(dpy, gv.font)) || fnt->passthrough) return 0;   /* symbol font -> X */
+            GCFont | GCForeground | GCBackground | GCFillStyle, &t->gv)) return 0;
+    if (!(t->fnt = r5_font_get(dpy, t->gv.font)) || t->fnt->passthrough) return 0;  /* symbol -> X */
     if (!r5x.GetGeometry(dpy, d, &root, &gx, &gy, &gw, &gh, &gbw, &gdep)) return 0;
-
-    sf = cz.xlib_surface_create(dpy, d, DefaultVisual(dpy, DefaultScreen(dpy)),
-                                (int)gw, (int)gh);
-    if (!sf) return 0;
-    cr = cz.create(sf);
-    if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
-
-    /* Clear the glyph box to the GC background on EVERY draw — for plain XDrawString too, not just
-     * XDrawImageString. Plain XDrawString is transparent in X, but WP redraws chrome labels in
-     * place (toggle/radio items repaint on every arm and focus change, and Motif double-draws text
-     * one pixel offset to fake bold), and compositing antialiased cairo glyphs over the previous
-     * pass makes the text pile up and darken (very visible on radio/checkbox labels). Establishing
-     * an opaque background first makes each draw idempotent. For chrome the GC background equals the
-     * widget's own background, so the fill is invisible; it only removes the accumulation. */
-    (void)fs; (void)image;
-    r5_cairo_font(cr, fnt);
-    r5_latin1_utf8(s, len > 500 ? 500 : len, buf, sizeof buf);
-    {
-        cairo_text_extents_t te;
-        cz.text_extents(cr, buf, &te);
-        r5_pixel_rgb(dpy, gv.background, &fr, &fg, &fb);
-        cz.set_source_rgb(cr, fr, fg, fb);
-        cz.rectangle(cr, x - 1, y - fnt->size, te.x_advance + 3, fnt->size * 1.35);
-        cz.fill(cr);
+    t->sf = cz.xlib_surface_create(dpy, d, DefaultVisual(dpy, DefaultScreen(dpy)), (int)gw, (int)gh);
+    if (!t->sf) return 0;
+    t->cr = cz.create(t->sf);
+    if (!t->cr || cz.status(t->cr)) {
+        if (t->cr) cz.destroy(t->cr);
+        cz.surface_destroy(t->sf); t->cr = 0; t->sf = 0; return 0;
     }
-    r5_pixel_rgb(dpy, gv.foreground, &fr, &fg, &fb);
-    /* Disabled (insensitive) text: Motif renders it by STIPPLING the label GC (fill_style
-     * FillStippled/FillOpaqueStippled) so only ~half the glyph pixels land, giving a dimmed look.
-     * Our solid cairo glyphs ignore the stipple, so disabled text came out identical to enabled.
-     * Reproduce the dim by blending the foreground halfway to the background instead. */
-    if (gv.fill_style == FillStippled || gv.fill_style == FillOpaqueStippled) {
+    r5_cairo_font(t->cr, t->fnt);
+    r5_latin1_utf8(s, len > 500 ? 500 : len, t->buf, sizeof t->buf);
+    r5_last_label = *t->fnt;                             /* remember the live dialog/label font: the */
+    r5_have_last_label = 1;                              /* toggle expose renders its own label to match */
+    return 1;
+}
+
+static void r5_text_finish(R5Text *t) {
+    if (t->sf) cz.surface_flush(t->sf);
+    if (t->cr) cz.destroy(t->cr);
+    if (t->sf) cz.surface_destroy(t->sf);
+    t->cr = 0; t->sf = 0;
+}
+
+/* Glyph color = GC foreground, dimmed when the GC is stippled. Motif renders insensitive text by
+ * STIPPLING the label GC (fill_style FillStippled/FillOpaqueStippled) so only ~half the glyph pixels
+ * land; our solid cairo glyphs ignore the stipple, so we reproduce the dim by blending the
+ * foreground halfway to the background. True of both calls, so it is shared. */
+static void r5_text_source(Display *dpy, R5Text *t) {
+    double fr, fg, fb;
+    r5_pixel_rgb(dpy, t->gv.foreground, &fr, &fg, &fb);
+    if (t->gv.fill_style == FillStippled || t->gv.fill_style == FillOpaqueStippled) {
         double br, bgc, bb;
-        r5_pixel_rgb(dpy, gv.background, &br, &bgc, &bb);
+        r5_pixel_rgb(dpy, t->gv.background, &br, &bgc, &bb);
         fr = fr * 0.5 + br * 0.5; fg = fg * 0.5 + bgc * 0.5; fb = fb * 0.5 + bb * 0.5;
     }
-    cz.set_source_rgb(cr, fr, fg, fb);
-    cz.move_to(cr, x, y);                                /* X (x,y) is the glyph baseline */
-    cz.show_text(cr, buf);
-    cz.surface_flush(sf);
-    cz.destroy(cr);
-    cz.surface_destroy(sf);
-    return 1;
+    cz.set_source_rgb(t->cr, fr, fg, fb);
 }
 
 /* --- the interposed X entry points --- */
@@ -1131,13 +1139,42 @@ static int  (*r5_real_FreeFont)(Display *, XFontStruct *);
 static XFontStruct *(*r5_real_LoadQueryFont)(Display *, const char *);
 static XFontStruct *(*r5_real_QueryFont)(Display *, XID);
 
+/* XDrawString — TRANSPARENT, per X: paint only the glyphs, never touch the background. Whatever the
+ * caller already put behind the text (a Motif expose clears the widget first; a double-buffered
+ * painter of ours draws the label onto its own fresh face) shows through the antialiased edges. */
 void retro5_XDrawString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
-    if (r5_draw_text(dpy, d, gc, x, y, s, len, 0)) return;
+    R5Text t;
+    if (r5_text_setup(dpy, d, gc, s, len, &t)) {
+        r5_text_source(dpy, &t);
+        cz.move_to(t.cr, x, y);                          /* X (x,y) is the glyph baseline */
+        cz.show_text(t.cr, t.buf);
+        r5_text_finish(&t);
+        return;
+    }
     if (!r5_real_DrawString) *(void **)&r5_real_DrawString = r5_realsym("XDrawString");
     if (r5_real_DrawString) r5_real_DrawString(dpy, d, gc, x, y, s, len);
 }
+
+/* XDrawImageString — OPAQUE, per X: fill the glyph box with the GC BACKGROUND, then paint the
+ * glyphs. That is image-text semantics exactly, and because the fill precedes the glyphs on a fresh
+ * box each call it is inherently idempotent — a label redrawn in place never accumulates. */
 void retro5_XDrawImageString(Display *dpy, Drawable d, GC gc, int x, int y, const char *s, int len) {
-    if (r5_draw_text(dpy, d, gc, x, y, s, len, 1)) return;
+    R5Text t;
+    if (r5_text_setup(dpy, d, gc, s, len, &t)) {
+        cairo_text_extents_t te;
+        double br, bg, bb;
+        cz.text_extents(t.cr, t.buf, &te);
+        r5_pixel_rgb(dpy, t.gv.background, &br, &bg, &bb);
+        cz.set_source_rgb(t.cr, br, bg, bb);
+        cz.rectangle(t.cr, x - 1, y - t.fnt->size, te.x_advance + 3, t.fnt->size * 1.35);
+        cz.fill(t.cr);
+        r5_text_source(dpy, &t);
+        cz.move_to(t.cr, x, y);
+        cz.show_text(t.cr, t.buf);
+        r5_text_finish(&t);
+        return;
+    }
+    if (!r5_real_DrawImageString) *(void **)&r5_real_DrawImageString = r5_realsym("XDrawImageString");
     if (!r5_real_DrawImageString) *(void **)&r5_real_DrawImageString =
                                       r5_realsym("XDrawImageString");
     if (r5_real_DrawImageString) r5_real_DrawImageString(dpy, d, gc, x, y, s, len);
@@ -1308,6 +1345,87 @@ static GC r5_gc_for_pixel(Display *dpy, Drawable d, unsigned long pix) {
     return r5_pixgc[r5_pixgc_n++].gc;
 }
 
+/* ---- the double buffer ----
+ * THE LAW: any expose we take over, we re-make completely — and we do it off-screen. Every taken-over
+ * painter draws into a back-buffer Pixmap (window depth, window size) and blits the finished frame to
+ * the window in a single XCopyArea. The window is therefore only ever written once per repaint, with a
+ * complete image, so there is no flicker (no intermediate face/border/icon/label states are ever seen)
+ * and no tearing between our passes. Both X drawing (FillRectangle, DrawPoints, CopyArea/Plane) and
+ * cairo (text, indicators) target the SAME pixmap: the X calls take the Drawable directly, cairo gets
+ * an xlib surface on it, so one buffer serves every draw primitive the painters use.
+ *
+ * The blit GC has graphics_exposures OFF: a full-cover copy would otherwise emit NoExpose events, and
+ * (if the pixmap were ever smaller than the window) GraphicsExpose events that would trigger another
+ * expose — a repaint loop. We never want the copy itself to generate expose traffic. */
+typedef struct {
+    Display        *dpy;
+    Window          win;
+    Pixmap          buf;
+    unsigned        w, h;
+    cairo_surface_t *sf;    /* lazily created — only if a caller asks for cairo */
+    cairo_t         *cr;
+    int             ok;
+} R5Canvas;
+
+static GC r5_blit_gc;
+static GC r5_get_blit_gc(Display *dpy, Drawable d) {
+    if (!r5_blit_gc) {
+        XGCValues v;
+        v.graphics_exposures = False;
+        r5_blit_gc = r5x.CreateGC(dpy, d, GCGraphicsExposures, &v);
+    }
+    return r5_blit_gc;
+}
+
+/* Begin a frame: allocate the back buffer at the window's depth and size. Returns 0 (and leaves the
+ * canvas inert) if anything is missing, so callers can just fall through to their non-buffered path. */
+static int r5_canvas_begin(R5Canvas *c, Display *dpy, Window win, unsigned w, unsigned h) {
+    Window root; int rx, ry; unsigned rw, rh, bw, dep;
+    c->dpy = 0; c->win = 0; c->buf = 0; c->w = 0; c->h = 0; c->sf = 0; c->cr = 0; c->ok = 0;
+    if (!dpy || !win || w < 1 || h < 1 || !r5_xlib()) return 0;
+    if (!r5x.GetGeometry(dpy, win, &root, &rx, &ry, &rw, &rh, &bw, &dep)) return 0;
+    c->buf = r5x.CreatePixmap(dpy, win, w, h, dep);
+    if (!c->buf) return 0;
+    c->dpy = dpy; c->win = win; c->w = w; c->h = h; c->ok = 1;
+    return 1;
+}
+
+/* A cairo context bound to the back buffer, made on first use. NULL if cairo is unavailable — an
+ * X-only painter never triggers the surface allocation. */
+static cairo_t *r5_canvas_cairo(R5Canvas *c) {
+    if (c->cr) return c->cr;
+    if (!c->ok || !r5_cairo()) return 0;
+    c->sf = cz.xlib_surface_create(c->dpy, c->buf,
+                                   DefaultVisual(c->dpy, DefaultScreen(c->dpy)), (int)c->w, (int)c->h);
+    if (!c->sf) return 0;
+    c->cr = cz.create(c->sf);
+    if (!c->cr || cz.status(c->cr)) {
+        if (c->cr) cz.destroy(c->cr);
+        cz.surface_destroy(c->sf);
+        c->cr = 0; c->sf = 0;
+        return 0;
+    }
+    return c->cr;
+}
+
+/* Present the finished frame: flush cairo, blit the given sub-rectangle to the window, free the
+ * buffer. Pass the whole widget (0,0,w,h) for a full-widget painter, or just the region we own for a
+ * partial takeover (e.g. a toggle indicator cell, where Motif still paints the label). */
+static void r5_canvas_commit(R5Canvas *c, int x, int y, unsigned w, unsigned h) {
+    GC gc;
+    if (!c->ok) return;
+    if (c->cr) {
+        cz.surface_flush(c->sf);
+        cz.destroy(c->cr);
+        cz.surface_destroy(c->sf);
+        c->cr = 0; c->sf = 0;
+    }
+    if (w && h && (gc = r5_get_blit_gc(c->dpy, c->win)))
+        r5x.CopyArea(c->dpy, c->buf, c->win, gc, x, y, w, h, x, y);
+    r5x.FreePixmap(c->dpy, c->buf);
+    c->buf = 0; c->ok = 0;
+}
+
 /* Read a widget's `background` pixel (the resource, via the real XtGetValues). */
 static int r5_bg_pixel(void *w, unsigned long *out) {
     R5Arg a;
@@ -1327,28 +1445,22 @@ static int r5_bg_pixel(void *w, unsigned long *out) {
  * our rounded 1px frame into a genuinely rounded button instead of a rounded outline sitting on a
  * square face. Only the 3 pixels outside the frame's arc are touched per corner, so no icon, label
  * or focus ring can ever be clipped. */
-static void retro5_round_widget(void *w) {
-    Display *dpy;
-    Window win, root;
+/* Carve the four corners of a `ww`x`hh` widget out of drawable `d`, in widget `w`'s PARENT background
+ * color — which turns our rounded 1px frame into a genuinely rounded button rather than a rounded
+ * outline on a square face. `d` is the DRAW TARGET (the back buffer when double-buffering, the window
+ * for the Motif-fallback path); the parent color is read off the live widget regardless. Only the 3
+ * pixels outside the frame's arc are touched per corner, so no icon/label/focus ring is ever clipped. */
+static void r5_carve_corners(Display *dpy, Drawable d, void *w, unsigned ww, unsigned hh) {
     unsigned long bg;
-    unsigned int ww, hh, bw, dep;
-    int wx, wy;
     void *parent;
     GC gc;
     XPoint p[12];
     int i = 0, x1, y1;
-
-    if (!r5_skin || !w || !r5_xlib()) return;
-    dpy = r5x.XtDisplayOfObject(w);
-    win = r5x.XtWindowOfObject(w);
-    if (!dpy || !win) return;
-    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return;
     if (ww < 6 || hh < 6) return;
-
     parent = *(void **)((char *)w + 8);                   /* core.parent */
     if (!parent || range_unmapped(parent, 12) || *(void **)parent != parent) return;
     if (!r5_bg_pixel(parent, &bg)) return;
-    if (!(gc = r5_gc_for_pixel(dpy, win, bg))) return;
+    if (!(gc = r5_gc_for_pixel(dpy, d, bg))) return;
 
     x1 = (int)ww - 1; y1 = (int)hh - 1;
     p[i].x = 0;      p[i++].y = 0;                        /* top-left    */
@@ -1363,7 +1475,22 @@ static void retro5_round_widget(void *w) {
     p[i].x = x1;     p[i++].y = y1;                       /* bottom-right*/
     p[i].x = x1 - 1; p[i++].y = y1;
     p[i].x = x1;     p[i++].y = y1 - 1;
-    r5x.DrawPoints(dpy, win, gc, p, i, CoordModeOrigin);
+    r5x.DrawPoints(dpy, d, gc, p, i, CoordModeOrigin);
+}
+
+/* Corner-carve on the WINDOW — the fallback path, when Motif drew the widget itself (unbuffered) and
+ * we only round the corners on top. */
+static void retro5_round_widget(void *w) {
+    Display *dpy;
+    Window win, root;
+    unsigned int ww, hh, bw, dep;
+    int wx, wy;
+    if (!r5_skin || !w || !r5_xlib()) return;
+    dpy = r5x.XtDisplayOfObject(w);
+    win = r5x.XtWindowOfObject(w);
+    if (!dpy || !win) return;
+    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return;
+    r5_carve_corners(dpy, win, w, ww, hh);
 }
 
 /* Read several resources off a widget in one XtGetValues. */
@@ -1399,6 +1526,8 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     long shadow_type = 0;
     int wx, wy, px, py, sunk;
     unsigned int ww, hh, bw, dep, pw, ph, pbw, pdep;
+    R5Canvas cv;
+    Drawable dst;
     GC face;
     R5Arg args[3];
 
@@ -1422,35 +1551,41 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return 0;
     if (!r5x.GetGeometry(dpy, pm, &root, &px, &py, &pw, &ph, &pbw, &pdep)) return 0;
     if (ww < 4 || hh < 4) return 0;
+    if (pdep != 1 && pdep != dep) return 0;               /* depth we don't understand -> defer */
 
     sunk = (shadow_type == R5_SHADOW_IN);
 
+    /* Draw the whole button off-screen, then blit once (see the double-buffer banner). All the X
+     * primitives below target the back buffer `dst` instead of the window; nothing reaches the
+     * screen until the single commit. */
+    if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
+    dst = cv.buf;
+
     /* 1. face. Filling is safe here (unlike inside _XmDrawShadows) precisely because we own the
      *    order: the icon has not been drawn yet — we draw it, below, on top. */
-    face = sunk ? r5_pick(dpy, win, R5_GC_PRESS) : r5_gc_for_pixel(dpy, win, bg);
-    if (face) r5x.FillRectangle(dpy, win, face, 0, 0, ww, hh);
+    face = sunk ? r5_pick(dpy, dst, R5_GC_PRESS) : r5_gc_for_pixel(dpy, dst, bg);
+    if (face) r5x.FillRectangle(dpy, dst, face, 0, 0, ww, hh);
 
     /* 2. border: a pressed button gets the inset frame; at rest a toolbar button wears none. */
-    if (sunk)            r5_inset(dpy, win, 0, 0, (int)ww, (int)hh);
+    if (sunk)            r5_inset(dpy, dst, 0, 0, (int)ww, (int)hh);
     else if (!flat_at_rest) {
-        GC e = r5_pick(dpy, win, R5_GC_EDGE);
-        if (e) r5_round_rect(dpy, win, e, 0, 0, (int)ww, (int)hh);
+        GC e = r5_pick(dpy, dst, R5_GC_EDGE);
+        if (e) r5_round_rect(dpy, dst, e, 0, 0, (int)ww, (int)hh);
     }
 
     /* 3. the icon, centered; nudged a pixel down-right while pressed, so the press is felt. */
     px = ((int)ww - (int)pw) / 2 + (sunk ? 1 : 0);
     py = ((int)hh - (int)ph) / 2 + (sunk ? 1 : 0);
     if (pdep == 1) {                                      /* bitmap: stencil it in the fg color */
-        GC g = r5_pick(dpy, win, R5_GC_GLYPH);
-        if (g) r5x.CopyPlane(dpy, pm, win, g, 0, 0, pw, ph, px, py, 1);
-    } else if (pdep == dep) {
-        GC g = r5_gc_for_pixel(dpy, win, bg);
-        if (g) r5x.CopyArea(dpy, pm, win, g, 0, 0, pw, ph, px, py);
-    } else {
-        return 0;                                         /* depth we don't understand -> defer */
+        GC g = r5_pick(dpy, dst, R5_GC_GLYPH);
+        if (g) r5x.CopyPlane(dpy, pm, dst, g, 0, 0, pw, ph, px, py, 1);
+    } else {                                              /* pdep == dep: full-color icon */
+        GC g = r5_gc_for_pixel(dpy, dst, bg);
+        if (g) r5x.CopyArea(dpy, pm, dst, g, 0, 0, pw, ph, px, py);
     }
 
-    retro5_round_widget(w);                               /* carve the corners, last */
+    r5_carve_corners(dpy, dst, w, ww, hh);                /* carve the corners into the buffer, last */
+    r5_canvas_commit(&cv, 0, 0, ww, hh);                  /* present the finished button in one blit */
     return 1;
 }
 
@@ -1471,69 +1606,14 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
     retro5_round_widget(w);
 }
 
-/* ---- radio / checkbox indicators, drawn with cairo (antialiased) ----
- * This REPLACES Motif's DrawToggle (the function that draws the indicator, called from expose AND
- * from every arm/select/disarm redraw). So the indicator is 100% ours on every path — Motif never
- * draws it, which is why there is no flicker and no click artifact (mixing our drawing with Motif's
- * on the same element is the thing that goes badly; here Motif draws none of it). Motif's expose
- * still paints the widget background + label (label glyphs via our cairo text hook); DrawToggle
- * only ever drew the indicator, so replacing it leaves those intact.
- *
- * cdecl (Widget w) — 1 arg, plain ret, verified. XmNindicatorType picks the shape (XmONE_OF_MANY=2
- * -> circle, XmN_OF_MANY=1 -> square); XmNset picks filled vs empty. Geometry mirrors Motif: the
- * cell is at highlightThickness+shadowThickness+marginWidth, the drawn indicator is clamped to the
- * widget height (Motif draws well under indicatorSize) and centered in the cell. */
-void retro5_DrawToggle(void *w) {
-    Display *dpy;
-    Window win, root;
-    unsigned int ww, hh, bwid, dep;
-    int wx, wy, x, y, sz;
-    cairo_surface_t *sf;
-    cairo_t *cr;
-    R5Arg a[7];
-    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, dim = 0, height = 0, edge;
-    unsigned long bg = 0xd3d3d3;
+/* Paint one radio/checkbox indicator into an existing cairo context, at cell (x,y) size sz. Shared
+ * by the full toggle EXPOSE (which also draws the background + label) and by DrawToggle (the
+ * arm/select/disarm redraw path, which repaints just this cell). itype: XmONE_OF_MANY=2 -> radio
+ * circle, XmN_OF_MANY=1 -> checkbox square; set -> filled/accented. bg fills the cell first so a
+ * repaint erases whatever was underneath. */
+static void r5_paint_indicator(cairo_t *cr, int x, int y, int sz, long itype, long set,
+                               unsigned long bg) {
     double cx, cy, r;
-
-    if (!r5_skin || !w || !r5_cairo()) return;
-    dpy = r5x.XtDisplayOfObject(w);
-    win = r5x.XtWindowOfObject(w);
-    if (!dpy || !win) return;
-    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bwid, &dep)) return;
-
-    a[0].name = (char *)"set";                a[0].value = (long)&set;
-    a[1].name = (char *)"indicatorType";      a[1].value = (long)&itype;
-    a[2].name = (char *)"highlightThickness"; a[2].value = (long)&hlt;
-    a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
-    a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
-    a[5].name = (char *)"indicatorSize";      a[5].value = (long)&dim;
-    a[6].name = (char *)"background";         a[6].value = (long)&bg;
-    r5_get(w, a, 7);
-
-    /* Dimension resources are 16-bit; mask off any high-word garbage. */
-    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff; dim &= 0xffff;
-    height = (long)hh;
-    if (dim <= 0 || dim >= 0xffff) dim = 13;
-    /* Size the indicator from the widget height so it scales with the font (Motif grows the toggle
-     * with the font). Fill most of the usable height for a modern look, but stay inside the cell
-     * Motif reserved (indicatorSize) so the label — placed by Motif after that cell — is never
-     * clipped. */
-    edge = height - 2 * (hlt + st);
-    if (edge > 13) edge = 13;                            /* Motif's label sits close; stay clear of it */
-    if (edge < 10) edge = 10;
-    sz = (int)edge;
-    /* Hug the widget's left edge (drop the highlight margin) so a clear gap opens before the label,
-     * which Motif has already placed for its own smaller indicator and which we don't move. */
-    x  = (int)(st + mw);
-    y  = (int)((height - edge) / 2);
-    if (sz < 6 || x < 0 || y < 0) return;
-
-    sf = cz.xlib_surface_create(dpy, win, DefaultVisual(dpy, DefaultScreen(dpy)), (int)ww, (int)hh);
-    if (!sf) return;
-    cr = cz.create(sf);
-    if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return; }
-
-    /* clear the indicator cell to the widget background — erases Motif's own indicator underneath */
     cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));
     cz.rectangle(cr, x - 1, y - 1, sz + 2, sz + 2);
     cz.fill(cr);
@@ -1592,9 +1672,228 @@ void retro5_DrawToggle(void *w) {
             cz.stroke(cr);
         }
     }
-    cz.surface_flush(sf);
-    cz.destroy(cr);
-    cz.surface_destroy(sf);
+}
+
+/* ---- radio / checkbox indicators, drawn with cairo (antialiased) ----
+ * DrawToggle is Motif's indicator painter, called from expose AND from every arm/select/disarm
+ * redraw. We take over the whole toggle EXPOSE below (background + indicator + label, buffered), so
+ * on expose Motif draws none of it. But arm/select/disarm repaint the indicator through THIS
+ * function WITHOUT a full expose, so we take it over too: it repaints just the indicator cell, into
+ * a back buffer, so every interactive redraw path is ours and none of them flickers.
+ *
+ * cdecl (Widget w) — 1 arg, plain ret, verified. Geometry mirrors Motif: the cell is at
+ * highlightThickness+shadowThickness+marginWidth, the drawn indicator is clamped to the widget
+ * height (Motif draws well under indicatorSize) and centered in the cell. */
+void retro5_DrawToggle(void *w) {
+    Display *dpy;
+    Window win, root;
+    unsigned int ww, hh, bwid, dep;
+    int wx, wy, x, y, sz;
+    R5Canvas cv;
+    cairo_t *cr;
+    R5Arg a[7];
+    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, dim = 0, height = 0, edge;
+    unsigned long bg = 0xd3d3d3;
+
+    if (!r5_skin || !w || !r5_cairo()) return;
+    dpy = r5x.XtDisplayOfObject(w);
+    win = r5x.XtWindowOfObject(w);
+    if (!dpy || !win) return;
+    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bwid, &dep)) return;
+
+    if (r5_trace) {                                       /* discover the toggle class record + expose */
+        void *cls = *(void **)((char *)w + 4);
+        void *exp = (cls && !range_unmapped((char *)cls + R5_EXPOSE_OFF, 4))
+                    ? *(void **)((char *)cls + R5_EXPOSE_OFF) : 0;
+        char b[128];
+        int k = snprintf(b, sizeof b, "toggle w=%p class=%p expose=%p name=%s\n",
+                         w, cls, exp, r5_widget_class(w) ? r5_widget_class(w) : "?");
+        if (k > 0) write(2, b, (size_t)k);
+    }
+
+    a[0].name = (char *)"set";                a[0].value = (long)&set;
+    a[1].name = (char *)"indicatorType";      a[1].value = (long)&itype;
+    a[2].name = (char *)"highlightThickness"; a[2].value = (long)&hlt;
+    a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
+    a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
+    a[5].name = (char *)"indicatorSize";      a[5].value = (long)&dim;
+    a[6].name = (char *)"background";         a[6].value = (long)&bg;
+    r5_get(w, a, 7);
+
+    /* Dimension resources are 16-bit; mask off any high-word garbage. */
+    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff; dim &= 0xffff;
+    height = (long)hh;
+    if (dim <= 0 || dim >= 0xffff) dim = 13;
+    /* Size the indicator from the widget height so it scales with the font (Motif grows the toggle
+     * with the font). Fill most of the usable height for a modern look, but stay inside the cell
+     * Motif reserved (indicatorSize) so the label — placed by Motif after that cell — is never
+     * clipped. */
+    edge = height - 2 * (hlt + st);
+    if (edge > 13) edge = 13;                            /* Motif's label sits close; stay clear of it */
+    if (edge < 10) edge = 10;
+    sz = (int)edge;
+    /* Hug the widget's left edge (drop the highlight margin) so a clear gap opens before the label,
+     * which Motif has already placed for its own smaller indicator and which we don't move. */
+    x  = (int)(st + mw);
+    y  = (int)((height - edge) / 2);
+    if (sz < 6 || x < 0 || y < 0) return;
+
+    /* Draw the indicator off-screen and blit only its cell (Motif still paints the widget background
+     * and the label; we own the indicator cell alone — see the double-buffer banner). */
+    if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return;
+    if (!(cr = r5_canvas_cairo(&cv))) { r5_canvas_commit(&cv, 0, 0, 0, 0); return; }
+
+    r5_paint_indicator(cr, x, y, sz, itype, set, bg);
+    {
+        /* blit just the indicator cell (the region we cleared + drew), clamped to the widget */
+        int bx = x - 1, by = y - 1;
+        int bw2 = sz + 2, bh2 = sz + 2;
+        if (bx < 0) { bw2 += bx; bx = 0; }
+        if (by < 0) { bh2 += by; by = 0; }
+        if (bx + bw2 > (int)ww) bw2 = (int)ww - bx;
+        if (by + bh2 > (int)hh) bh2 = (int)hh - by;
+        if (bw2 < 0) bw2 = 0;
+        if (bh2 < 0) bh2 = 0;
+        r5_canvas_commit(&cv, bx, by, (unsigned)bw2, (unsigned)bh2);
+    }
+}
+
+/* Motif's XmStringGetLtoR is in the statically-linked Xm code (no symbol to resolve), so the
+ * per-binary takeover hands us its absolute address. The charset is compared by strcmp inside it, so
+ * the literal default tag matches WP's label segments. XtGetValues(XmNlabelString) returns a freshly
+ * allocated *external* XmString that the caller owns, and XmStringGetLtoR returns an XtMalloc'd
+ * char*; since XmStringFree is literally XtFree((char*)s), one XtFree reclaims each — no extra Motif
+ * address needed. Returns the label length (0 = none), copied into the caller's buffer. */
+static uintptr_t r5_addr_XmStringGetLtoR;
+static void (*r5_XtFree)(void *);
+
+static int r5_widget_label(void *w, char *out, int outsz) {
+    void *xs = 0;                                        /* XmString (opaque) */
+    R5Arg a;
+    char *t = 0;
+    int (*getltor)(void *, const char *, char **);
+    if (!out || outsz < 1) return 0;
+    out[0] = 0;
+    if (!r5_addr_XmStringGetLtoR) return 0;
+    a.name = (char *)"labelString"; a.value = (long)&xs;
+    r5_get(w, &a, 1);
+    if (!xs) return 0;
+    if (!r5_XtFree) *(void **)&r5_XtFree = r5_realsym("XtFree");
+    *(void **)&getltor = (void *)r5_addr_XmStringGetLtoR;
+    if (getltor(xs, "FONTLIST_DEFAULT_TAG_STRING", &t) && t) {
+        strncpy(out, t, outsz - 1); out[outsz - 1] = 0;
+        if (r5_XtFree) r5_XtFree(t);
+    }
+    if (r5_XtFree) r5_XtFree(xs);                        /* XmStringFree(xs) == XtFree(xs) */
+    return (int)strlen(out);
+}
+
+/* Full XmToggleButton expose — background + indicator + label, ALL ours and double-buffered, with no
+ * delegation to Motif (the law: a taken-over expose re-makes the whole widget). This is what ends the
+ * group flicker: Motif's own toggle expose clears each widget's background directly on the window, so
+ * unsetting siblings in a radio group flashes a clear across every one of them; here nothing reaches
+ * the screen until a single blit of the finished frame. The label is rendered in our UI font (like
+ * the rest of the app's text), sized from the widget and placed just right of the indicator. */
+static void (*r5_orig_toggle_expose)(void *, XEvent *, Region);
+
+void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
+    Display *dpy;
+    Window win, root;
+    unsigned int ww, hh, bwid, dep;
+    int wx, wy, x, y, sz;
+    R5Canvas cv;
+    cairo_t *cr;
+    R5Arg a[9];
+    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, mh = 0, isz = 0, height, edge;
+    unsigned long bg = 0xd3d3d3, fgpix = 0;
+    char label[256];
+    int llen, label_x;
+
+    if (!r5_skin || !w || !r5_cairo() || !r5_xlib()) goto fallback;
+    dpy = r5x.XtDisplayOfObject(w);
+    win = r5x.XtWindowOfObject(w);
+    if (!dpy || !win) return;                            /* no window yet: nothing to paint, no fallback */
+    if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bwid, &dep)) goto fallback;
+
+    a[0].name = (char *)"set";                a[0].value = (long)&set;
+    a[1].name = (char *)"indicatorType";      a[1].value = (long)&itype;
+    a[2].name = (char *)"highlightThickness"; a[2].value = (long)&hlt;
+    a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
+    a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
+    a[5].name = (char *)"marginHeight";       a[5].value = (long)&mh;
+    a[6].name = (char *)"background";         a[6].value = (long)&bg;
+    a[7].name = (char *)"foreground";         a[7].value = (long)&fgpix;
+    a[8].name = (char *)"indicatorSize";      a[8].value = (long)&isz;
+    r5_get(w, a, 9);
+
+    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff; mh &= 0xffff; isz &= 0xffff;
+    height = (long)hh;
+    edge = height - 2 * (hlt + st);                      /* same indicator geometry as DrawToggle */
+    if (edge > 13) edge = 13;
+    if (edge < 10) edge = 10;
+    sz = (int)edge;
+    x  = (int)(st + mw);
+    y  = (int)((height - edge) / 2);
+    if (sz < 6 || x < 0 || y < 0) goto fallback;
+
+    /* Where Motif budgeted the label: after highlight + shadow + margin + the FULL indicator cell it
+     * reserved (indicatorSize), plus its spacing. Placing our label there — and rendering it in the
+     * font Motif sized the widget with — makes it fit exactly inside ww instead of overflowing. */
+    if (isz < sz || isz > 40) isz = sz;                  /* sane fallback if the resource is odd */
+    label_x = (int)(hlt + st + mw + isz + 1);
+
+    if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) goto fallback;
+    if (!(cr = r5_canvas_cairo(&cv))) { r5_canvas_commit(&cv, 0, 0, 0, 0); goto fallback; }
+
+    /* whole-widget background */
+    cz.set_source_rgb(cr, R5_RD(bg), R5_GD(bg), R5_BD(bg));
+    cz.rectangle(cr, 0, 0, (double)ww, (double)hh);
+    cz.fill(cr);
+
+    r5_paint_indicator(cr, x, y, sz, itype, set, bg);
+
+    /* label: the SAME font the dialog's other text is drawn in (captured from our text hook), so the
+     * width matches what Motif reserved; vertically centered on the widget. */
+    llen = r5_widget_label(w, label, sizeof label);
+    if (llen > 0) {
+        R5Font lf;
+        char utf[512];
+        cairo_text_extents_t te;
+        double fr, fg2, fb;
+        int avail = (int)ww - label_x - (int)mw;         /* room Motif left for the text */
+        if (r5_have_last_label) {
+            lf = r5_last_label;
+        } else {                                         /* first paint, no sample yet: derive a size */
+            double fpx = hh * 0.62;
+            if (fpx < 10) fpx = 10;
+            if (fpx > 22) fpx = 22;
+            lf.family = r5_family_for(0, 0);
+            lf.slant  = CAIRO_FONT_SLANT_NORMAL;
+            lf.weight = CAIRO_FONT_WEIGHT_NORMAL;
+            lf.size   = fpx;
+        }
+        r5_latin1_utf8(label, llen, utf, sizeof utf);
+        r5_cairo_font(cr, &lf);
+        /* Motif sized this widget from the toggle's OWN font metrics; our captured font is only close,
+         * so a long label can be a hair too wide and clip at the widget edge. Measure it and, only if
+         * it would overflow, shrink the font just enough to fit — no clip, minimal size change. */
+        cz.text_extents(cr, utf, &te);
+        if (avail > 8 && te.x_advance > avail) {
+            lf.size *= (double)avail / te.x_advance;
+            if (lf.size < 8) lf.size = 8;
+            r5_cairo_font(cr, &lf);
+        }
+        r5_pixel_rgb(dpy, fgpix, &fr, &fg2, &fb);
+        cz.set_source_rgb(cr, fr, fg2, fb);
+        cz.move_to(cr, (double)label_x, (hh + lf.size * 0.72) / 2.0);
+        cz.show_text(cr, utf);
+    }
+
+    r5_canvas_commit(&cv, 0, 0, ww, hh);                 /* present the whole toggle in one blit */
+    return;
+
+fallback:
+    if (r5_orig_toggle_expose) r5_orig_toggle_expose(w, ev, region);
 }
 
 /* ======================================================================================= *
@@ -1648,6 +1947,8 @@ static void takeoverWP80(void) {
           (void **)&r5_orig_drawnbutton_expose, "XmDrawnButton" },   /* toolbar buttons */
         { 0x087cfb68, 0x0866d00c, retro5_PushButtonExpose,
           (void **)&r5_orig_pushbutton_expose,  "XmPushButton"  },   /* dialog buttons  */
+        { 0x087d1ae8, 0x08695968, retro5_ToggleButtonExpose,
+          (void **)&r5_orig_toggle_expose,      "XmToggleButton" }, /* radio + checkbox */
     };
     /* Text. We take over the font LOAD (XLoadQueryFont/XQueryFont) to rewrite each font's width
        metrics to our cairo advances — after which WP's OWN XTextWidth/XTextExtents return cairo
@@ -1663,6 +1964,7 @@ static void takeoverWP80(void) {
         { 0x08050660, 0x087d875c, retro5_XFreeFont,        "XFreeFont"        },
     };
     r5_xsyms = 0;                       /* 8.0 is dynamic-X: resolve X/Xt entry points by name */
+    r5_addr_XmStringGetLtoR = 0x0869dc40;  /* statically-linked Xm; the toggle expose reads labels */
 
     /* Appearance takeover — cheap (byte patches + one class-record word each), no library loads. */
     takeover_entries(entries, sizeof entries / sizeof entries[0]);
