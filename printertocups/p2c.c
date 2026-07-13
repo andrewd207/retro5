@@ -24,10 +24,16 @@
 /* Minimal CUPS types (we dlopen libcups, so we don't include cups.h / link -lcups). */
 typedef struct { char *name, *value; } cups_option_t;
 typedef struct { char *name, *instance; int is_default; int num_options; cups_option_t *options; } cups_dest_t;
+/* cups_size_t: the public media-size record. width/length/margins are in HUNDREDTHS OF A MILLIMETRE
+ * (CUPS's unit), so microns = value * 10. Layout matches cups/dest.h exactly. */
+typedef struct { char media[128]; int width, length, bottom, left, right, top; } cups_size_t;
+#define P2C_CUPS_MEDIA_FLAGS_DEFAULT 0u
 
-/* dlsym'd libcups entry points (http_t* is passed as NULL = CUPS_HTTP_DEFAULT). */
+/* dlsym'd libcups entry points (http_t* is passed as NULL = CUPS_HTTP_DEFAULT; cups_dinfo_t* and
+ * ipp_attribute_t* are opaque, so void*). */
 static struct {
     int   ready;
+    int   caps_ready;
     void *h;
     int         (*GetDests)(cups_dest_t **);
     void        (*FreeDests)(int, cups_dest_t *);
@@ -38,6 +44,19 @@ static struct {
     int         (*StartDocument)(void *, const char *, int, const char *, const char *, int);
     int         (*WriteRequestData)(void *, const char *, size_t);
     int         (*FinishDocument)(void *, const char *);
+    /* capability query (IPP dest-info) */
+    cups_dest_t *(*GetNamedDest)(void *, const char *, const char *);
+    void        *(*CopyDestInfo)(void *, cups_dest_t *);
+    void         (*FreeDestInfo)(void *);
+    void        *(*FindDestSupported)(void *, cups_dest_t *, void *, const char *);
+    void        *(*FindDestDefault)(void *, cups_dest_t *, void *, const char *);
+    int          (*GetDestMediaCount)(void *, cups_dest_t *, void *, unsigned);
+    int          (*GetDestMediaByIndex)(void *, cups_dest_t *, void *, int, unsigned, cups_size_t *);
+    int          (*GetDestMediaDefault)(void *, cups_dest_t *, void *, unsigned, cups_size_t *);
+    int          (*ippGetCount)(void *);
+    const char  *(*ippGetString)(void *, int, const char **);
+    int          (*ippGetInteger)(void *, int);
+    int          (*ippGetResolution)(void *, int, int *, int *);
 } cu;
 
 /* ---- job queue ---- */
@@ -76,6 +95,30 @@ static int p2c_load_cups(void) {
     if (!cu.GetDests || !cu.CreateJob || !cu.StartDocument || !cu.WriteRequestData || !cu.FinishDocument)
         return 0;
     cu.ready = 1;
+    return 1;
+}
+
+/* Resolve the IPP dest-info + accessor entry points on top of the core set. Separate from
+ * p2c_load_cups so a libcups too old for the dest-info API still lets enumeration/submission work;
+ * only p2c_caps degrades. */
+static int p2c_load_caps(void) {
+    if (cu.caps_ready) return 1;
+    if (!p2c_load_cups()) return 0;
+    cu.GetNamedDest        = (cups_dest_t *(*)(void *, const char *, const char *)) dlsym(cu.h, "cupsGetNamedDest");
+    cu.CopyDestInfo        = (void *(*)(void *, cups_dest_t *))                     dlsym(cu.h, "cupsCopyDestInfo");
+    cu.FreeDestInfo        = (void  (*)(void *))                                    dlsym(cu.h, "cupsFreeDestInfo");
+    cu.FindDestSupported   = (void *(*)(void *, cups_dest_t *, void *, const char *)) dlsym(cu.h, "cupsFindDestSupported");
+    cu.FindDestDefault     = (void *(*)(void *, cups_dest_t *, void *, const char *)) dlsym(cu.h, "cupsFindDestDefault");
+    cu.GetDestMediaCount   = (int  (*)(void *, cups_dest_t *, void *, unsigned))     dlsym(cu.h, "cupsGetDestMediaCount");
+    cu.GetDestMediaByIndex = (int  (*)(void *, cups_dest_t *, void *, int, unsigned, cups_size_t *)) dlsym(cu.h, "cupsGetDestMediaByIndex");
+    cu.GetDestMediaDefault = (int  (*)(void *, cups_dest_t *, void *, unsigned, cups_size_t *)) dlsym(cu.h, "cupsGetDestMediaDefault");
+    cu.ippGetCount         = (int  (*)(void *))                                     dlsym(cu.h, "ippGetCount");
+    cu.ippGetString        = (const char *(*)(void *, int, const char **))          dlsym(cu.h, "ippGetString");
+    cu.ippGetInteger       = (int  (*)(void *, int))                                dlsym(cu.h, "ippGetInteger");
+    cu.ippGetResolution    = (int  (*)(void *, int, int *, int *))                  dlsym(cu.h, "ippGetResolution");
+    if (!cu.GetNamedDest || !cu.CopyDestInfo || !cu.FindDestSupported || !cu.ippGetCount || !cu.ippGetString)
+        return 0;
+    cu.caps_ready = 1;
     return 1;
 }
 
@@ -152,6 +195,91 @@ int p2c_enum(P2CPrinter *out, int max) {
     }
     if (dests && cu.FreeDests) cu.FreeDests(n, dests);
     return got;
+}
+
+int p2c_caps(const char *dest, P2CCaps *out) {
+    cups_dest_t *d; void *dinfo, *attr; int i, n, yres, units, xres;
+    if (!out) return -1;
+    memset(out, 0, sizeof *out);
+    if (!p2c_load_caps()) return -1;
+
+    d = cu.GetNamedDest((void *)0, (dest && *dest) ? dest : (const char *)0, (const char *)0);
+    if (!d) return -1;
+    dinfo = cu.CopyDestInfo((void *)0, d);
+    if (!dinfo) { if (cu.FreeDests) cu.FreeDests(1, d); return -1; }
+    out->ok = 1;
+
+    /* media WITH dimensions, preferred (cupsGetDestMedia*). Falls back to the bare "media"
+       name list if the media-DB API is missing or empty. */
+    n = cu.GetDestMediaCount ? cu.GetDestMediaCount((void *)0, d, dinfo, P2C_CUPS_MEDIA_FLAGS_DEFAULT) : 0;
+    for (i = 0; i < n && out->n_media < P2C_MAX_MEDIA; i++) {
+        cups_size_t sz; memset(&sz, 0, sizeof sz);
+        if (cu.GetDestMediaByIndex &&
+            cu.GetDestMediaByIndex((void *)0, d, dinfo, i, P2C_CUPS_MEDIA_FLAGS_DEFAULT, &sz)) {
+            strncpy(out->media[out->n_media], sz.media, sizeof out->media[0] - 1);
+            out->media_w_um[out->n_media] = sz.width  * 10;   /* 1/100 mm -> micron */
+            out->media_h_um[out->n_media] = sz.length * 10;
+            out->n_media++;
+        }
+    }
+    if (out->n_media == 0 && cu.FindDestSupported) {
+        attr = cu.FindDestSupported((void *)0, d, dinfo, "media");
+        if (attr) { int c = cu.ippGetCount(attr);
+            for (i = 0; i < c && out->n_media < P2C_MAX_MEDIA; i++) {
+                const char *s = cu.ippGetString(attr, i, (const char **)0);
+                if (s) { strncpy(out->media[out->n_media], s, sizeof out->media[0] - 1); out->n_media++; } } }
+    }
+    if (cu.GetDestMediaDefault) {
+        cups_size_t sz; memset(&sz, 0, sizeof sz);
+        if (cu.GetDestMediaDefault((void *)0, d, dinfo, P2C_CUPS_MEDIA_FLAGS_DEFAULT, &sz))
+            strncpy(out->media_default, sz.media, sizeof out->media_default - 1);
+    }
+
+    /* resolutions */
+    if (cu.FindDestSupported && cu.ippGetResolution) {
+        attr = cu.FindDestSupported((void *)0, d, dinfo, "printer-resolution");
+        if (attr) { int c = cu.ippGetCount(attr);
+            for (i = 0; i < c && out->n_res < P2C_MAX_RES; i++) {
+                yres = units = 0; xres = cu.ippGetResolution(attr, i, &yres, &units);
+                if (xres > 0) out->res_dpi[out->n_res++] = xres; } }
+    }
+    if (cu.FindDestDefault && cu.ippGetResolution) {
+        attr = cu.FindDestDefault((void *)0, d, dinfo, "printer-resolution");
+        if (attr) { yres = units = 0; xres = cu.ippGetResolution(attr, 0, &yres, &units);
+                    if (xres > 0) out->res_default_dpi = xres; }
+    }
+
+    /* color: any print-color-mode that isn't monochrome */
+    if (cu.FindDestSupported) {
+        attr = cu.FindDestSupported((void *)0, d, dinfo, "print-color-mode");
+        if (attr) { int c = cu.ippGetCount(attr);
+            for (i = 0; i < c; i++) { const char *s = cu.ippGetString(attr, i, (const char **)0);
+                if (s && (strstr(s, "color") || !strcmp(s, "auto"))) out->color = 1; } }
+    }
+    /* duplex: any two-sided "sides" value */
+    if (cu.FindDestSupported) {
+        attr = cu.FindDestSupported((void *)0, d, dinfo, "sides");
+        if (attr) { int c = cu.ippGetCount(attr);
+            for (i = 0; i < c; i++) { const char *s = cu.ippGetString(attr, i, (const char **)0);
+                if (s && strstr(s, "two-sided")) out->duplex = 1; } }
+    }
+    if (cu.FindDestDefault) {
+        attr = cu.FindDestDefault((void *)0, d, dinfo, "sides");
+        if (attr) { const char *s = cu.ippGetString(attr, 0, (const char **)0);
+                    if (s && strstr(s, "two-sided")) out->duplex_default = 1; }
+    }
+    /* input sources / trays */
+    if (cu.FindDestSupported) {
+        attr = cu.FindDestSupported((void *)0, d, dinfo, "media-source");
+        if (attr) { int c = cu.ippGetCount(attr);
+            for (i = 0; i < c && out->n_source < P2C_MAX_SOURCE; i++) {
+                const char *s = cu.ippGetString(attr, i, (const char **)0);
+                if (s) { strncpy(out->source[out->n_source], s, sizeof out->source[0] - 1); out->n_source++; } } }
+    }
+
+    if (cu.FreeDestInfo) cu.FreeDestInfo(dinfo);
+    if (cu.FreeDests)    cu.FreeDests(1, d);
+    return 0;
 }
 
 long p2c_submit(const char *dest, const char *title, const char *format,

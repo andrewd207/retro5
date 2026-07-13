@@ -1,4 +1,5 @@
 /* test.c — printertocups smoke test.  ./p2c-test list            (enumerate; safe)
+ *                                     ./p2c-test caps [DEST]      (query capabilities; safe)
  *                                     ./p2c-test submit DEST FILE (spool FILE to DEST; prints!)
  * SPDX-License-Identifier: MIT */
 #include "p2c.h"
@@ -22,6 +23,27 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (!strcmp(cmd, "caps")) {
+        P2CCaps c; int i;
+        const char *dest = argc > 2 ? argv[2] : "";
+        if (p2c_caps(dest, &c) != 0 || !c.ok) {
+            fprintf(stderr, "p2c_caps failed for '%s' (no dest-info?)\n", dest[0] ? dest : "(default)");
+            p2c_shutdown(); return 1;
+        }
+        printf("capabilities for '%s':\n", dest[0] ? dest : "(default)");
+        printf("  color=%d  duplex=%d (default two-sided=%d)\n", c.color, c.duplex, c.duplex_default);
+        printf("  resolutions (default %d dpi):", c.res_default_dpi);
+        for (i = 0; i < c.n_res; i++) printf(" %d", c.res_dpi[i]);
+        printf("\n  media (%d; default '%s'):\n", c.n_media, c.media_default);
+        for (i = 0; i < c.n_media; i++)
+            printf("    %-28s %d x %d um\n", c.media[i], c.media_w_um[i], c.media_h_um[i]);
+        printf("  sources (%d):", c.n_source);
+        for (i = 0; i < c.n_source; i++) printf(" %s", c.source[i]);
+        printf("\n");
+        p2c_shutdown();
+        return 0;
+    }
+
     if (!strcmp(cmd, "submit") && argc >= 4) {
         FILE *f = fopen(argv[3], "rb"); long len; char *buf;
         if (!f) { perror("fopen"); return 1; }
@@ -36,6 +58,6 @@ int main(int argc, char **argv) {
         return h > 0 ? 0 : 1;
     }
 
-    fprintf(stderr, "usage: %s list | submit DEST FILE.ps\n", argv[0]);
+    fprintf(stderr, "usage: %s list | caps [DEST] | submit DEST FILE.ps\n", argv[0]);
     return 2;
 }

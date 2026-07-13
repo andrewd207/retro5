@@ -32,6 +32,40 @@ typedef struct {
 #define P2C_POSTSCRIPT "application/postscript"
 #define P2C_PDF        "application/pdf"
 
+/* --- printer capabilities, resolved from CUPS via IPP (cupsGetDestInfo + cupsFindDest*) ----------
+ * This is what WP's own printer-capability model (the .prs-derived struct) gets populated from, so
+ * WP's Page Setup / Print dialogs reflect the REAL queue instead of a frozen Type1-PostScript .prs.
+ * Every list is best-effort: a count of 0 / empty string means CUPS did not report that attribute
+ * for this queue (WP can then fall back to its defaults). PPDs are deprecated in current CUPS, so
+ * this uses the IPP dest-info path exclusively. */
+enum { P2C_MAX_MEDIA = 96, P2C_MAX_RES = 16, P2C_MAX_SOURCE = 24 };
+
+typedef struct {
+    int  ok;                              /* 1 = dest-info obtained; 0 = query failed (use WP defaults) */
+
+    /* media / page sizes. `media[]` are PWG self-describing names ("iso_a4_210x297mm",
+     * "na_letter_8.5x11in"); dimensions are in MICRONS (0 if CUPS gave a name but no size). */
+    int  n_media;
+    char media[P2C_MAX_MEDIA][64];
+    int  media_w_um[P2C_MAX_MEDIA];
+    int  media_h_um[P2C_MAX_MEDIA];
+    char media_default[64];
+
+    /* resolutions, in DPI (square; the x resolution if non-square). */
+    int  n_res;
+    int  res_dpi[P2C_MAX_RES];
+    int  res_default_dpi;
+
+    /* input sources / trays (IPP keywords: "main", "tray-1", "auto", "manual", ...). */
+    int  n_source;
+    char source[P2C_MAX_SOURCE][64];
+
+    /* boolean capabilities. */
+    int  color;                           /* 1 = a color print-color-mode is supported */
+    int  duplex;                          /* 1 = two-sided ("sides") supported */
+    int  duplex_default;                  /* 1 = the queue defaults to two-sided */
+} P2CCaps;
+
 /* Bring up libcups + the worker thread(s). Idempotent. Returns 0 on success, -1 if libcups is
  * unavailable (in which case p2c_submit/p2c_enum degrade to no-ops / 0). */
 int  p2c_init(void);
@@ -39,6 +73,12 @@ int  p2c_init(void);
 /* Enumerate CUPS destinations into out[0..max-1]; returns the count written (>=0) or -1 on error.
  * Thread-safe. */
 int  p2c_enum(P2CPrinter *out, int max);
+
+/* Resolve one queue's capabilities into *out (media/page-sizes, resolutions, sources, color,
+ * duplex) via CUPS IPP. `dest` NULL/"" = the CUPS default destination. Returns 0 on success
+ * (out->ok set), -1 if libcups/dest-info is unavailable (out zeroed, out->ok == 0). Thread-safe;
+ * synchronous (a capability query, not a job) — cheap enough to call when a print dialog opens. */
+int  p2c_caps(const char *dest, P2CCaps *out);
 
 /* Queue a print job (async, thread-safe). `dest` = CUPS queue name (NULL/"" = CUPS default);
  * `title` = job title; `format` = P2C_POSTSCRIPT or P2C_PDF; `data`/`len` = the job body (copied,
