@@ -2353,6 +2353,7 @@ static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline
 static int r5_doc_active;                                /* set only during our draw_text_run call */
 static double r5_doc_px;                                 /* RETRO5_DOCFONT_PX size override (0 = auto) */
 static char r5_cur_family[80];                           /* Phase 3: current run's injected family, or "" */
+static double r5_run_size;                               /* chrome runs (DOCFONT=2): one size per run */
 /* Reverse map: WP rasterises glyphs LAZILY (pixmap at glyphTable[c*12]->+0x18 is 0 until first draw),
  * so pre-filtering the buffer by pixmap!=0 dropped not-yet-rendered chars and desynced the mapping.
  * At BLIT time the pixmap IS populated and uniquely identifies the char, so recover the char from the
@@ -2561,7 +2562,15 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     int penx = *(int *)r5s.pen_x, peny = *(int *)r5s.pen_y;
     double sz = r5_doc_pixsize();
     if (symbolic) return 0;                               /* symbol/pi/non-Latin -> WP's native glyph */
-    if (sz <= 0) return 0;                                /* not a sized doc run -> WP draws it */
+    if (sz <= 0) {
+        /* No font-context run size => UI chrome drawn by the same engine (status bar, F9 preview).
+         * RETRO5_DOCFONT=2 renders those with cairo too; use ONE size per run (locked from the first
+         * glyph) so the whole run is consistent — that avoids the per-glyph size wobble. Level 1
+         * leaves chrome to WP's native 1-bit blit. */
+        if (r5_docfont < 2) return 0;
+        if (r5_run_size > 0) sz = r5_run_size;
+        else { sz = (double)h * 1.35; r5_run_size = sz; }
+    }
     if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
     if (penx < 0 || peny < 0 || penx > 20000 || peny > 20000) return 0;   /* sanity */
     sf = cz.xlib_surface_create(dpy, dst, DefaultVisual(dpy, DefaultScreen(dpy)), penx + 64, peny + 24);
@@ -2607,6 +2616,7 @@ void retro5_doc_text(void *buf, int count, int px, int py, int flag, int mode) {
         return;
     }
     r5_doc_active = 1;
+    r5_run_size = 0;                                     /* new run: re-lock the chrome size (DOCFONT=2) */
     r5_doc_text_orig(buf, count, px, py, flag, mode);
     r5_doc_active = 0;
 }
@@ -3398,7 +3408,8 @@ static void findBinaryFixes(void) {
     if (getenv("RETRO5_TRACE")) r5_trace = 1;
     if (getenv("RETRO5_ICON_DUMP")) r5_icon_dump = 1;    /* log each toolbar icon's content hash */
     r5_icons_cfg = getenv("RETRO5_ICONS");               /* hash->file replacement map (NULL = off) */
-    if (getenv("RETRO5_DOCFONT")) r5_docfont = 1;        /* cairo-render the document canvas text (8.0) */
+    { const char *d = getenv("RETRO5_DOCFONT");          /* 1 = document canvas; 2 = + chrome (preview/status) */
+      if (d && *d) r5_docfont = atoi(d) >= 2 ? 2 : 1; }
     if (getenv("RETRO5_DOCFONT81")) r5_docfont81 = 1;    /* EXPERIMENTAL 8.1 canvas (see takeoverWP81) */
     if (getenv("RETRO5_ALLFONTS")) r5_allfonts = 1;      /* unfilter the font selector (all fonts) */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
