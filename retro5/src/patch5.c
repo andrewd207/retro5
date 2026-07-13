@@ -1600,10 +1600,21 @@ static void r5_get(void *w, R5Arg *args, unsigned n) {
  * so a `hash -> file` map can be built by eye; RETRO5_ICONS points at that map file (lines:
  * "<hexhash> <path>", '#' comments). A matched icon is replaced by the file (rendering wired in a
  * following step); either way a disabled button's icon is drawn greyed — native OR replacement. */
-static int         r5_icon_dump;            /* RETRO5_ICON_DUMP: log icon hashes */
+static int         r5_icon_dump;            /* RETRO5_ICON_DUMP: emit config skeleton lines */
 static const char *r5_icons_cfg;            /* RETRO5_ICONS: hash->file map path */
 static struct { uint32_t hash; char file[256]; } r5_icon_map[128];
 static int         r5_icon_map_n = -1;      /* -1 = not yet loaded */
+
+/* Dump de-dup: distinct buttons carry their own pixmap copy of a shared icon, so the same HASH is
+ * seen on many pixmap XIDs. The skeleton wants each hash ONCE. */
+static uint32_t    r5_dump_seen[256];
+static int         r5_dump_seen_n;
+static int r5_dump_first_time(uint32_t h) {
+    int i;
+    for (i = 0; i < r5_dump_seen_n; i++) if (r5_dump_seen[i] == h) return 0;
+    if (r5_dump_seen_n < 256) r5_dump_seen[r5_dump_seen_n++] = h;
+    return 1;
+}
 
 static void r5_icon_map_load(void) {
     FILE *f; char line[400];
@@ -1613,7 +1624,9 @@ static void r5_icon_map_load(void) {
     while (fgets(line, sizeof line, f) && r5_icon_map_n < 128) {
         unsigned long h; char path[256];
         if (line[0] == '#' || line[0] == '\n') continue;
-        if (sscanf(line, "%lx %255s", &h, path) == 2) {
+        /* "<hexhash> <file-or-'-'> [hint...]" — '-' means not mapped yet (skeleton row); the hint
+         * text after the file is documentation for the human and ignored here. */
+        if (sscanf(line, "%lx %255s", &h, path) == 2 && strcmp(path, "-") != 0) {
             r5_icon_map[r5_icon_map_n].hash = (uint32_t)h;
             strncpy(r5_icon_map[r5_icon_map_n].file, path, 255);
             r5_icon_map[r5_icon_map_n].file[255] = 0;
@@ -1700,12 +1713,29 @@ static int r5_blit_gray_color(Display *dpy, Pixmap pm, Drawable dst, GC gc,
 
 static int r5_insensitive(void *w);                      /* defined below (toggle section) */
 
-/* The widget's instance name (XtName) — used to label icon hashes in the discovery dump so they can
- * be matched to files (e.g. name "Save" -> a save icon). Resolved straight from libXt. */
+/* The widget's instance name (XtName). Only the generic Motif type here (TBpushButton, ...), so it
+ * is a poor icon label — the hint below is what actually identifies a button. Resolved from libXt. */
 static char *(*r5_XtName)(void *);
 static const char *r5_widget_name(void *w) {
     if (!r5_XtName) *(void **)&r5_XtName = r5_realsym("XtName");
     return r5_XtName ? r5_XtName(w) : 0;
+}
+
+/* The button's descriptive name — WP's status-bar hint, e.g. "QuickFind Previous", "Bold". WP hangs
+ * it off XmNuserData: a WP control struct whose +0x1c field is a char* to that name. Verified for
+ * this build across push/toggle/palette toolbar buttons. This is what lets an icon hash be matched
+ * to a file by meaning. Guarded: userData on a non-WP widget would give a bad char*, so we reject a
+ * pointer outside the heap rather than deref garbage. */
+static const char *r5_widget_hint(void *w) {
+    void *ud = 0;
+    const char *p;
+    R5Arg a[1];
+    a[0].name = (char *)"userData"; a[0].value = (long)&ud;
+    r5_get(w, a, 1);
+    if (!ud) return 0;
+    p = *(const char **)((const char *)ud + 0x1c);       /* WP control struct: name/hint pointer */
+    if ((uintptr_t)p < 0x08048000 || (uintptr_t)p >= 0x10000000) return 0;  /* not a heap string */
+    return p;
 }
 
 /* ---- the icon seam ----
@@ -1815,10 +1845,14 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     r5_icon_map_load();
     if (r5_icon_dump || r5_icon_map_n > 0) {
         uint32_t hash = r5_pixmap_hash(dpy, pm, pw, ph, pdep);
-        if (r5_icon_dump && hash && r5_hash_fresh) {      /* log each distinct icon once, not per repaint */
-            const char *nm = r5_widget_name(w);
-            char b[256]; int k = snprintf(b, sizeof b, "icon %08x %ux%u dep=%u name=%s\n",
-                                          hash, pw, ph, pdep, nm ? nm : "?");
+        /* Emit a config-skeleton line the first time each distinct hash is seen: "<hash> - <hint>".
+         * The '-' is the blank filename (nothing mapped yet); the hint is WP's button name. Redirect
+         * these into a file and set RETRO5_ICONS to it, then replace '-' with an icon path per row. */
+        if (r5_icon_dump && hash && r5_hash_fresh && r5_dump_first_time(hash)) {
+            const char *hint = r5_widget_hint(w);
+            const char *nm   = r5_widget_name(w);
+            const char *lbl  = (hint && hint[0]) ? hint : (nm ? nm : "?");
+            char b[320]; int k = snprintf(b, sizeof b, "%08x - %s\n", hash, lbl);
             if (k > 0) write(2, b, (size_t)k);
         }
         if ((custom = r5_icon_for(w, pm, hash)) != 0) {
