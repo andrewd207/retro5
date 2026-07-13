@@ -2368,14 +2368,85 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
     return tr;
 }
 
+/* ---- document face matching --------------------------------------------------------------------
+ * The current font's identity lives in a WP font record (+0x10 = .pfb path / WP face name). At the
+ * blit site draw_text_run has only the glyph table (= some record's +0x18), not the record, so we
+ * reverse-scan the font-record pointer array for the record whose +0x18 == the current glyph table
+ * and read its +0x10. That face string maps to a fontconfig generic (Serif/Sans/Monospace) so the
+ * SYSTEM font engine supplies the real face; slant/weight are derived from the name. Cached by the
+ * glyph-table value (the "current font" changes only when WP switches face/size/attr). */
+#define R5_FONTREC_ARR 0x08808754               /* ptr array of font records (8.0; DAT_088281c0@8.1) */
+#define R5_FONTREC_CNT 0x0880875a               /* live count, uint16 (8.0; DAT_088281c6@8.1)        */
+#define R5_METRIC_PTR  0x0880878c               /* -> current font metric struct; +0x00 = face char* */
+
+static const char *r5_face_to_family(const char *face, int *slant, int *weight) {
+    char b[128]; int n = 0; const char *p, *base;
+    *slant = CAIRO_FONT_SLANT_NORMAL; *weight = CAIRO_FONT_WEIGHT_NORMAL;
+    if (!face || !*face) return "Serif";
+    for (base = face, p = face; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;   /* basename */
+    for (n = 0; base[n] && n < (int)sizeof b - 1; n++)
+        b[n] = (base[n] >= 'A' && base[n] <= 'Z') ? base[n] + 32 : base[n];
+    b[n] = 0;
+    if (strstr(b,"italic") || strstr(b,"oblique")) *slant = CAIRO_FONT_SLANT_ITALIC;
+    if (strstr(b,"bold") || strstr(b,"demi") || strstr(b,"black") || strstr(b,"heavy"))
+        *weight = CAIRO_FONT_WEIGHT_BOLD;
+    if (strstr(b,"courier")||strstr(b,"mono")||strstr(b,"cour")||strstr(b,"wpcr")||strstr(b,"wpco"))
+        return "Monospace";
+    if (strstr(b,"helv")||strstr(b,"arial")||strstr(b,"swiss")||strstr(b,"univers")||strstr(b,"wphv")
+        ||strstr(b,"sans")||strstr(b,"gothic"))
+        return "Sans";
+    /* Times / CG Times / Dutch / Roman / most serif book faces (and the safe document default). */
+    return "Serif";
+}
+
+/* Current document face name. The current-font metric struct pointer lives at [0x0880878c]; its
+ * +0x00 is a char* to the PostScript face name (e.g. "Courier10PitchBT-Roman", "Dutch801BT-Bold").
+ * Two derefs, fully range-guarded — no scanning. (Cross-checked live: the active record's +0x18 also
+ * equals this metric pointer, and its +0x10 is the friendly name, but +0x00 here carries the style
+ * suffix we want for slant/weight.) Returns NULL if anything is unmapped -> caller uses a generic. */
+static const char *r5_doc_face(void) {
+    unsigned met, name;
+    if (range_unmapped((void *)(uintptr_t)R5_METRIC_PTR, 4)) return 0;
+    met = *(unsigned *)(uintptr_t)R5_METRIC_PTR;
+    if (!met || range_unmapped((void *)(uintptr_t)met, 4)) return 0;
+    name = *(unsigned *)(uintptr_t)met;                        /* metric struct +0x00 = face char* */
+    if (!name || range_unmapped((void *)(uintptr_t)name, 1)) return 0;
+    return (const char *)(uintptr_t)name;
+}
+
+/* Family + slant/weight for the current document run, cached by the metric-struct pointer (which
+ * changes on every face/size/attribute switch). */
+static struct { unsigned key; char fam[64]; int slant, weight; int has; } r5_doc_facecache;
+static const char *r5_doc_family(int *slant, int *weight) {
+    unsigned key = range_unmapped((void *)(uintptr_t)R5_METRIC_PTR, 4)
+                 ? 0 : *(unsigned *)(uintptr_t)R5_METRIC_PTR;
+    const char *face, *fam;
+    if (r5_doc_facecache.has && r5_doc_facecache.key == key) {
+        *slant = r5_doc_facecache.slant; *weight = r5_doc_facecache.weight;
+        return r5_doc_facecache.fam;
+    }
+    face = r5_doc_face();
+    fam = r5_face_to_family(face, slant, weight);
+    if (r5_trace) {
+        char m[192]; int k = snprintf(m, sizeof m, "retro5: doc face '%s' -> %s%s%s\n",
+            face ? face : "(none)", fam, *weight ? " bold" : "", *slant ? " italic" : "");
+        if (k > 0) write(2, m, (size_t)k);
+    }
+    r5_doc_facecache.key = key; r5_doc_facecache.slant = *slant; r5_doc_facecache.weight = *weight;
+    strncpy(r5_doc_facecache.fam, fam, sizeof r5_doc_facecache.fam - 1);
+    r5_doc_facecache.fam[sizeof r5_doc_facecache.fam - 1] = 0; r5_doc_facecache.has = 1;
+    return r5_doc_facecache.fam;
+}
+
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
  * set the device pen for this glyph in the globals: origin x = [R5_PEN_X], baseline y = [R5_PEN_Y]
  * (dst_x/dst_y in the blit are the ink box, offset by the glyph's bearings — using the pen origin +
  * baseline is exact for cairo's show_text). Size is one run-consistent value (the per-glyph ink box
  * height varies, so we do NOT size by it): RETRO5_DOCFONT_PX overrides; else a heuristic from the box
- * height (a rough cap-height -> em). Uses the reskin UI face; a later step keys off the .pfb. */
+ * height (a rough cap-height -> em). Face is matched from the current font record's .pfb (+0x10). */
 static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned h, unsigned char c) {
-    cairo_surface_t *sf; cairo_t *cr; char s[2];
+    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight;
+    const char *fam = r5_doc_family(&slant, &weight);
     int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
     double sz = r5_doc_px > 0 ? r5_doc_px : (double)h * 1.35;
     if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
@@ -2385,7 +2456,7 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned 
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
     s[0] = (char)c; s[1] = 0;
-    cz.select_font_face(cr, r5_family_for(0, 0), CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cz.select_font_face(cr, fam, slant, weight);
     cz.set_font_size(cr, sz);
     cz.set_source_rgb(cr, 0.0, 0.0, 0.0);
     cz.move_to(cr, (double)penx, (double)peny);          /* pen origin x, baseline y */
