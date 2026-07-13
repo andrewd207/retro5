@@ -2378,6 +2378,24 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
 #define R5_FONTREC_ARR 0x08808754               /* ptr array of font records (8.0; DAT_088281c0@8.1) */
 #define R5_FONTREC_CNT 0x0880875a               /* live count, uint16 (8.0; DAT_088281c6@8.1)        */
 #define R5_METRIC_PTR  0x0880878c               /* -> current font metric struct; +0x00 = face char* */
+#define R5_FONT_CTX    0x08808798               /* -> current font context; +0x04 hi16 = px size     */
+
+/* Constant device-pixel size for the whole run, from the font context ([0x08808798]->+0x04 high
+ * word). Confirmed live: 12pt at the 100 resolution divisor -> 16 px, and it is one value per font
+ * (so glyph size no longer wobbles with each glyph's ink-box height). RETRO5_DOCFONT_PX overrides;
+ * the old ink-box heuristic remains only as a last resort if the context is unreadable. */
+static double r5_doc_pixsize(unsigned inkbox_h) {
+    unsigned ctx, sz;
+    if (r5_doc_px > 0) return r5_doc_px;
+    if (!range_unmapped((void *)(uintptr_t)R5_FONT_CTX, 4)) {
+        ctx = *(unsigned *)(uintptr_t)R5_FONT_CTX;
+        if (ctx && !range_unmapped((void *)(uintptr_t)(ctx + 4), 4)) {
+            sz = (*(unsigned *)(uintptr_t)(ctx + 4)) >> 16;
+            if (sz >= 4 && sz <= 400) return (double)sz;
+        }
+    }
+    return (double)inkbox_h * 1.35;
+}
 
 static const char *r5_face_to_family(const char *face, int *slant, int *weight) {
     char b[128]; int n = 0; const char *p, *base;
@@ -2448,7 +2466,7 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned 
     cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight;
     const char *fam = r5_doc_family(&slant, &weight);
     int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
-    double sz = r5_doc_px > 0 ? r5_doc_px : (double)h * 1.35;
+    double sz = r5_doc_pixsize(h);
     if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
     if (penx < 0 || peny < 0 || penx > 20000 || peny > 20000) return 0;   /* sanity */
     sf = cz.xlib_surface_create(dpy, dst, DefaultVisual(dpy, DefaultScreen(dpy)), penx + 64, peny + 24);
