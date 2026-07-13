@@ -3425,10 +3425,10 @@ static void findBinaryFixes(void) {
     if (getenv("RETRO5_TRACE")) r5_trace = 1;
     if (getenv("RETRO5_ICON_DUMP")) r5_icon_dump = 1;    /* log each toolbar icon's content hash */
     r5_icons_cfg = getenv("RETRO5_ICONS");               /* hash->file replacement map (NULL = off) */
-    { const char *d = getenv("RETRO5_DOCFONT");          /* 1 = document canvas; 2 = + chrome (preview/status) */
-      if (d && *d) r5_docfont = atoi(d) >= 2 ? 2 : 1; }
-    if (getenv("RETRO5_DOCFONT81")) r5_docfont81 = 1;    /* EXPERIMENTAL 8.1 canvas (see takeoverWP81) */
-    if (getenv("RETRO5_ALLFONTS")) r5_allfonts = 1;      /* unfilter the font selector (all fonts) */
+    { const char *d = getenv("RETRO5_DOCFONT");          /* 0 = off; 1 = document canvas; 2 = + chrome */
+      if (d && *d) { int v = atoi(d); r5_docfont = v <= 0 ? 0 : (v >= 2 ? 2 : 1); } }
+    { const char *e = getenv("RETRO5_DOCFONT81"); if (e && *e && e[0] != '0') r5_docfont81 = 1; }  /* EXPERIMENTAL 8.1 canvas */
+    { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
