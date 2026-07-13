@@ -957,15 +957,18 @@ static void r5_parse_xlfd(const char *xlfd, char *family, int fsz,
  * WP was built for late-'90s displays (~75-96 dpi), where its fixed-pixel fonts looked comfortably
  * large; on a modern high-dpi panel the same pixel counts render tiny. r5_scale() is the factor we
  * grow the UI by: render size AND the metrics WP measures (so controls reserve the extra room), kept
- * in lock-step so text still fits its widget. Default is derived from the screen's real dpi against a
- * 96 baseline; RETRO5_UI_SCALE overrides it outright. Floored at 1.0 — we never render SMALLER than
- * stock — and capped so a mis-reported dpi can't blow the UI up. Computed once, when a Display first
- * exists (it does by font-load time). */
+ * in lock-step so text still fits its widget. Default is derived from the screen's real dpi against an
+ * 84 baseline — so an ordinary ~96 dpi screen already gets a modest ~1.14x bump (WP's fixed-pixel
+ * fonts read a touch small even at 96 dpi), and genuinely high-dpi panels scale further.
+ * RETRO5_UI_SCALE overrides it outright. Floored at 1.0 — we never render SMALLER than stock — and
+ * capped so a mis-reported dpi can't blow the UI up. Computed once, when a Display first exists (it
+ * does by font-load time). */
+#define R5_DPI_BASE 84.0                                /* dpi mapping to 1.0; 96 dpi -> ~1.14 */
 static double r5_ui_scale_env;                          /* RETRO5_UI_SCALE, 0 = unset */
 static double r5_ui_scale_cache;                        /* 0 = not yet computed */
 static Display *r5_dpy;                                 /* stashed Display for the no-Display metrics */
 static double r5_scale(void) {
-    double s = 1.0;
+    double s = 96.0 / R5_DPI_BASE;                       /* default assumes an ordinary ~96 dpi screen */
     if (r5_ui_scale_cache > 0) return r5_ui_scale_cache;
     if (r5_ui_scale_env > 0) {
         s = r5_ui_scale_env;
@@ -973,7 +976,7 @@ static double r5_scale(void) {
         int scr = DefaultScreen(r5_dpy);
         int mm  = DisplayHeightMM(r5_dpy, scr);
         int px  = DisplayHeight(r5_dpy, scr);
-        if (mm > 0 && px > 0) s = (px * 25.4 / mm) / 96.0;
+        if (mm > 0 && px > 0) s = (px * 25.4 / mm) / R5_DPI_BASE;   /* real dpi when known */
     }
     if (s < 1.0)  s = 1.0;                               /* never below stock */
     if (s > 1.75) s = 1.75;                              /* guard a bogus dpi */
