@@ -3064,7 +3064,9 @@ static void r5_inject_fonts(void) {
         unsigned char *rec = (unsigned char *)calloc(1, 0x20);
         if (!rec) break;
         if (tmpl) memcpy(rec, tmpl, 0x20);                     /* inherit valid fields from a real font */
+        *(unsigned short *)(rec + 0x06) = (unsigned short)code;/* this record's OWN fontcode (was stale) */
         *(char **)(rec + 0x08) = strdup("wphv____.pfb");       /* stock face; resolver never faults */
+        *(char **)(rec + 0x0c) = strdup(r5_fcfam[i]);          /* list-name (was stale template ptr) */
         *(char **)(rec + 0x10) = strdup(r5_fcfam[i]);          /* system family (selector display name) */
         *(char **)(rec + 0x14) = 0;                            /* no aux name */
         *(unsigned *)(rec + 0x18) = 0;                         /* lazy metric cache */
