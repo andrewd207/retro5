@@ -2318,15 +2318,33 @@ void retro5_DrawnButtonResize(void *w) {
  * OPT-IN and safe: without RETRO5_DOCFONT we never patch draw_text_run or hook XCopyPlane — the page
  * is byte-for-byte WP's own. Any failure (no cairo, bad glyph table) falls back to WP's bitmap blit. */
 static int r5_docfont;                                   /* RETRO5_DOCFONT: cairo-render the canvas */
-#define R5_DOC_TEXT_VA   0x085b54e0                       /* draw_text_run (8.0) */
-/* The current font's glyph table is the RETURN of this getter (draw_text_run itself calls it, then
- * stores it at -0x98(ebp)); it is NOT a plain global deref — reading 0x08808794 gave nothing. */
-static unsigned (*r5_glyphtab_get)(void) = (unsigned (*)(void))0x085b9840;
+static int r5_docfont81;                                 /* RETRO5_DOCFONT81: EXPERIMENTAL 8.1 canvas */
+static int r5_allfonts;                                  /* RETRO5_ALLFONTS: unfilter the font selector */
+
+/* Per-build symbol/address table. Filled once at load time by the detected build's takeover
+ * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
+ * function and the selector patch read r5s.<field>. 8.1 differs from 8.0 in relocated globals and in
+ * STATIC-linked Xlib (XCopyPlane is a static fn with no GOT), hence both a GOT-interpose path (8.0)
+ * and a call-site path (8.1). See installer/wp81port/FONT-RENDERING-MAP.md §14. */
+typedef struct {
+    uintptr_t doc_text_va;        /* draw_text_run entry (8.0: entry-patch + trampoline)          */
+    uintptr_t blit_site;          /* glyph-blit XCopyPlane call site (8.1 call-site patch); 0 on 8.0 */
+    unsigned char blit_call[5];   /* guard bytes at blit_site (8.1)                                */
+    uintptr_t xcp_plt, xcp_got;   /* XCopyPlane PLT/GOT for GOT interpose (8.0); 0 on 8.1          */
+    uintptr_t xcp_fn;             /* real static XCopyPlane (8.1); 0 => resolve dynamically (8.0)  */
+    uintptr_t pen_x, pen_y;       /* device pen X (glyph origin) / Y (baseline)                    */
+    uintptr_t metric_ptr;         /* -> current metric struct; +0x00 = face-name char*            */
+    uintptr_t font_ctx;           /* -> current font context; +0x04 hi16 = device px size          */
+    uintptr_t fontrec_arr, fontrec_cnt;                  /* font-record ptr array + live count u16 */
+    unsigned (*glyphtab_get)(void);                      /* returns the current glyph table         */
+    uintptr_t sel_filter_jne;     /* the "record+0x1e != 0" list filter jne to NOP (all-fonts)     */
+    unsigned char sel_filter_bytes[2];                   /* guard: expected `75 XX`                 */
+} R5Syms;
+static R5Syms r5s;
+
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
 static int r5_doc_active;                                /* set only during our draw_text_run call */
 static double r5_doc_px;                                 /* RETRO5_DOCFONT_PX size override (0 = auto) */
-#define R5_PEN_X   0x87bdd5c                              /* device pen X (glyph origin), set per glyph */
-#define R5_PEN_Y   0x87bdd60                              /* device pen Y (baseline),     set per glyph */
 /* Reverse map: WP rasterises glyphs LAZILY (pixmap at glyphTable[c*12]->+0x18 is 0 until first draw),
  * so pre-filtering the buffer by pixmap!=0 dropped not-yet-rendered chars and desynced the mapping.
  * At BLIT time the pixmap IS populated and uniquely identifies the char, so recover the char from the
@@ -2335,9 +2353,9 @@ static struct { unsigned pm; unsigned char c; } r5_pmc[256];
 static int r5_pmc_n;
 static unsigned char r5_pixmap_to_char(unsigned pm) {
     int i; unsigned tab;
-    if (!pm) return 0;
+    if (!pm || !r5s.glyphtab_get) return 0;
     for (i = 0; i < r5_pmc_n; i++) if (r5_pmc[i].pm == pm) return r5_pmc[i].c;
-    tab = r5_glyphtab_get();
+    tab = r5s.glyphtab_get();
     if (!tab || range_unmapped((void *)(uintptr_t)tab, 12)) return 0;
     for (i = 1; i < 256; i++) {
         unsigned entry = tab + (unsigned)i * 12, glyph, gpm = 0;
@@ -2375,11 +2393,6 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
  * and read its +0x10. That face string maps to a fontconfig generic (Serif/Sans/Monospace) so the
  * SYSTEM font engine supplies the real face; slant/weight are derived from the name. Cached by the
  * glyph-table value (the "current font" changes only when WP switches face/size/attr). */
-#define R5_FONTREC_ARR 0x08808754               /* ptr array of font records (8.0; DAT_088281c0@8.1) */
-#define R5_FONTREC_CNT 0x0880875a               /* live count, uint16 (8.0; DAT_088281c6@8.1)        */
-#define R5_METRIC_PTR  0x0880878c               /* -> current font metric struct; +0x00 = face char* */
-#define R5_FONT_CTX    0x08808798               /* -> current font context; +0x04 hi16 = px size     */
-
 /* Constant device-pixel size for the whole run, from the font context ([0x08808798]->+0x04 high
  * word). Confirmed live: 12pt at the 100 resolution divisor -> 16 px, one value per font (so glyph
  * size no longer wobbles with each glyph's ink-box height). Returns 0 when there is NO reliable run
@@ -2389,8 +2402,8 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
 static double r5_doc_pixsize(void) {
     unsigned ctx, sz;
     if (r5_doc_px > 0) return r5_doc_px;
-    if (!range_unmapped((void *)(uintptr_t)R5_FONT_CTX, 4)) {
-        ctx = *(unsigned *)(uintptr_t)R5_FONT_CTX;
+    if (r5s.font_ctx && !range_unmapped((void *)r5s.font_ctx, 4)) {
+        ctx = *(unsigned *)r5s.font_ctx;
         if (ctx && !range_unmapped((void *)(uintptr_t)(ctx + 4), 4)) {
             sz = (*(unsigned *)(uintptr_t)(ctx + 4)) >> 16;
             if (sz >= 4 && sz <= 400) return (double)sz;
@@ -2440,8 +2453,8 @@ static const char *r5_face_to_family(const char *face, int *slant, int *weight, 
  * suffix we want for slant/weight.) Returns NULL if anything is unmapped -> caller uses a generic. */
 static const char *r5_doc_face(void) {
     unsigned met, name;
-    if (range_unmapped((void *)(uintptr_t)R5_METRIC_PTR, 4)) return 0;
-    met = *(unsigned *)(uintptr_t)R5_METRIC_PTR;
+    if (!r5s.metric_ptr || range_unmapped((void *)r5s.metric_ptr, 4)) return 0;
+    met = *(unsigned *)r5s.metric_ptr;
     if (!met || range_unmapped((void *)(uintptr_t)met, 4)) return 0;
     name = *(unsigned *)(uintptr_t)met;                        /* metric struct +0x00 = face char* */
     if (!name || range_unmapped((void *)(uintptr_t)name, 1)) return 0;
@@ -2452,8 +2465,8 @@ static const char *r5_doc_face(void) {
  * changes on every face/size/attribute switch). */
 static struct { unsigned key; char fam[64]; int slant, weight, symbolic; int has; } r5_doc_facecache;
 static const char *r5_doc_family(int *slant, int *weight, int *symbolic) {
-    unsigned key = range_unmapped((void *)(uintptr_t)R5_METRIC_PTR, 4)
-                 ? 0 : *(unsigned *)(uintptr_t)R5_METRIC_PTR;
+    unsigned key = (!r5s.metric_ptr || range_unmapped((void *)r5s.metric_ptr, 4))
+                 ? 0 : *(unsigned *)r5s.metric_ptr;
     const char *face, *fam;
     if (r5_doc_facecache.has && r5_doc_facecache.key == key) {
         *slant = r5_doc_facecache.slant; *weight = r5_doc_facecache.weight;
@@ -2529,7 +2542,7 @@ static int r5_utf8(unsigned cp, char *o) {                       /* encode cp ->
 static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, unsigned h, unsigned char c) {
     cairo_surface_t *sf; cairo_t *cr; char s[5]; int slant, weight, symbolic; double cr_, cg, cb;
     const char *fam = r5_doc_family(&slant, &weight, &symbolic);
-    int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
+    int penx = *(int *)r5s.pen_x, peny = *(int *)r5s.pen_y;
     double sz = r5_doc_pixsize();
     if (symbolic) return 0;                               /* symbol/pi/non-Latin -> WP's native glyph */
     if (sz <= 0) return 0;                                /* not a sized doc run -> WP draws it */
@@ -2562,7 +2575,10 @@ void retro5_XCopyPlane(Display *dpy, Drawable src, Drawable dst, GC gc,
         unsigned char c = r5_pixmap_to_char((unsigned)src);       /* recover char from glyph pixmap */
         if (c && r5_doc_render_glyph(dpy, dst, gc, w, h, c)) return; /* rendered via cairo */
     }
-    if (!r5_real_CopyPlane_x) *(void **)&r5_real_CopyPlane_x = r5_realsym("XCopyPlane");
+    if (!r5_real_CopyPlane_x) {
+        if (r5s.xcp_fn) *(void **)&r5_real_CopyPlane_x = (void *)r5s.xcp_fn;  /* 8.1: static X fn */
+        else *(void **)&r5_real_CopyPlane_x = r5_realsym("XCopyPlane");        /* 8.0: dynamic */
+    }
     if (r5_real_CopyPlane_x) r5_real_CopyPlane_x(dpy, src, dst, gc, sx, sy, w, h, dx, dy, plane);
 }
 
@@ -2894,10 +2910,37 @@ void retro5_LabelExpose(void *w, XEvent *ev, Region region) {
  *  Per-binary fix routines — each concentrated, self-contained, and obvious
  * ======================================================================================= */
 
+/* Font-selector takeover (RETRO5_ALLFONTS): the F9 "Font Face" list builder shows an entry only if
+ * record+0x1e == 0 (a printer-available-vs-display-only category byte). Normal mode leaves only the
+ * current printer's font(s) at 0, so the list shows ~1; NOP the filter jne and ALL enumerated fonts
+ * list. One scoped 2-byte patch — does NOT touch the 55-consumer admin flag; the shared widget-populate
+ * wrapper means it fixes all font pickers at once. Per-build jne site in r5s. (FONT-RENDERING-MAP §14) */
+static void r5_apply_allfonts(void) {
+    unsigned char *p = (unsigned char *)r5s.sel_filter_jne;
+    if (!r5_allfonts || !r5s.sel_filter_jne || range_unmapped(p, 2)) return;
+    if (p[0] == r5s.sel_filter_bytes[0] && p[1] == r5s.sel_filter_bytes[1]) {
+        unsigned char nop[2] = {0x90, 0x90};
+        write_code(r5s.sel_filter_jne, nop, 2);
+        if (r5_trace) { const char *m = "retro5: font selector unfiltered (all fonts)\n";
+                        write(2, m, strlen(m)); }
+    } else if (r5_trace) { const char *m = "retro5: ALLFONTS skipped (guard mismatch)\n";
+                           write(2, m, strlen(m)); }
+}
+
 /* WordPerfect 8.0.0076, dynamic-X build ("build B"). .text base 0x08048000. */
 static void takeoverWP80(void);          /* appearance table for this build, below */
 
 static void applyWp8_0_dynX_Fixes(void) {
+    /* Per-build symbol table for this (8.0 dynamic-X) binary — see FONT-RENDERING-MAP §14. */
+    r5s.doc_text_va = 0x085b54e0;
+    r5s.blit_site = 0;                                   /* 8.0 uses GOT interpose, not a call site */
+    r5s.xcp_plt = 0x0804f2d0; r5s.xcp_got = 0x087d8278; r5s.xcp_fn = 0;   /* dynamic XCopyPlane */
+    r5s.pen_x = 0x087bdd5c; r5s.pen_y = 0x087bdd60;
+    r5s.metric_ptr = 0x0880878c; r5s.font_ctx = 0x08808798;
+    r5s.fontrec_arr = 0x08808754; r5s.fontrec_cnt = 0x0880875a;
+    r5s.glyphtab_get = (unsigned (*)(void))0x085b9840;
+    r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
+
     /* Table QuickFill (Insert Table -> "Extend the pattern in the current selection"):
        guard the code-stream parser's copy at 0x08430205 (orig: call FUN_085c5dd0). */
     patch_call(0x08430205, "\xe8\xc6\x5b\x19\x00", retro5_guarded_copy);
@@ -2910,6 +2953,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     patch_call(0x080f2a52, "\xe8\xe9\xc9\xf5\xff", retro5_guarded_XtVaGetValues);
 
     if (r5_skin) takeoverWP80();
+    r5_apply_allfonts();
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -3025,15 +3069,15 @@ static void takeoverWP80(void) {
         /* Document canvas font rendering (opt-in): jmp-patch WP's own glyph-blit loop draw_text_run
          * via a trampoline (so its layout body still runs) and hook XCopyPlane so each glyph is cairo-
          * drawn. Only when RETRO5_DOCFONT is set — otherwise the page is byte-for-byte WP's own. */
-        if (r5_docfont && cz.icons_ok) {
+        if (r5_docfont && cz.icons_ok && r5s.doc_text_va) {
             static const unsigned char g[] = {0x55,0x89,0xe5,0x81,0xec,0xb0,0x00,0x00,0x00};
             int ok = 0;
-            if (!memcmp((void *)R5_DOC_TEXT_VA, g, sizeof g)) {
+            if (!memcmp((void *)r5s.doc_text_va, g, sizeof g)) {
                 r5_doc_text_orig = (void (*)(void *, int, int, int, int, int))
-                                   r5_make_trampoline(R5_DOC_TEXT_VA, 9);
+                                   r5_make_trampoline(r5s.doc_text_va, 9);
                 if (r5_doc_text_orig) {
-                    patch_entry(R5_DOC_TEXT_VA, (const char *)g, sizeof g, (void *)retro5_doc_text);
-                    ok = patch_import(0x0804f2d0, 0x087d8278, (void *)retro5_XCopyPlane);
+                    patch_entry(r5s.doc_text_va, (const char *)g, sizeof g, (void *)retro5_doc_text);
+                    ok = patch_import(r5s.xcp_plt, r5s.xcp_got, (void *)retro5_XCopyPlane);
                 }
             }
             if (r5_trace) { char b[80]; int k = snprintf(b, sizeof b,
@@ -3041,6 +3085,54 @@ static void takeoverWP80(void) {
                 if (k > 0) write(2, b, (size_t)k); }
         }
     }
+}
+
+/* WordPerfect 8.1 (static-X build, 8,161,760 B). DOC-FONT canvas rendering only for now — the Motif
+ * appearance reskin is not yet ported (8.1 statically links Xlib/Xt, so the GOT interposition the 8.0
+ * reskin relies on is impossible; it needs inline detours). Addresses from FONT-RENDERING-MAP §14.
+ * draw_text_run @0x08535ca4; the glyph blit @0x08536301 is `call 0x08677d60` (XCopyPlane is a STATIC
+ * function — no GOT slot). So we patch that single call site (scoped to exactly the document glyph
+ * blit) rather than interposing an import, and reach the real XCopyPlane via r5_df_xcp_fn. */
+static void takeoverWP81(void) {
+    /* 8.1's document glyph pipeline is structurally different from 8.0 (static-X, different codegen);
+     * our cairo blit hook currently destabilises it and 8.1 has its own newer renderer — so the canvas
+     * cairo layer is OFF unless RETRO5_DOCFONT81 is set explicitly (experimental). 8.1's retro5 value
+     * is the all-fonts selector + -admin gate + (coming) printer/reskin work, not the doc-font canvas. */
+    if (r5_text && r5_docfont81) {
+        r5_cairo_load();
+        r5_cairo_warm();
+        if (cz.icons_ok && r5s.blit_site) {
+            /* 8.1 links Xlib statically (no XCopyPlane GOT). The glyph blit is one `call` to the
+             * static XCopyPlane; patch just that call site -> our hook. Scoped to exactly the doc
+             * glyph, so no draw_text_run entry patch and no r5_doc_active toggling are needed. */
+            unsigned char *site = (unsigned char *)r5s.blit_site;
+            int ok = 0;
+            if (!range_unmapped(site, 5) && !memcmp(site, r5s.blit_call, 5)) {
+                patch_call(r5s.blit_site, (const char *)r5s.blit_call, (void *)retro5_XCopyPlane);
+                ok = (memcmp(site, r5s.blit_call, 5) != 0);   /* bytes changed => patch applied */
+                if (ok) r5_doc_active = 1;                     /* call-site-scoped: always a doc glyph */
+            }
+            if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
+                "retro5: 8.1 doc-font canvas render %s\n", ok ? "enabled" : "SKIPPED (guard mismatch)");
+                if (k > 0) write(2, b, (size_t)k); }
+        }
+    }
+}
+
+static void applyWp8_1_Fixes(void) {
+    /* Per-build symbol table for this (8.1 static-X) binary — see FONT-RENDERING-MAP §14. */
+    r5s.doc_text_va = 0x08535ca4;
+    r5s.blit_site   = 0x08536301;
+    r5s.blit_call[0]=0xe8; r5s.blit_call[1]=0x5a; r5s.blit_call[2]=0x1a; r5s.blit_call[3]=0x14; r5s.blit_call[4]=0x00;
+    r5s.xcp_plt = 0; r5s.xcp_got = 0; r5s.xcp_fn = 0x08677d60;   /* static XCopyPlane */
+    r5s.pen_x = 0x087d9f54; r5s.pen_y = 0x087d9f58;
+    r5s.metric_ptr = 0x088281f8; r5s.font_ctx = 0x08828204;
+    r5s.fontrec_arr = 0x088281c0; r5s.fontrec_cnt = 0x088281c6;
+    r5s.glyphtab_get = (unsigned (*)(void))0x08539db8;
+    r5s.sel_filter_jne = 0x08538408; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4d;
+    /* 8.1 doc-font port (static-X). Motif appearance reskin not yet ported. */
+    takeoverWP81();
+    r5_apply_allfonts();
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
@@ -3059,6 +3151,7 @@ static void takeoverWP80(void) {
 struct known_binary { uint32_t hash; const char *name; void (*apply)(void); };
 static const struct known_binary KNOWN_BINARIES[] = {
     { 0x12d07fceu, "WordPerfect 8.0.0076 (dynamic-X)", applyWp8_0_dynX_Fixes },
+    { 0x5f86b242u, "WordPerfect 8.1 (static-X)",       applyWp8_1_Fixes      },
     /* { 0x........, "WordPerfect 8.0 (static-X, 8.16 MB)", applyWp8_0_staticX_Fixes }, */
 };
 
@@ -3089,7 +3182,9 @@ static void findBinaryFixes(void) {
     if (getenv("RETRO5_TRACE")) r5_trace = 1;
     if (getenv("RETRO5_ICON_DUMP")) r5_icon_dump = 1;    /* log each toolbar icon's content hash */
     r5_icons_cfg = getenv("RETRO5_ICONS");               /* hash->file replacement map (NULL = off) */
-    if (getenv("RETRO5_DOCFONT")) r5_docfont = 1;        /* cairo-render the document canvas text */
+    if (getenv("RETRO5_DOCFONT")) r5_docfont = 1;        /* cairo-render the document canvas text (8.0) */
+    if (getenv("RETRO5_DOCFONT81")) r5_docfont81 = 1;    /* EXPERIMENTAL 8.1 canvas (see takeoverWP81) */
+    if (getenv("RETRO5_ALLFONTS")) r5_allfonts = 1;      /* unfilter the font selector (all fonts) */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
