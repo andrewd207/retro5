@@ -2495,33 +2495,11 @@ static int r5_p2c_load(void) {
     return 1;
 }
 
-/* --- CUPS replaces WP's print server outright (RETRO5_CUPS) --------------------------------------
- * WP launches its `wpexc` print server through a generic fork+exec+wait spawn (8.0 fn 0x085c7a90),
- * called once at startup from 0x0853154c, and thereafter drives printing by talking to that child
- * over a pipe/FIFO. In CUPS mode that whole subprocess is redundant — our in-process threaded bridge
- * IS the print server. So we do NOT fork it at all: retro5 interposes that one spawn and, when CUPS
- * is on, SKIPS the fork/exec (no wpexc child, therefore no pipe to talk to, and no stale FIFO/lock
- * state left behind) and instead brings the CUPS backend up in-process. This also removes the reason
- * the constructor could not load CUPS: there is no longer a fork that would inherit our worker/
- * prefetch threads' locked mutex (which dead-locked the child in futex_wait — live-confirmed on
- * Xvfb :145: with the old code the forked child sat in futex_wait_queue while the parent blocked in
- * wait(), so WP never left its splash).
- *
- * The spawn's own success contract (verified in-tree): parent-success returns 0 and the child's wait
- * status is written through arg4; so we return 0 and write *stat_out = 0 to take WP's OK path. Init-
- * once — a later call (WP reuses this generic spawn for other helpers is possible) with CUPS already
- * up just "says hi" and returns success without forking. cdecl, 4 args: (execvp file, argv, flags,
- * status-out). Without CUPS, forward verbatim to the real spawn so default behaviour is unchanged. */
-static int (*r5_pserver_spawn)(void *, void *, int, void *);   /* real 0x085c7a90 (non-CUPS passthrough) */
-static int r5_cups_started;
-static int retro5_pserver_spawn(void *file, void *argv, int flags, void *stat_out) {
-    if (r5_cups) {                                     /* bypass wpexc — CUPS threads are the server */
-        if (!r5_cups_started) { r5_cups_started = 1; r5_p2c_load(); }
-        if (stat_out) *(int *)stat_out = 0;            /* child-status 0 -> WP's success path */
-        return 0;                                      /* spawn "succeeded" without forking anything */
-    }
-    return r5_pserver_spawn ? r5_pserver_spawn(file, argv, flags, stat_out) : 1;
-}
+/* CUPS job routing (RETRO5_CUPS) is implemented at the wppx PostScript-write stage — retro5's own
+ * libc file-I/O layer captures the `%!PS-Adobe` bytes as the spooler writes /tmp/_pp_<pid> and hands
+ * the buffer to printertocups (p2c_submit), suppressing the legacy `lpr`. See the file-I/O interpose.
+ * (The old wpexc-spawn bypass was removed: §20 proved wpexc is an idle daemon off the print path, so
+ * bypassing it only caused the "Cannot create a new process" spawn-loop.) */
 
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
 static int r5_doc_active;                                /* set only during our draw_text_run call */
@@ -3374,15 +3352,11 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_apply_allfonts();
     r5_install_injection();
     r5_install_resolver_hook();
-    /* CUPS: replace the wpexc print-server launch with in-process CUPS (see retro5_pserver_spawn).
-     * Interpose the print-server spawn call site 0x0853154c (`call 0x085c7a90`); the handler skips
-     * the fork/exec entirely when CUPS is on and brings the backend up instead — so no wpexc child,
-     * no pipe, and no fork to inherit our threads' locks. Keep the real fn ptr for the non-CUPS pass-
-     * through (harmless: with CUPS off the site is not even patched, since we only patch when r5_cups). */
-    if (r5_cups) {
-        r5_pserver_spawn = (int (*)(void *, void *, int, void *))0x085c7a90;
-        patch_call(0x0853154c, "\xe8\x3f\x65\x09\x00", (void *)retro5_pserver_spawn);
-    }
+    /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
+     * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
+     * interactive print path, so bypassing its spawn was both unnecessary and the cause of the
+     * "Cannot create a new process" spawn-loop. wpexc now spawns normally; and because retro5 no
+     * longer starts CUPS threads in xwp at all, there is no fork-inherited lock to deadlock on. */
 }
 
 /* ---------------------------------------------------------------------------------------
