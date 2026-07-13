@@ -1983,7 +1983,21 @@ static Pixmap r5_icon_render(Display *dpy, Window win, unsigned dep,
  */
 #define R5_BORDER_HL_OFF   116
 #define R5_BORDER_UNHL_OFF 120
-static void retro5_NoHighlight(void *w) { (void)w; }     /* we own the whole button; Motif draws nothing */
+static int r5_is_dropdown_item(void *w);                 /* defined in the menu-item section below */
+static int (*r5_XClearArea)(Display *, Window, int, int, unsigned, unsigned, int);
+/* border_highlight/unhighlight takeover. For toolbar/dialog buttons this is a pure no-op (Motif must
+ * not draw its highlight border over the button we fully painted). For a DROPDOWN MENU ITEM we reuse
+ * this enter/leave hook the other way: force an Expose so our expose re-runs and re-evaluates the
+ * hot-track (the item under the pointer washes subtly). Cheap XClearArea(...,True) just queues the
+ * Expose; with the item window's None background it paints nothing itself, so no flash. */
+static void retro5_NoHighlight(void *w) {
+    if (w && r5_is_dropdown_item(w)) {
+        Display *dpy = r5x.XtDisplayOfObject(w);
+        Window   win = r5x.XtWindowOfObject(w);
+        if (!r5_XClearArea) *(void **)&r5_XClearArea = r5_realsym("XClearArea");
+        if (dpy && win && r5_XClearArea) r5_XClearArea(dpy, win, 0, 0, 0, 0, 1);
+    }
+}
 
 static void *(*r5_XtClass)(void *);
 static void  *r5_hl_done[16];
@@ -2003,9 +2017,23 @@ static void r5_take_highlight(void *w) {
     if (unhl != (uintptr_t)retro5_NoHighlight)
         patch_method((uintptr_t)cls, R5_BORDER_UNHL_OFF, unhl, (void *)retro5_NoHighlight, &saved);
     if (r5_trace) {
-        char b[96]; int k = snprintf(b, sizeof b, "retro5: highlight takeover class %p (no-op)\n", cls);
+        char b[96]; int k = snprintf(b, sizeof b, "retro5: highlight takeover class %p\n", cls);
         if (k > 0) write(2, b, (size_t)k);
     }
+}
+
+/* Give a window a None background so the server never auto-fills it. WP hot-tracks buttons on hover
+ * by calling XtVaSetValues on enter/leave; when set_values asks for redisplay, Xt runs
+ * XClearArea(win, 0,0,0,0, True) — clears the WHOLE window to its (grey) background then generates an
+ * Expose. That grey clear is a visible flash before our expose repaints (gdb: XClearArea <-
+ * XtSetValues <- XtVaSetValues <- WP enter/leave). Per the X spec, XClearArea on a None-background
+ * window changes NO contents but still generates the exposures, so our expose redraws over the intact
+ * frame: the Expose survives, the flash does not. Only for windows we fully own. */
+static int (*r5_XSetWindowBackgroundPixmap)(Display *, Window, Pixmap);
+static void r5_win_no_autoclear(Display *dpy, Window win) {
+    if (!r5_XSetWindowBackgroundPixmap)
+        *(void **)&r5_XSetWindowBackgroundPixmap = r5_realsym("XSetWindowBackgroundPixmap");
+    if (r5_XSetWindowBackgroundPixmap) r5_XSetWindowBackgroundPixmap(dpy, win, (Pixmap)None);
 }
 
 /* Paint a Label-derived button end to end: face, border, icon. Nothing of Motif's drawing survives
@@ -2082,6 +2110,7 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
      * screen until the single commit. */
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
     dst = cv.buf;
+    r5_win_no_autoclear(dpy, win);                        /* kill the grey enter/leave clear flash */
 
     /* 1. face. Filling is safe here (unlike inside _XmDrawShadows) precisely because we own the
      *    order: the icon has not been drawn yet — we draw it, below, on top. */
@@ -2179,11 +2208,13 @@ static int retro5_paint_menu_item(void *w, XEvent *ev, Region region, int cascad
     if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bw, &dep)) return 0;
     if (ww < 4 || hh < 4) return 0;
     r5_bg_pixel(w, &bg);
+    r5_take_highlight(w);                                /* enter/leave -> repaint (hot-track, below) */
 
     hot  = !r5_insensitive(w) && r5_pointer_in(dpy, win, ww, hh);   /* highlight item under pointer */
     fill = hot ? r5_blend_pixel(0x3a6ea5u, bg, 0.24) : bg;          /* subtle blue wash */
 
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) return 0;
+    r5_win_no_autoclear(dpy, win);                       /* no grey flash on the hover repaint clear */
     face = r5_gc_for_pixel(dpy, cv.buf, fill);
     if (face) r5x.FillRectangle(dpy, cv.buf, face, 0, 0, ww, hh);   /* fresh face */
 
