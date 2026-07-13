@@ -332,8 +332,49 @@ int putenv(char *s) {
 }
 FWD(int,   getpid, (void), ())
 FWD(int,   getuid, (void), ())
-FWD(int,   geteuid,(void), ())
 FWD(int,   getegid,(void), ())
+
+/* geteuid override for `-admin` font install on a USER-OWNED (writable) install.
+ * WordPerfect's admin/font-install mode (`xwp -admin`, and its `xwpfi` helper) is gated by
+ * geteuid()==0 (auth fn 0x857ee20: geteuid -> test -> jne authorized), then refuses non-root with
+ * "Not authorized to run as administrator" and exit(2). But this WP lives in a user-owned tree, so
+ * that root requirement is just permission theatre — the install writes wp.drs under the user's own
+ * shlib10. Report euid 0 ONLY when BOTH hold:
+ *   (a) admin context — argv contains "-admin", or this process IS the xwpfi helper; and
+ *   (b) the WP install dir ($WPC) is writable by the real user.
+ * A SYSTEM install (root-owned, not writable) still sees the real euid, so WP's protection is intact;
+ * and normal (non-admin) WP runs never see euid 0, keeping the many other geteuid callers untouched. */
+extern int access(const char *, int);
+static int r5_admin_local(void) {
+    static int cached = -1;
+    int fd; char b[1024]; long n; int admin = 0;
+    const char *wpc;
+    if (cached >= 0) return cached;
+    cached = 0;
+    fd = open("/proc/self/cmdline", 0 /*O_RDONLY*/, 0);
+    if (fd >= 0) {
+        n = read(fd, b, sizeof b - 1); close(fd);
+        if (n > 0) {
+            long i; b[n] = 0;
+            for (i = 0; i < n; i++)
+                if (i == 0 || b[i-1] == 0) {                 /* start of an argv token */
+                    const char *t = b + i, *bn = t, *p;
+                    for (p = t; *p; p++) if (*p == '/') bn = p + 1;   /* basename */
+                    if (!__builtin_strcmp(bn, "xwpfi") || !__builtin_strcmp(t, "-admin")) admin = 1;
+                }
+        }
+    }
+    if (!admin) return cached;                               /* not admin context -> real euid */
+    wpc = getenv("WPC");
+    if (wpc && *wpc && access(wpc, 2 /*W_OK*/) == 0) cached = 1;   /* writable local install */
+    return cached;
+}
+int geteuid(void) {
+    static int (*fn)(void);
+    if (r5_admin_local()) return 0;
+    if (!fn) fn = (int (*)(void)) dlsym(RTLD_NEXT, "geteuid");
+    return fn ? fn() : 0;
+}
 FWD(unsigned, alarm, (unsigned a), (a))
 FWD(unsigned, sleep, (unsigned a), (a))
 FWD(int,   kill,   (int a, int b), (a, b))
