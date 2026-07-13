@@ -1692,6 +1692,35 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
     retro5_round_widget(w);
 }
 
+/* ---- bigger icon toolbar buttons under the UI scale ----
+ * An XmDrawnButton with a pixmap sizes itself in Motif's XmLabel SetSize: core = TextRect(pixmap) +
+ * margins + 2*(marginW + shadow + highlight), but ONLY when core.width is still 0 (initial sizing).
+ * SetSize is reached through DrawnButton's `resize` method, so we take that over and inflate the icon
+ * slot (label.TextRect) by the UI scale BEFORE the original runs — SetSize then computes
+ * core = round(icon*scale) + the constant chrome, and re-centers, with no reimplementation. The
+ * core.width==0 gate makes it a one-shot per widget (later resizes keep the already-inflated slot).
+ * Instance-field offsets verified for this build (guarded by the class-record `expect` in the swap):
+ * core.width +0x20, TextRect.width +0xf4, TextRect.height +0xf6. No-op at scale 1.0.
+ *
+ * NB: XCopyArea does not scale, so this enlarges the BUTTON (icon centered with more padding); the
+ * icon glyph itself only grows via a larger source pixmap (the planned SVG-by-hash replacement). */
+#define R5_RESIZE_OFF (R5_EXPOSE_OFF - 4)                /* offsetof(CoreClassPart, resize) = 64 */
+static void (*r5_orig_drawnbutton_resize)(void *);
+
+void retro5_DrawnButtonResize(void *w) {
+    if (r5_skin && w) {
+        double s = r5_scale();
+        unsigned short *cw = (unsigned short *)((char *)w + 0x20);   /* core.width */
+        if (s > 1.0001 && *cw == 0) {                    /* initial sizing only -> inflate icon slot */
+            unsigned short *tw = (unsigned short *)((char *)w + 0xf4);   /* label.TextRect.width  */
+            unsigned short *th = (unsigned short *)((char *)w + 0xf6);   /* label.TextRect.height */
+            if (*tw && *tw < 2000) *tw = (unsigned short)(*tw * s + 0.5);
+            if (*th && *th < 2000) *th = (unsigned short)(*th * s + 0.5);
+        }
+    }
+    if (r5_orig_drawnbutton_resize) r5_orig_drawnbutton_resize(w);   /* SetSize computes core from it */
+}
+
 /* True when a widget is insensitive (disabled). XtIsSensitive is the correct test — it folds in
  * ancestor sensitivity — and is a genuine libXt symbol, unlike the XmNsensitive resource read which
  * proved unreliable here. Resolved directly from libXt (never RTLD_DEFAULT). */
@@ -2090,6 +2119,25 @@ static void takeoverWP80(void) {
             lm[0].saved     = (void **)&r5_orig_label_expose;
             lm[0].name      = "XmLabel";
             takeover_methods(lm, 1);
+        }
+    }
+
+    /* Bigger icon toolbar buttons: take over XmDrawnButton's `resize` (class 0x087cd050, slot +64)
+     * so its SetSize reserves UI-scaled space per icon. Guarded by the live resize fn value. No-op at
+     * scale 1.0, so stock-dpi displays are untouched. */
+    {
+        static const R5Method rz[] = {
+            { 0x087cd050, 0x086495bc, retro5_DrawnButtonResize,
+              (void **)&r5_orig_drawnbutton_resize, "XmDrawnButton.resize" },
+        };
+        unsigned i;
+        for (i = 0; i < sizeof rz / sizeof rz[0]; i++) {
+            int ok = patch_method(rz[i].class_rec, R5_RESIZE_OFF, rz[i].expect, rz[i].target, rz[i].saved);
+            if (r5_trace) {
+                char b[80]; int k = snprintf(b, sizeof b, "retro5: resize takeover %-20s %s\n",
+                                             rz[i].name, ok ? "ok" : "SKIPPED (guard mismatch)");
+                if (k > 0) write(2, b, (size_t)k);
+            }
         }
     }
 
