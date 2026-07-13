@@ -2339,6 +2339,11 @@ typedef struct {
     unsigned (*glyphtab_get)(void);                      /* returns the current glyph table         */
     uintptr_t sel_filter_jne;     /* the "record+0x1e != 0" list filter jne to NOP (all-fonts)     */
     unsigned char sel_filter_bytes[2];                   /* guard: expected `75 XX`                 */
+    /* system-font injection: grow the record table + remap and append records */
+    uintptr_t fontrec_cap;        /* record-array capacity u16                                     */
+    uintptr_t remap_arr, remap_cap;  /* remap[0xfff-code]->index ptr + capacity u16               */
+    uintptr_t freecode;           /* next-free 12-bit fontcode counter u16 (inits 0xfff, counts down) */
+    uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
 } R5Syms;
 static R5Syms r5s;
 
@@ -2910,6 +2915,125 @@ void retro5_LabelExpose(void *w, XEvent *ev, Region region) {
  *  Per-binary fix routines — each concentrated, self-contained, and obvious
  * ======================================================================================= */
 
+/* ---- system-font injection ------------------------------------------------------------------
+ * Append records to WP's font-record table so extra faces appear in the (now-unfiltered) selector.
+ * Runs AFTER WP's own table builder via a trampoline detour, so it re-applies on every rebuild
+ * (printer/.prs change). Replicates the 32-byte record contract (FONT-RENDERING-MAP §12): grow the
+ * ptr array + remap table, calloc each record, set name (+0x10), a stock .pfb (+0x08 so WP's Type1
+ * resolver never faults on a null path), alias self (+0x1c=0xffff), category 0 (+0x1e, lists), claim
+ * a fontcode top-down from the free-code counter, and index remap[0xfff-code]=slot. Bounded well
+ * under the 4096-fontcode ceiling. PHASE 1: a fixed test list to validate the mechanism safely;
+ * fontconfig enumeration replaces r5_inject_list next. Gated by RETRO5_ALLFONTS. */
+extern void *calloc(size_t, size_t);
+extern void *realloc(void *, size_t);
+extern char *strdup(const char *);
+
+static int (*r5_builder_orig)(void);                 /* trampoline to the real font-table builder */
+
+/* Enumerate installed system font FAMILIES via libfontconfig (deduped, case-insensitive). Fills
+ * r5_fcfam. dlopen'd RTLD_DEEPBIND (NOLOAD first — cairo has usually already loaded it) so its libc
+ * calls bind to glibc, not our libc5 shims. Best-effort: 0 families on any failure -> nothing injected. */
+static char r5_fcfam[2048][64];
+static int  r5_fcfam_n;
+static void r5_fc_enumerate(void) {
+    void *h; int (*FcInit)(void); void *(*FcPatternCreate)(void);
+    void *(*FcObjectSetBuild)(const char *, void *); void *(*FcFontList)(void *, void *, void *);
+    int (*FcPatternGetString)(void *, const char *, int, unsigned char **);
+    void *pat, *os, *fs; int nfont, i, j;
+    unsigned char **fonts;
+    if (r5_fcfam_n) return;                              /* once */
+    h = dlopen("libfontconfig.so.1", RTLD_NOLOAD | RTLD_NOW);
+    if (!h) h = dlopen("libfontconfig.so.1", RTLD_NOW | RTLD_DEEPBIND);
+    if (!h) return;
+    FcInit             = (int (*)(void))dlsym(h, "FcInit");
+    FcPatternCreate    = (void *(*)(void))dlsym(h, "FcPatternCreate");
+    FcObjectSetBuild   = (void *(*)(const char *, void *))dlsym(h, "FcObjectSetBuild");
+    FcFontList         = (void *(*)(void *, void *, void *))dlsym(h, "FcFontList");
+    FcPatternGetString = (int (*)(void *, const char *, int, unsigned char **))dlsym(h, "FcPatternGetString");
+    if (!FcInit || !FcPatternCreate || !FcObjectSetBuild || !FcFontList || !FcPatternGetString) return;
+    FcInit();
+    pat = FcPatternCreate();
+    os  = FcObjectSetBuild("family", (void *)0);        /* variadic, NULL-terminated */
+    if (!pat || !os) return;
+    fs = FcFontList(0, pat, os);                        /* config 0 => current */
+    if (!fs) return;
+    nfont = *(int *)fs;                                 /* FcFontSet: {int nfont; int sfont; FcPattern**} */
+    fonts = *(unsigned char ***)((char *)fs + 8);
+    for (i = 0; i < nfont && r5_fcfam_n < (int)(sizeof r5_fcfam / sizeof r5_fcfam[0]); i++) {
+        unsigned char *fam = 0;
+        if (FcPatternGetString(fonts[i], "family", 0, &fam) != 0 || !fam || !fam[0]) continue;
+        for (j = 0; j < r5_fcfam_n; j++)                /* dedup, case-insensitive */
+            if (!strcasecmp(r5_fcfam[j], (const char *)fam)) break;
+        if (j < r5_fcfam_n) continue;
+        strncpy(r5_fcfam[r5_fcfam_n], (const char *)fam, sizeof r5_fcfam[0] - 1);
+        r5_fcfam[r5_fcfam_n][sizeof r5_fcfam[0] - 1] = 0;
+        r5_fcfam_n++;
+    }
+}
+
+static void r5_inject_fonts(void) {
+    uint32_t *arr; unsigned short *remap; unsigned cnt, cap, code; int n, i;
+    if (!r5_allfonts || !r5s.fontrec_arr || !r5s.remap_arr || !r5s.freecode) return;
+    if (range_unmapped((void *)r5s.fontrec_arr, 4) || range_unmapped((void *)r5s.remap_arr, 4)) return;
+    arr   = *(uint32_t **)r5s.fontrec_arr;
+    remap = *(unsigned short **)r5s.remap_arr;
+    if (!arr || !remap) return;
+    cnt  = *(unsigned short *)r5s.fontrec_cnt;
+    cap  = *(unsigned short *)r5s.fontrec_cap;
+    code = *(unsigned short *)r5s.freecode;
+    if (cnt < 1 || cnt > 4000 || code < 0x40) return;          /* sanity / leave code headroom */
+    r5_fc_enumerate();
+    n = r5_fcfam_n;
+    if (n <= 0) return;
+    if ((int)cnt + n > 4000) n = 4000 - (int)cnt;              /* stay under the 4096 fontcode ceiling */
+    if (n <= 0) return;
+    if (cnt + (unsigned)n > cap) {                             /* grow both arrays together */
+        uint32_t *na = (uint32_t *)realloc(arr, (cnt + n) * 4);
+        unsigned short *nr;
+        if (!na) return;
+        arr = na; *(uint32_t **)r5s.fontrec_arr = arr;
+        nr = (unsigned short *)realloc(remap, (cnt + n) * 2);
+        if (!nr) return;
+        remap = nr; *(unsigned short **)r5s.remap_arr = remap;
+        *(unsigned short *)r5s.fontrec_cap = (unsigned short)(cnt + n);
+        if (r5s.remap_cap) *(unsigned short *)r5s.remap_cap = (unsigned short)(cnt + n);
+    }
+    for (i = 0; i < n; i++) {
+        unsigned char *rec = (unsigned char *)calloc(1, 0x20);
+        if (!rec) break;
+        *(char **)(rec + 0x08) = strdup("wphv____.pfb");       /* stock face; resolver never faults */
+        *(char **)(rec + 0x10) = strdup(r5_fcfam[i]);          /* system family (selector display name) */
+        *(unsigned short *)(rec + 0x1c) = 0xffff;              /* alias = self */
+        *(unsigned char  *)(rec + 0x1e) = 0;                   /* category 0 -> lists */
+        arr[cnt] = (uint32_t)(uintptr_t)rec;
+        remap[0xfff - code] = (unsigned short)cnt;             /* claim the current free code */
+        code--;
+        cnt++;
+    }
+    *(unsigned short *)r5s.fontrec_cnt  = (unsigned short)cnt;
+    *(unsigned short *)r5s.freecode     = (unsigned short)code;
+    if (r5_trace) { char b[80]; int k = snprintf(b, sizeof b,
+        "retro5: injected %d font(s), table count now %u\n", n, cnt);
+        if (k > 0) write(2, b, (size_t)k); }
+}
+
+/* Builder detour: run WP's real builder (trampoline), then append our fonts. Same 6-byte prologue
+ * on both builds (55 89 e5 83 ec 0c), so keep=6. */
+static int retro5_font_builder(void) {
+    int r = r5_builder_orig ? r5_builder_orig() : 0;
+    r5_inject_fonts();
+    return r;
+}
+static void r5_install_injection(void) {
+    static const unsigned char g[] = {0x55,0x89,0xe5,0x83,0xec,0x0c};
+    if (!r5_allfonts || !r5s.builder_va) return;
+    if (range_unmapped((void *)r5s.builder_va, sizeof g) || memcmp((void *)r5s.builder_va, g, sizeof g))
+        return;
+    r5_builder_orig = (int (*)(void))r5_make_trampoline(r5s.builder_va, 6);
+    if (r5_builder_orig)
+        patch_entry(r5s.builder_va, (const char *)g, sizeof g, (void *)retro5_font_builder);
+}
+
 /* Font-selector takeover (RETRO5_ALLFONTS): the F9 "Font Face" list builder shows an entry only if
  * record+0x1e == 0 (a printer-available-vs-display-only category byte). Normal mode leaves only the
  * current printer's font(s) at 0, so the list shows ~1; NOP the filter jne and ALL enumerated fonts
@@ -2940,6 +3064,8 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.fontrec_arr = 0x08808754; r5s.fontrec_cnt = 0x0880875a;
     r5s.glyphtab_get = (unsigned (*)(void))0x085b9840;
     r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
+    r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
+    r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500;
 
     /* Table QuickFill (Insert Table -> "Extend the pattern in the current selection"):
        guard the code-stream parser's copy at 0x08430205 (orig: call FUN_085c5dd0). */
@@ -2954,6 +3080,7 @@ static void applyWp8_0_dynX_Fixes(void) {
 
     if (r5_skin) takeoverWP80();
     r5_apply_allfonts();
+    r5_install_injection();
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -3130,9 +3257,12 @@ static void applyWp8_1_Fixes(void) {
     r5s.fontrec_arr = 0x088281c0; r5s.fontrec_cnt = 0x088281c6;
     r5s.glyphtab_get = (unsigned (*)(void))0x08539db8;
     r5s.sel_filter_jne = 0x08538408; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4d;
+    r5s.fontrec_cap = 0x088281c4; r5s.remap_arr = 0x088281d8; r5s.remap_cap = 0x088281dc;
+    r5s.freecode = 0x087da1da; r5s.builder_va = 0x08538b6c;
     /* 8.1 doc-font port (static-X). Motif appearance reskin not yet ported. */
     takeoverWP81();
     r5_apply_allfonts();
+    r5_install_injection();
 }
 
 /* Add a build: hash its .text window, add one KNOWN_BINARIES row, and give it a takeoverXxx()
