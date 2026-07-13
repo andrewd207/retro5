@@ -2500,6 +2500,25 @@ static void r5_doc_text_color(Display *dpy, GC gc, double *r, double *g, double 
     *b = r5_chan(gv.foreground, v->blue_mask);
 }
 
+/* WP byte -> Unicode codepoint. WP's Latin text fonts are encoded ISO 8859-1 (Latin-1), where the
+ * codepoint IS the byte value (0x00-0xFF), so the default table is the identity; this is a table
+ * (not a formula) so a font/charset that turns out NOT to be 8859-1 can be remapped in one place.
+ * cairo's show_text wants UTF-8, so a raw high byte (>=0x80) must be encoded as 2 bytes — emitting it
+ * bare (as we did) is invalid UTF-8 and drew tofu for accented characters. */
+static unsigned short r5_wp2uni[256];
+static int r5_wp2uni_ready;
+static void r5_wp2uni_init(void) {
+    int i;
+    for (i = 0; i < 256; i++) r5_wp2uni[i] = (unsigned short)i;   /* ISO 8859-1: codepoint == byte */
+    r5_wp2uni_ready = 1;
+}
+static int r5_utf8(unsigned cp, char *o) {                       /* encode cp -> UTF-8, return length */
+    if (cp < 0x80)   { o[0] = (char)cp; return 1; }
+    if (cp < 0x800)  { o[0] = (char)(0xC0 | (cp >> 6)); o[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    o[0] = (char)(0xE0 | (cp >> 12)); o[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    o[2] = (char)(0x80 | (cp & 0x3F)); return 3;
+}
+
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
  * set the device pen for this glyph in the globals: origin x = [R5_PEN_X], baseline y = [R5_PEN_Y]
  * (dst_x/dst_y in the blit are the ink box, offset by the glyph's bearings — using the pen origin +
@@ -2508,7 +2527,7 @@ static void r5_doc_text_color(Display *dpy, GC gc, double *r, double *g, double 
  * height (a rough cap-height -> em). Face is matched from the current font record's .pfb (+0x10);
  * colour comes from the blit GC's foreground. */
 static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, unsigned h, unsigned char c) {
-    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight, symbolic; double cr_, cg, cb;
+    cairo_surface_t *sf; cairo_t *cr; char s[5]; int slant, weight, symbolic; double cr_, cg, cb;
     const char *fam = r5_doc_family(&slant, &weight, &symbolic);
     int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
     double sz = r5_doc_pixsize();
@@ -2520,7 +2539,8 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     if (!sf || cz.surface_status(sf)) { if (sf) cz.surface_destroy(sf); return 0; }
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
-    s[0] = (char)c; s[1] = 0;
+    if (!r5_wp2uni_ready) r5_wp2uni_init();
+    s[r5_utf8(r5_wp2uni[c], s)] = 0;                     /* WP byte -> Unicode -> UTF-8 for cairo */
     r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
     cz.select_font_face(cr, fam, slant, weight);
     cz.set_font_size(cr, sz);
