@@ -2474,6 +2474,7 @@ static struct {
     int   (*prefetch)(void);
     int   (*enumerate)(R5P2CPrinter *, int);
     long  (*submit)(const char *, const char *, const char *, const void *, size_t, const void *, int);
+    int   (*wait_idle)(int);                      /* block until the worker has handed all jobs to CUPS */
     void  (*shutdown)(void);
 } r5p2c;
 
@@ -2485,6 +2486,7 @@ static int r5_p2c_load(void) {
     *(void **)&r5p2c.prefetch  = dlsym(h, "p2c_prefetch");
     *(void **)&r5p2c.enumerate = dlsym(h, "p2c_enum");
     *(void **)&r5p2c.submit    = dlsym(h, "p2c_submit");
+    *(void **)&r5p2c.wait_idle = dlsym(h, "p2c_wait_idle");
     *(void **)&r5p2c.shutdown  = dlsym(h, "p2c_shutdown");
     if (!r5p2c.init || !r5p2c.enumerate || !r5p2c.submit) return 0;
     r5p2c.h = h;
@@ -2500,6 +2502,35 @@ static int r5_p2c_load(void) {
  * the buffer to printertocups (p2c_submit), suppressing the legacy `lpr`. See the file-I/O interpose.
  * (The old wpexc-spawn bypass was removed: §20 proved wpexc is an idle daemon off the print path, so
  * bypassing it only caused the "Cannot create a new process" spawn-loop.) */
+
+/* Is CUPS routing on? Exported so retro5's libc file-I/O layer (forward.c) can gate its capture of
+ * the spooler's PostScript and its suppression of the real `lpr` without duplicating the env parse. */
+int r5_cups_enabled(void) { return r5_cups; }
+
+/* Route ONE finished print job to CUPS instead of the legacy `lpr`. Called from the system()/execvp()
+ * interpose in forward.c the moment wppx tries to spool `/tmp/_pp_<pid>_1` to <dest>. `ps`/`len` is
+ * the captured `%!PS-Adobe` body. Returns 1 if we handled it (caller MUST then suppress the real lpr),
+ * 0 if CUPS is off or the backend could not be loaded (caller runs the real lpr — graceful degrade).
+ *
+ * SYNCHRONOUS by necessity: wppx exits immediately after system() returns, so an un-drained async
+ * submit would be lost with the process. We submit then p2c_wait_idle() (worker hands the job to CUPS
+ * before we return); if the bridge lacks wait_idle we fall back to shutdown(), which also drains. */
+int r5_cups_spool(const char *dest, const void *ps, unsigned len) {
+    long job;
+    if (!r5_cups) return 0;                       /* gate off -> caller runs the real lpr */
+    if (!r5_p2c_load()) return 0;                 /* backend unavailable -> fall back to lpr */
+    job = r5p2c.submit((dest && *dest) ? dest : 0, "WordPerfect", "application/postscript",
+                       ps, (size_t)len, 0, 0);
+    if (r5p2c.wait_idle) r5p2c.wait_idle(-1);     /* drain before wppx exits */
+    else                 r5p2c.shutdown();        /* older bridge: shutdown() also drains + joins */
+    if (r5_trace) {
+        char b[160]; int n = snprintf(b, sizeof b,
+            "retro5: p2c_submit dest=%s len=%u job=%ld (drained)\n",
+            (dest && *dest) ? dest : "(default)", len, job);
+        if (n > 0) write(2, b, (size_t)n);
+    }
+    return 1;                                     /* handled: suppress the legacy lpr */
+}
 
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
 static int r5_doc_active;                                /* set only during our draw_text_run call */

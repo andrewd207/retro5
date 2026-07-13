@@ -90,6 +90,175 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 
+/* ---- CUPS PostScript capture (RETRO5_CUPS) --------------------------------
+ * When RETRO5_CUPS is on, WP's spooler child (wppx — which loads this shim as
+ * its libc) writes a genuine %!PS-Adobe body to /tmp/_pp_<pid>_<n> and then
+ * system()s `lpr -P<dev> <file>`. We tee that temp file's bytes into an
+ * in-memory buffer as they are written (keyed by path), and in system()/execvp()
+ * hand the buffer to CUPS via r5_cups_spool(), suppressing the real lpr.
+ *
+ * The FILE* spool path funnels through THIS file's own open()/write()
+ * (fopen->open, fwrite->write_all->write), so one fd-level tee captures both the
+ * raw-fd and the stdio path. Everything is gated on r5_cups_enabled(): with CUPS
+ * off, open/write/close never touch a slot and behaviour is byte-identical. */
+extern void *__libc_realloc(void *, size_t);
+extern long  read(int, void *, size_t);
+extern int   close(int);
+extern char *getenv(const char *);
+extern int   r5_cups_enabled(void);              /* patch5.c: RETRO5_CUPS on? */
+extern int   r5_cups_spool(const char *dest, const void *ps, unsigned len);  /* patch5.c */
+
+static int r5_cups_trace(void) {                 /* RETRO5_TRACE=1 -> dump captured PS + log */
+    static int t = -1;
+    if (t == -1) { char *e = getenv("RETRO5_TRACE"); t = (e && *e) ? 1 : 0; }
+    return t;
+}
+
+#define R5CAP_MAX  4
+#define R5CAP_PATH 256
+static struct r5cap {
+    int      used;                 /* slot claimed */
+    int      fd;                   /* live fd writing this file, or -1 (closed but retained) */
+    char     path[R5CAP_PATH];
+    char    *buf;
+    unsigned len, cap;
+} r5cap[R5CAP_MAX];
+
+/* basename of a spooler PostScript temp? WP names them _pp_<pid>_<n>. */
+static int r5cap_is_ps_temp(const char *path) {
+    const char *tail = path, *p;
+    if (!path) return 0;
+    for (p = path; *p; p++) if (*p == '/') tail = p + 1;
+    return startswith(tail, "_pp_");
+}
+static struct r5cap *r5cap_by_path(const char *path) {
+    int i;
+    for (i = 0; i < R5CAP_MAX; i++)
+        if (r5cap[i].used && streq(r5cap[i].path, path)) return &r5cap[i];
+    return 0;
+}
+static struct r5cap *r5cap_by_fd(int fd) {
+    int i;
+    if (fd < 0) return 0;
+    for (i = 0; i < R5CAP_MAX; i++)
+        if (r5cap[i].used && r5cap[i].fd == fd) return &r5cap[i];
+    return 0;
+}
+/* open() calls this after a successful open of a PS temp: (re)claim a slot. */
+static void r5cap_open(const char *path, int fd) {
+    struct r5cap *s = r5cap_by_path(path);
+    size_t i;
+    if (!s) {
+        int k;
+        for (k = 0; k < R5CAP_MAX && !s; k++) if (!r5cap[k].used) s = &r5cap[k];
+        if (!s) s = &r5cap[0];       /* all busy: reuse slot 0 (only a handful of jobs ever) */
+        if (s->buf) { __libc_free(s->buf); s->buf = 0; }
+        s->cap = 0;
+    }
+    s->used = 1; s->fd = fd; s->len = 0;
+    for (i = 0; path[i] && i < R5CAP_PATH - 1; i++) s->path[i] = path[i];
+    s->path[i] = 0;
+}
+/* write() calls this for a tagged fd: append n bytes (n = bytes actually written). */
+static void r5cap_append(struct r5cap *s, const void *buf, long n) {
+    if (n <= 0) return;
+    if (s->len + (unsigned)n > s->cap) {
+        unsigned nc = s->cap ? s->cap * 2 : 8192;
+        char *nb;
+        while (nc < s->len + (unsigned)n) nc *= 2;
+        nb = (char *)__libc_realloc(s->buf, nc);
+        if (!nb) return;             /* OOM: keep what we have (system() falls back to disk) */
+        s->buf = nb; s->cap = nc;
+    }
+    __builtin_memcpy(s->buf + s->len, buf, (size_t)n);
+    s->len += (unsigned)n;
+}
+/* Fallback: read a fully-written spool file from disk. Caller frees the result. */
+static char *r5cap_read_file(const char *path, unsigned *outlen) {
+    int fd = open(path, 0 /*O_RDONLY*/, 0);
+    char *buf = 0; unsigned len = 0, cap = 0;
+    *outlen = 0;
+    if (fd < 0) return 0;
+    for (;;) {
+        long n;
+        if (len + 8192 > cap) {
+            unsigned nc = cap ? cap * 2 : 65536; char *nb;
+            while (nc < len + 8192) nc *= 2;
+            nb = (char *)__libc_realloc(buf, nc);
+            if (!nb) break;
+            buf = nb; cap = nc;
+        }
+        n = read(fd, buf + len, 8192);
+        if (n <= 0) break;
+        len += (unsigned)n;
+    }
+    close(fd);
+    *outlen = len;
+    return buf;
+}
+/* If argv is the wppx spool (`lpr/lp/qprt -P<dev> /tmp/_pp_*`), route its captured
+ * PostScript to CUPS. Returns 1 if handled (caller suppresses the real command). */
+static int r5_spool_argv(char *const *argv) {
+    const char *bn, *p, *dest = 0, *file = 0;
+    struct r5cap *s;
+    const char *ps; unsigned len = 0; char *disk = 0; int handled, is_ps, i;
+    if (!argv || !argv[0]) return 0;
+    bn = argv[0];
+    for (p = argv[0]; *p; p++) if (*p == '/') bn = p + 1;
+    if (!streq(bn, "lpr") && !streq(bn, "lp") && !streq(bn, "qprt")) return 0;
+    for (i = 1; argv[i]; i++) {
+        const char *a = argv[i];
+        if (a[0] == '-' && (a[1] == 'P' || a[1] == 'd')) {       /* -P<dev> (lpr/qprt) / -d<dev> (lp) */
+            if (a[2]) dest = a + 2;
+            else if (argv[i + 1]) dest = argv[++i];              /* split "-P dev" form */
+        } else if (a[0] != '-' && r5cap_is_ps_temp(a)) {
+            file = a;
+        }
+    }
+    if (!file) return 0;                                         /* not our spool -> real command runs */
+
+    s = r5cap_by_path(file);
+    if (s && s->len > 0) { ps = s->buf; len = s->len; }
+    else { disk = r5cap_read_file(file, &len); ps = disk; }      /* buffer empty -> read from disk */
+    if (!ps || !len) { if (disk) __libc_free(disk); return 0; }  /* nothing to send -> real lpr */
+
+    is_ps = (len >= 4 && ps[0] == '%' && ps[1] == '!' && ps[2] == 'P' && ps[3] == 'S');
+    if (r5_cups_trace()) {
+        char dp[64], b[256]; int k;
+        int dfd = open((k = snprintf(dp, sizeof dp, "/tmp/r5_captured_%d.ps", getpid()), dp),
+                       01 | 0100 | 01000 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0644);
+        if (dfd >= 0) { long off = 0; while (off < (long)len) {
+            long w = write(dfd, ps + off, len - off); if (w <= 0) break; off += w; } close(dfd); }
+        k = snprintf(b, sizeof b,
+            "retro5: captured %u bytes, %%!PS=%s, dest=%s -> %s, lpr suppressed\n",
+            len, is_ps ? "yes" : "no", (dest && *dest) ? dest : "(default)", dp);
+        if (k > 0) write(2, b, (size_t)k);
+    }
+
+    handled = r5_cups_spool(dest, ps, len);
+    if (disk) __libc_free(disk);
+    return handled;
+}
+/* system() passes a shell string; tokenise on whitespace (WP builds a plain
+ * `lpr  -P<dev> <file>` command with no quoting) and reuse r5_spool_argv. */
+static int r5_spool_cmd(const char *cmd) {
+    char buf[1024]; char *tok[64]; int nt = 0; size_t i = 0; char *p;
+    if (!cmd) return 0;
+    while (cmd[i] && i < sizeof buf - 1) { buf[i] = cmd[i]; i++; }
+    if (cmd[i]) return 0;                    /* too long to parse safely -> let the shell run it */
+    buf[i] = 0;
+    p = buf;
+    while (*p && nt < 63) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        tok[nt++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = 0;
+    }
+    tok[nt] = 0;
+    return nt ? r5_spool_argv(tok) : 0;
+}
+
 /* ---- per-instance print-server path rewrite ------------------------------
  * WP's xwp<->wpexc handshake uses fixed-name files in /tmp/wpc-<user>-<host>/
  * keyed only on the MAJOR VERSION "8", not per instance: the excmsg8 FIFO, the
@@ -313,6 +482,11 @@ int system(const char *a) {
     static int (*fn)(const char *);
     if (!fn) fn = (int (*)(const char *)) dlsym(RTLD_NEXT, "system");
     logkv("system", a);
+    if (a && r5_cups_enabled() && r5_spool_cmd(a)) {   /* wppx spool -> CUPS: suppress the real lpr */
+        logkv("  system CUPS-routed (lpr suppressed)", a);
+        SYNC_ERRNO();
+        return 0;                                      /* success, exactly as a good lpr would report */
+    }
     int r = fn(a);
     SYNC_ERRNO(); logint("  system ret", r);
     return r;
@@ -414,7 +588,14 @@ int rename(const char *a, const char *b) {
     const char *pb = r5_wpexc_rewrite(b, bb, sizeof bb);
     PRE_ERRNO(); int _r = fn(pa, pb); SYNC_ERRNO(); return _r;
 }
-FWD(int,   close,   (int a), (a))
+int close(int a) {
+    static int (*fn)(int);
+    if (!fn) fn = (int (*)(int)) dlsym(RTLD_NEXT, "close");
+    /* CUPS mode: detach a tagged spool fd but KEEP its buffer — wppx closes the
+     * %!PS temp before system()s lpr, and system() still needs the captured bytes. */
+    if (r5_cups_enabled()) { struct r5cap *s = r5cap_by_fd(a); if (s) s->fd = -1; }
+    PRE_ERRNO(); int _r = fn(a); SYNC_ERRNO(); return _r;
+}
 int g_drs_fd = -1;   /* set by open() when wp.drs is opened; traced below */
 /* trace the WP IPC channels (excmsg8 FIFO + per-client response files) to see
  * the xwp<->wpexc print-server message exchange. */
@@ -438,6 +619,10 @@ long write(int a, const void *b, size_t c) {
     long r = fn(a, b, c); SYNC_ERRNO();
     if (is_ipc(a)) { logint("IPC write fd", a); logint("  IPC write sent", r);
         if (r < 0) logint("  IPC write errno", *__errno_location()); }
+    if (r > 0 && r5_cups_enabled()) {                  /* tee a tagged %!PS spool temp into memory */
+        struct r5cap *s = r5cap_by_fd(a);
+        if (s) r5cap_append(s, b, r);
+    }
     return r;
 }
 FWD(long,  readv,   (int a, const void *b, int c), (a, b, c))
@@ -487,6 +672,12 @@ int execvp(const char *a, char *const *b) {
     if (!fn) fn = (int (*)(const char *, char *const *)) dlsym(RTLD_NEXT, "execvp");
     logkv("execvp", a);
     if (b) for (int i = 0; b[i] && i < 12; i++) logkv("  execvp argv", b[i]);
+    /* Safety twin of the system() hook: if wppx spools via execvp(lpr...) rather than
+     * system(), route it to CUPS and exit success (a successful exec never returns). */
+    if (b && r5_cups_enabled() && r5_spool_argv(b)) {
+        logkv("  execvp CUPS-routed (lpr suppressed)", a);
+        _exit(0);
+    }
     { extern char **environ; if (environ) for (int i = 0; environ[i]; i++)
         if (startswith(environ[i], "WP") || startswith(environ[i], "SHTMP")
             || startswith(environ[i], "TMPDIR")) logkv("  child env", environ[i]); }
@@ -708,6 +899,8 @@ int open(const char *path, int flags, ...) {
               (startswith(tail,"excmsg8")||startswith(tail,"_000_")||startswith(tail,"_UNX_")||startswith(tail,"_WP_")))
               { g_ipc_fds[g_ipc_n++] = r; logkv("  [tracking IPC chan]", tail); logint("    fd", r); } }
     }
+    /* CUPS mode: tag the spooler's %!PS temp so write() tees its bytes into memory. */
+    if (r >= 0 && r5_cups_enabled() && r5cap_is_ps_temp(path)) r5cap_open(path, r);
     return r;
 }
 /* openat/mknodat/unlinkat: not part of the libc5 ABI (WP never calls them), but
