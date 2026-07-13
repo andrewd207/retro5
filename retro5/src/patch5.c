@@ -1418,6 +1418,109 @@ int retro5_XFreeFont(Display *dpy, XFontStruct *fs) {
     return r5_real_FreeFont ? r5_real_FreeFont(dpy, fs) : 0;
 }
 
+/* ---- EWMH / _NET_WM hints on WP's Motif top-levels (RETRO5_EWMH) -------------------------------
+ * WP8's Motif (1.2.4, 1998) predates the EWMH/_NET_WM spec, so its frames carry only ICCCM +
+ * _MOTIF_WM_HINTS. Modern window managers then can't associate a window with its process, group it
+ * in the taskbar, or type it (normal vs dialog) — they guess, often wrongly. We interpose
+ * XtRealizeWidget and, once a top-level shell has its X window, stamp the EWMH properties the WM
+ * wants. Fail-safe by construction: the real XtRealizeWidget always runs first, and any misstep in
+ * the stamp just skips it. This fires while WP builds its UI — long after the SIGALRM startup IPC
+ * handshake — so binding the remaining real X calls lazily here is safe (no signal-context dlsym).
+ *
+ * 8.0 only: 8.0 dynamically links Xt, so XtRealizeWidget has a GOT slot we interpose. 8.1 statically
+ * links Xt (no GOT) and would need an inline detour of the static entry — deferred. */
+static int r5_ewmh = 1;                     /* RETRO5_EWMH=0 disables */
+#ifndef XA_ATOM
+#define XA_ATOM              ((Atom)4)
+#define XA_CARDINAL          ((Atom)6)
+#define XA_STRING            ((Atom)31)
+#define XA_WM_CLIENT_MACHINE ((Atom)36)
+#endif
+static void    (*r5_real_XtRealizeWidget)(void *);
+static Window  (*r5_real_XtWindow)(void *);
+static Display *(*r5_real_XtDisplayOfObject)(void *);
+static int     (*r5_real_XChangeProperty)(Display *, Window, Atom, Atom, int, int,
+                                          const unsigned char *, int);
+static Atom    (*r5_real_XInternAtom)(Display *, const char *, Bool);
+static Status  (*r5_real_XGetWindowAttributes)(Display *, Window, XWindowAttributes *);
+static int     (*r5_real_XQueryTree)(Display *, Window, Window *, Window *, Window **, unsigned int *);
+static Bool    (*r5_real_XGetTransientForHint)(Display *, Window, Window *);
+static int     (*r5_real_XFreeXlib)(void *);
+static int     r5_ewmh_bound;
+
+static void r5_ewmh_bind(void) {
+    if (r5_ewmh_bound) return;
+    r5_ewmh_bound = 1;
+    if (!r5_real_XtRealizeWidget) *(void **)&r5_real_XtRealizeWidget = r5_realsym("XtRealizeWidget");
+    *(void **)&r5_real_XtWindow             = r5_realsym("XtWindow");
+    *(void **)&r5_real_XtDisplayOfObject    = r5_realsym("XtDisplayOfObject");
+    *(void **)&r5_real_XChangeProperty      = r5_realsym("XChangeProperty");
+    *(void **)&r5_real_XInternAtom          = r5_realsym("XInternAtom");
+    *(void **)&r5_real_XGetWindowAttributes = r5_realsym("XGetWindowAttributes");
+    *(void **)&r5_real_XQueryTree           = r5_realsym("XQueryTree");
+    *(void **)&r5_real_XGetTransientForHint = r5_realsym("XGetTransientForHint");
+    *(void **)&r5_real_XFreeXlib            = r5_realsym("XFree");
+}
+
+static void r5_stamp_ewmh(Display *dpy, Window win) {
+    XWindowAttributes wa;
+    Window root = 0, parent = 0, *kids = 0, tf = 0;
+    unsigned int nk = 0;
+    Atom a_pid, a_wtype, a_wnormal, a_wdialog, wtype;
+    long pid;
+    char host[256];
+
+    if (!dpy || !win || !r5_real_XChangeProperty || !r5_real_XInternAtom) return;
+
+    /* stamp only real, WM-managed top-levels: skip override-redirect (menus, tooltips, combo
+       popups) and any window whose parent is not the root (i.e. a plain child widget). At realize
+       time a shell's window still has root as its parent — before the WM reparents it. */
+    if (r5_real_XGetWindowAttributes) {
+        if (!r5_real_XGetWindowAttributes(dpy, win, &wa)) return;
+        if (wa.override_redirect) return;
+    }
+    if (r5_real_XQueryTree) {
+        if (!r5_real_XQueryTree(dpy, win, &root, &parent, &kids, &nk)) return;
+        if (kids && r5_real_XFreeXlib) r5_real_XFreeXlib(kids);
+        if (root && parent && parent != root) return;
+    }
+
+    a_pid     = r5_real_XInternAtom(dpy, "_NET_WM_PID", False);
+    a_wtype   = r5_real_XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    a_wnormal = r5_real_XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    a_wdialog = r5_real_XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+
+    /* _NET_WM_PID — and WM_CLIENT_MACHINE, which EWMH requires alongside it for the PID to be honored */
+    pid = (long)getpid();
+    if (a_pid) r5_real_XChangeProperty(dpy, win, a_pid, XA_CARDINAL, 32,
+                                       PropModeReplace, (const unsigned char *)&pid, 1);
+    if (gethostname(host, sizeof host - 1) == 0) {
+        host[sizeof host - 1] = 0;
+        r5_real_XChangeProperty(dpy, win, XA_WM_CLIENT_MACHINE, XA_STRING, 8,
+                                PropModeReplace, (const unsigned char *)host, (int)strlen(host));
+    }
+
+    /* window type: DIALOG when the shell is transient-for another window (a Motif *Dialog),
+       else NORMAL (the main document frame). */
+    wtype = a_wnormal;
+    if (r5_real_XGetTransientForHint && r5_real_XGetTransientForHint(dpy, win, &tf) && tf && a_wdialog)
+        wtype = a_wdialog;
+    if (a_wtype && wtype)
+        r5_real_XChangeProperty(dpy, win, a_wtype, XA_ATOM, 32,
+                                PropModeReplace, (const unsigned char *)&wtype, 1);
+}
+
+void retro5_XtRealizeWidget(void *w) {
+    r5_ewmh_bind();
+    if (r5_real_XtRealizeWidget) r5_real_XtRealizeWidget(w);   /* realize FIRST — window now exists */
+    if (!r5_ewmh || !w || !r5_real_XtWindow || !r5_real_XtDisplayOfObject) return;
+    {
+        Window   win = r5_real_XtWindow(w);
+        Display *dpy = r5_real_XtDisplayOfObject(w);
+        if (win && dpy) r5_stamp_ewmh(dpy, win);
+    }
+}
+
 /* Resolve EVERYTHING our hooks could ever need, eagerly, at library init — before WP runs. This is
  * the whole safety argument for the text layer: a hook that fires while WP's SIGALRM startup
  * handshake is live must NOT touch the dynamic linker (dlsym / lazy PLT bind take dl_load_lock,
@@ -3277,6 +3380,20 @@ static void takeoverWP80(void) {
      * XmLabel resize thunk at 0x086bae18 — because the class-record resize slot is inherited and gets
      * clobbered by Xt class-init, which silently defeated the old slot-swap takeover here.) */
 
+    /* EWMH / _NET_WM hints (RETRO5_EWMH, default on): interpose XtRealizeWidget so every top-level
+     * shell is stamped with _NET_WM_PID + WM_CLIENT_MACHINE + _NET_WM_WINDOW_TYPE once realized.
+     * Independent of the appearance/text layers, so it runs here in the always-on section. 8.0 is
+     * dynamic-X, so this is a GOT interpose; resolve the real fn first, then swap the slot. */
+    if (r5_ewmh) {
+        *(void **)&r5_real_XtRealizeWidget = r5_realsym("XtRealizeWidget");
+        if (r5_real_XtRealizeWidget) {
+            int ok = patch_import(0x08050df0, 0x087d8940, (void *)retro5_XtRealizeWidget);
+            if (r5_trace) { const char *m = ok ? "retro5: EWMH hints enabled (XtRealizeWidget)\n"
+                                               : "retro5: EWMH SKIPPED (guard mismatch)\n";
+                            write(2, m, strlen(m)); }
+        }
+    }
+
     /* The cairo text layer — the ONLY expensive part of retro5. Everything here is gated behind
        RETRO5_TEXT so it can be switched off wholesale: with r5_text=0 we do NOT dlopen cairo, do
        NOT warm fontconfig, and install NO text/metrics hooks, so startup pays nothing for it and
@@ -3431,6 +3548,7 @@ static void findBinaryFixes(void) {
       if (d && *d) { int v = atoi(d); r5_docfont = v <= 0 ? 0 : (v >= 2 ? 2 : 1); } }
     { const char *e = getenv("RETRO5_DOCFONT81"); if (e && *e && e[0] != '0') r5_docfont81 = 1; }  /* EXPERIMENTAL 8.1 canvas */
     { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
+    { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
