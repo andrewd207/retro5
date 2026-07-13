@@ -259,6 +259,40 @@ static int r5_spool_cmd(const char *cmd) {
     return nt ? r5_spool_argv(tok) : 0;
 }
 
+/* xwppmgr -> modern CUPS config tool (RETRO5_CUPS). Both "Printer Control..."
+ * (Program menu, queue/jobs) and "Printer Create/Edit..." (Select-Printer dialog,
+ * add/config) fork+exec the legacy manager shbin10/xwppmgr. retro5 is that child's
+ * libc, so we replace the exec with a modern tool. RETRO5_PRINTER_ADMIN overrides
+ * the default ("gnome-control-center printers"), tokenised on spaces (e.g.
+ * "xdg-open http://localhost:631/admin"). If the replacement exec fails (tool
+ * absent), we return so the caller runs the real xwppmgr — graceful fallback.
+ * (The queue-vs-config distinction lives in an encrypted work-file, not argv, so
+ * both open one printer panel; gnome-control-center printers covers both.) */
+static int r5_is_xwppmgr(const char *file) {
+    const char *bn = file, *p;
+    if (!file) return 0;
+    for (p = file; *p; p++) if (*p == '/') bn = p + 1;
+    return streq(bn, "xwppmgr");
+}
+static void r5_admin_redirect(const char *file) {
+    static int (*ev)(const char *, char *const *);
+    char buf[256], *av[16], *p; int n = 0; const char *env; size_t i;
+    if (!r5_cups_enabled() || !r5_is_xwppmgr(file)) return;
+    env = getenv("RETRO5_PRINTER_ADMIN");
+    if (!env || !*env) env = "gnome-control-center printers";
+    for (i = 0; env[i] && i < sizeof buf - 1; i++) buf[i] = env[i];
+    buf[i] = 0;
+    p = buf;
+    while (*p && n < 15) { while (*p == ' ') p++; if (!*p) break; av[n++] = p;
+                           while (*p && *p != ' ') p++; if (*p) *p++ = 0; }
+    av[n] = 0;
+    if (!n) return;
+    if (r5_cups_trace()) { char b[192]; int k = snprintf(b, sizeof b,
+        "retro5: xwppmgr -> %s (CUPS admin)\n", buf); if (k > 0) write(2, b, (size_t)k); }
+    if (!ev) ev = (int (*)(const char *, char *const *)) dlsym(RTLD_NEXT, "execvp");
+    if (ev) ev(av[0], av);        /* success never returns; on failure fall through to real xwppmgr */
+}
+
 /* ---- per-instance print-server path rewrite ------------------------------
  * WP's xwp<->wpexc handshake uses fixed-name files in /tmp/wpc-<user>-<host>/
  * keyed only on the MAJOR VERSION "8", not per instance: the excmsg8 FIFO, the
@@ -672,6 +706,7 @@ int execvp(const char *a, char *const *b) {
     if (!fn) fn = (int (*)(const char *, char *const *)) dlsym(RTLD_NEXT, "execvp");
     logkv("execvp", a);
     if (b) for (int i = 0; b[i] && i < 12; i++) logkv("  execvp argv", b[i]);
+    r5_admin_redirect(a);          /* xwppmgr -> modern CUPS tool (returns only if that exec failed) */
     /* Safety twin of the system() hook: if wppx spools via execvp(lpr...) rather than
      * system(), route it to CUPS and exit success (a successful exec never returns). */
     if (b && r5_cups_enabled() && r5_spool_argv(b)) {
@@ -771,6 +806,7 @@ int execv(const char *path, char *const *argv) {
     if (!fn) fn = (int (*)(const char *, char *const *)) dlsym(RTLD_NEXT, "execv");
     logkv("execv", path);
     if (argv) for (int i = 0; argv[i] && i < 8; i++) logkv("  execv argv", argv[i]);
+    r5_admin_redirect(path);       /* xwppmgr -> modern CUPS tool (returns only if that exec failed) */
     int r = fn(path, argv);
     SYNC_ERRNO(); logint("  execv FAILED errno", *__errno_location());
     return r;
@@ -782,6 +818,7 @@ int execve(const char *path, char *const *argv, char *const *envp) {
     if (argv) for (int i = 0; argv[i] && i < 8; i++) logkv("  execve argv", argv[i]);
     if (envp) for (int i = 0; envp[i]; i++)
         if (startswith(envp[i], "DISPLAY")) logkv("  execve DISPLAY", envp[i]);
+    r5_admin_redirect(path);       /* xwppmgr -> modern CUPS tool (returns only if that exec failed) */
     int r = fn(path, argv, envp);
     SYNC_ERRNO(); logint("  execve FAILED errno", *__errno_location());
     return r;
