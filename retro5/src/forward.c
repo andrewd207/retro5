@@ -85,6 +85,64 @@ static int startswith(const char *s, const char *p) {
     while (*p) { if (*s++ != *p++) return 0; }
     return 1;
 }
+static int streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* ---- per-instance print-server path rewrite ------------------------------
+ * WP's xwp<->wpexc handshake uses fixed-name files in /tmp/wpc-<user>-<host>/
+ * keyed only on the MAJOR VERSION "8", not per instance: the excmsg8 FIFO, the
+ * .wpexc8.man manifest, and the .wpexc8.LCK lock. Two WP 8.0 instances therefore
+ * collide -- the second recreates excmsg8, orphaning the first (which then spins
+ * ~5 min and shows a false "print server not running"). Fix: make those three
+ * names per-instance by inserting a shared token. retro5 loads in BOTH xwp and
+ * the wpexc it spawns, so rewriting the path ARGUMENT of every path-taking libc
+ * call in both processes keeps them in agreement WITHOUT touching manifest
+ * CONTENTS: wpexc writes the base name "excmsg8" into the manifest, and when xwp
+ * later open()s that base name we rewrite it again with the same token, so both
+ * converge on the identical per-instance path.
+ *
+ * Gated on RETRO5_WPEXC_ID (exported by the WP launcher as $$): any program that
+ * loads retro5.so WITHOUT the token is never rewritten. Token read once + cached.
+ *
+ * CRITICAL: this must be applied at EVERY libc path entry point WP can reach --
+ * not only open/mknod/unlink here in forward.c, but also stat/lstat (os5.c),
+ * which is why r5_wpexc_rewrite is exported (non-static). If one entry point
+ * rewrites and another does not, xwp creates ".wpexc8.<id>.LCK" via open() but
+ * then stat()s the un-rewritten ".wpexc8.LCK", sees it absent, and skips
+ * releasing the lock -- wpexc then blocks forever and dies with "error 21". */
+extern char *getenv(const char *);
+static const char *wpexc_id(void) {
+    static const char *id; static int looked;
+    if (!looked) { looked = 1; id = getenv("RETRO5_WPEXC_ID"); if (id && !*id) id = 0; }
+    return id;
+}
+/* If PATH's basename is one of WP's fixed print-server file names, write a
+ * per-instance variant into BUF and return BUF; otherwise return PATH unchanged
+ * (also when the token is unset or the rewrite would overflow BUF). Gated only on
+ * (token set) + (EXACT basename match) -- no directory-prefix requirement, so a
+ * relative open (e.g. WP chdir'd into the wpc dir) is rewritten identically.
+ * Exact basename match keeps it idempotent (".wpexc8.1234.LCK" never re-matches). */
+const char *r5_wpexc_rewrite(const char *path, char *buf, size_t bufsz) {
+    const char *id = wpexc_id();
+    if (!id || !path) return path;
+    const char *tail = path;
+    for (const char *p = path; *p; p++) if (*p == '/') tail = p + 1;
+    size_t dlen = (size_t)(tail - path);
+    char nb[128]; int m;
+    if      (streq(tail, "excmsg8"))      m = snprintf(nb, sizeof nb, "excmsg8.%s", id);
+    else if (streq(tail, ".wpexc8.man"))  m = snprintf(nb, sizeof nb, ".wpexc8.%s.man", id);
+    else if (streq(tail, ".wpexc8.LCK"))  m = snprintf(nb, sizeof nb, ".wpexc8.%s.LCK", id);
+    else if (streq(tail, ".wpexc.man"))   m = snprintf(nb, sizeof nb, ".wpexc.%s.man", id);
+    else if (streq(tail, ".wpexc.LCK"))   m = snprintf(nb, sizeof nb, ".wpexc.%s.LCK", id);
+    else return path;
+    if (m < 0 || (size_t)m >= sizeof nb) return path;   /* basename too long */
+    if (dlen + (size_t)m + 1 > bufsz) return path;      /* overflow -> unchanged */
+    for (size_t i = 0; i < dlen; i++) buf[i] = path[i];
+    for (int i = 0; i <= m; i++) buf[dlen + i] = nb[i]; /* copies trailing NUL */
+    return buf;
+}
 /* log a key with an integer value (result/errno tracing for spawn calls) */
 static void logint(const char *k, long v) {
     char b[32]; int i = 0, neg = 0; unsigned long u;
@@ -267,14 +325,33 @@ FWDV(tzset, (void), ())
 FWD(long,   time,   (long *a), (a))
 
 /* ---- files / fs (non-FILE) ------------------------------------------------ */
-FWD(int,   access,  (const char *a, int b), (a, b))
+/* access/unlink/rename take the print-server path names, so they are explicit
+ * (not FWD) to apply the per-instance rewrite before forwarding. */
+int access(const char *a, int b) {
+    static int (*fn)(const char *, int);
+    if (!fn) fn = (int (*)(const char *, int)) dlsym(RTLD_NEXT, "access");
+    char buf[512]; const char *p = r5_wpexc_rewrite(a, buf, sizeof buf);
+    PRE_ERRNO(); int _r = fn(p, b); SYNC_ERRNO(); return _r;
+}
 FWD(int,   chdir,   (const char *a), (a))
 FWD(int,   chmod,   (const char *a, unsigned b), (a, b))
 FWD(int,   fchmod,  (int a, unsigned b), (a, b))
 FWD(int,   mkdir,   (const char *a, unsigned b), (a, b))
 FWD(int,   rmdir,   (const char *a), (a))
-FWD(int,   unlink,  (const char *a), (a))
-FWD(int,   rename,  (const char *a, const char *b), (a, b))
+int unlink(const char *a) {
+    static int (*fn)(const char *);
+    if (!fn) fn = (int (*)(const char *)) dlsym(RTLD_NEXT, "unlink");
+    char buf[512]; const char *p = r5_wpexc_rewrite(a, buf, sizeof buf);
+    PRE_ERRNO(); int _r = fn(p); SYNC_ERRNO(); return _r;
+}
+int rename(const char *a, const char *b) {
+    static int (*fn)(const char *, const char *);
+    if (!fn) fn = (int (*)(const char *, const char *)) dlsym(RTLD_NEXT, "rename");
+    char ba[512], bb[512];
+    const char *pa = r5_wpexc_rewrite(a, ba, sizeof ba);
+    const char *pb = r5_wpexc_rewrite(b, bb, sizeof bb);
+    PRE_ERRNO(); int _r = fn(pa, pb); SYNC_ERRNO(); return _r;
+}
 FWD(int,   close,   (int a), (a))
 int g_drs_fd = -1;   /* set by open() when wp.drs is opened; traced below */
 /* trace the WP IPC channels (excmsg8 FIFO + per-client response files) to see
@@ -481,6 +558,7 @@ extern int mkfifo(const char *, unsigned);
 #define WP_S_IFIFO 0x1000u
 int mknod(const char *a, unsigned b, unsigned c) {
     int r;
+    char _rbuf[512]; a = r5_wpexc_rewrite(a, _rbuf, sizeof _rbuf);
     if ((b & WP_S_IFMT) == WP_S_IFIFO) {
         unsigned perm = b & 0777; if (!perm) perm = 0666;
         r = mkfifo(a, perm); SYNC_ERRNO();
@@ -496,6 +574,7 @@ int mknod(const char *a, unsigned b, unsigned c) {
     return r;
 }
 int _xmknod(int a, const char *b, unsigned c, void *d) {
+    char _rbuf[512]; b = r5_wpexc_rewrite(b, _rbuf, sizeof _rbuf);
     if ((c & WP_S_IFMT) == WP_S_IFIFO) {
         unsigned perm = c & 0777; if (!perm) perm = 0666;
         int r = mkfifo(b, perm); SYNC_ERRNO();
@@ -552,7 +631,8 @@ int open(const char *path, int flags, ...) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, unsigned); va_end(ap);
     static int (*fn)(const char *, int, unsigned);
     if (!fn) fn = (int (*)(const char *, int, unsigned)) dlsym(RTLD_NEXT, "open");
-    int r = fn(path, flags, mode);
+    char _rbuf[512]; const char *rpath = r5_wpexc_rewrite(path, _rbuf, sizeof _rbuf);
+    int r = fn(rpath, flags, mode);
     /* skip our own log/proc paths to avoid logkv->open recursion */
     if (!startswith(path, "/tmp/wpshim.log") && !startswith(path, "/proc/self/cmdline")) {
         SYNC_ERRNO(); logkv("open", path);
@@ -567,6 +647,29 @@ int open(const char *path, int flags, ...) {
               { g_ipc_fds[g_ipc_n++] = r; logkv("  [tracking IPC chan]", tail); logint("    fd", r); } }
     }
     return r;
+}
+/* openat/mknodat/unlinkat: not part of the libc5 ABI (WP never calls them), but
+ * interposed for completeness so any *at() caller that resolves through the shim
+ * gets the same per-instance rewrite. Gated identically via wpexc_rewrite. */
+int openat(int dirfd, const char *path, int flags, ...) {
+    unsigned mode = 0;
+    va_list ap; va_start(ap, flags); mode = va_arg(ap, unsigned); va_end(ap);
+    static int (*fn)(int, const char *, int, unsigned);
+    if (!fn) fn = (int (*)(int, const char *, int, unsigned)) dlsym(RTLD_NEXT, "openat");
+    char buf[512]; const char *p = r5_wpexc_rewrite(path, buf, sizeof buf);
+    PRE_ERRNO(); int r = fn(dirfd, p, flags, mode); SYNC_ERRNO(); return r;
+}
+int mknodat(int dirfd, const char *path, unsigned mode, unsigned dev) {
+    static int (*fn)(int, const char *, unsigned, unsigned);
+    if (!fn) fn = (int (*)(int, const char *, unsigned, unsigned)) dlsym(RTLD_NEXT, "mknodat");
+    char buf[512]; const char *p = r5_wpexc_rewrite(path, buf, sizeof buf);
+    PRE_ERRNO(); int r = fn(dirfd, p, mode, dev); SYNC_ERRNO(); return r;
+}
+int unlinkat(int dirfd, const char *path, int flags) {
+    static int (*fn)(int, const char *, int);
+    if (!fn) fn = (int (*)(int, const char *, int)) dlsym(RTLD_NEXT, "unlinkat");
+    char buf[512]; const char *p = r5_wpexc_rewrite(path, buf, sizeof buf);
+    PRE_ERRNO(); int r = fn(dirfd, p, flags); SYNC_ERRNO(); return r;
 }
 int fcntl(int fd, int cmd, ...) {
     va_list ap; va_start(ap, cmd); void *arg = va_arg(ap, void *); va_end(ap);

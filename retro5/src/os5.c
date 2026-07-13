@@ -45,13 +45,21 @@ static void xlate_stat(const struct stat *s, struct lc5_stat *b) {
     b->ctime_     = (unsigned long)s->st_ctime;
 }
 
+/* Per-instance print-server path rewrite (defined in forward.c). MUST be applied
+ * here too: WP checks/releases its .wpexc8.LCK lock via _xstat/_lxstat, so if we
+ * rewrite the open() but not the stat(), xwp stats the un-rewritten name, sees it
+ * absent, and never releases the lock -> wpexc hangs and dies with "error 21". */
+extern const char *r5_wpexc_rewrite(const char *path, char *buf, size_t bufsz);
+
 int _xstat(int ver, const char *path, struct lc5_stat *b) {
     (void)ver; struct stat s;
+    char rb[512]; path = r5_wpexc_rewrite(path, rb, sizeof rb);
     if (stat(path, &s) < 0) { SYNC_ERRNO(); return -1; }
     xlate_stat(&s, b); return 0;
 }
 int _lxstat(int ver, const char *path, struct lc5_stat *b) {
     (void)ver; struct stat s;
+    char rb[512]; path = r5_wpexc_rewrite(path, rb, sizeof rb);
     if (lstat(path, &s) < 0) { SYNC_ERRNO(); return -1; }
     xlate_stat(&s, b); return 0;
 }
