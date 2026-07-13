@@ -1079,12 +1079,6 @@ typedef struct {
     char             buf[1100];
 } R5Text;
 
-/* The most recent font our text hook rendered, captured so the toggle expose can draw its OWN label
- * in the identical font. That matters because Motif sized each toggle's width from that font's
- * (rewritten-to-cairo) metrics — matching the font is what makes our label fit instead of clipping. */
-static R5Font r5_last_label;
-static int    r5_have_last_label;
-
 static int r5_text_setup(Display *dpy, Drawable d, GC gc, const char *s, int len, R5Text *t) {
     Window root; int gx, gy; unsigned gw, gh, gbw, gdep;
     t->sf = 0; t->cr = 0;
@@ -1105,8 +1099,6 @@ static int r5_text_setup(Display *dpy, Drawable d, GC gc, const char *s, int len
     }
     r5_cairo_font(t->cr, t->fnt);
     r5_latin1_utf8(s, len > 500 ? 500 : len, t->buf, sizeof t->buf);
-    r5_last_label = *t->fnt;                             /* remember the live dialog/label font: the */
-    r5_have_last_label = 1;                              /* toggle expose renders its own label to match */
     return 1;
 }
 
@@ -1758,43 +1750,18 @@ void retro5_DrawToggle(void *w) {
     }
 }
 
-/* Motif's XmStringGetLtoR is in the statically-linked Xm code (no symbol to resolve), so the
- * per-binary takeover hands us its absolute address. The charset is compared by strcmp inside it, so
- * the literal default tag matches WP's label segments. XtGetValues(XmNlabelString) returns a freshly
- * allocated *external* XmString that the caller owns, and XmStringGetLtoR returns an XtMalloc'd
- * char*; since XmStringFree is literally XtFree((char*)s), one XtFree reclaims each — no extra Motif
- * address needed. Returns the label length (0 = none), copied into the caller's buffer. */
-static uintptr_t r5_addr_XmStringGetLtoR;
-static void (*r5_XtFree)(void *);
-
-static int r5_widget_label(void *w, char *out, int outsz) {
-    void *xs = 0;                                        /* XmString (opaque) */
-    R5Arg a;
-    char *t = 0;
-    int (*getltor)(void *, const char *, char **);
-    if (!out || outsz < 1) return 0;
-    out[0] = 0;
-    if (!r5_addr_XmStringGetLtoR) return 0;
-    a.name = (char *)"labelString"; a.value = (long)&xs;
-    r5_get(w, &a, 1);
-    if (!xs) return 0;
-    if (!r5_XtFree) *(void **)&r5_XtFree = r5_realsym("XtFree");
-    *(void **)&getltor = (void *)r5_addr_XmStringGetLtoR;
-    if (getltor(xs, "FONTLIST_DEFAULT_TAG_STRING", &t) && t) {
-        strncpy(out, t, outsz - 1); out[outsz - 1] = 0;
-        if (r5_XtFree) r5_XtFree(t);
-    }
-    if (r5_XtFree) r5_XtFree(xs);                        /* XmStringFree(xs) == XtFree(xs) */
-    return (int)strlen(out);
-}
-
-/* Full XmToggleButton expose — background + indicator + label, ALL ours and double-buffered, with no
- * delegation to Motif (the law: a taken-over expose re-makes the whole widget). This is what ends the
+/* Full XmToggleButton expose — background + indicator drawn by us and double-buffered; the LABEL is
+ * then painted by Motif's own XmLabel expose (see the commit point below). This is what ends the
  * group flicker: Motif's own toggle expose clears each widget's background directly on the window, so
- * unsetting siblings in a radio group flashes a clear across every one of them; here nothing reaches
- * the screen until a single blit of the finished frame. The label is rendered in our UI font (like
- * the rest of the app's text), sized from the widget and placed just right of the indicator. */
+ * unsetting siblings in a radio group flashes a clear across every one of them; here the background
+ * and indicator reach the screen in a single blit of the finished frame.
+ *
+ * Reentry guard: the Motif-fallback path calls the toggle's original Redisplay, which itself calls
+ * the (now taken-over) XmLabel expose — see retro5_LabelExpose — which would route straight back here.
+ * The flag turns that into a one-shot so it can never recurse. */
 static void (*r5_orig_toggle_expose)(void *, XEvent *, Region);
+static void (*r5_orig_label_expose)(void *, XEvent *, Region);   /* real XmLabel expose (draws label) */
+static int r5_in_toggle_expose;
 
 void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     Display *dpy;
@@ -1803,11 +1770,11 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     int wx, wy, x, y, sz;
     R5Canvas cv;
     cairo_t *cr;
-    R5Arg a[9];
-    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, mh = 0, isz = 0, height, edge;
-    unsigned long bg = 0xd3d3d3, fgpix = 0;
-    char label[256];
-    int llen, label_x;
+    R5Arg a[6];
+    long set = 0, itype = 0, hlt = 0, st = 0, mw = 0, height, edge;
+    unsigned long bg = 0xd3d3d3;
+
+    if (r5_in_toggle_expose) return;                     /* never recurse via the fallback path */
 
     if (!r5_skin || !w || !r5_cairo() || !r5_xlib()) goto fallback;
     dpy = r5x.XtDisplayOfObject(w);
@@ -1820,13 +1787,10 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     a[2].name = (char *)"highlightThickness"; a[2].value = (long)&hlt;
     a[3].name = (char *)"shadowThickness";    a[3].value = (long)&st;
     a[4].name = (char *)"marginWidth";        a[4].value = (long)&mw;
-    a[5].name = (char *)"marginHeight";       a[5].value = (long)&mh;
-    a[6].name = (char *)"background";         a[6].value = (long)&bg;
-    a[7].name = (char *)"foreground";         a[7].value = (long)&fgpix;
-    a[8].name = (char *)"indicatorSize";      a[8].value = (long)&isz;
-    r5_get(w, a, 9);
+    a[5].name = (char *)"background";         a[5].value = (long)&bg;
+    r5_get(w, a, 6);
 
-    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff; mh &= 0xffff; isz &= 0xffff;
+    hlt &= 0xffff; st &= 0xffff; mw &= 0xffff;
     height = (long)hh;
     edge = height - 2 * (hlt + st);                      /* same indicator geometry as DrawToggle */
     if (edge > 13) edge = 13;
@@ -1835,12 +1799,6 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     x  = (int)(st + mw);
     y  = (int)((height - edge) / 2);
     if (sz < 6 || x < 0 || y < 0) goto fallback;
-
-    /* Where Motif budgeted the label: after highlight + shadow + margin + the FULL indicator cell it
-     * reserved (indicatorSize), plus its spacing. Placing our label there — and rendering it in the
-     * font Motif sized the widget with — makes it fit exactly inside ww instead of overflowing. */
-    if (isz < sz || isz > 40) isz = sz;                  /* sane fallback if the resource is odd */
-    label_x = (int)(hlt + st + mw + isz + 1);
 
     if (!r5_canvas_begin(&cv, dpy, win, ww, hh)) goto fallback;
     if (!(cr = r5_canvas_cairo(&cv))) { r5_canvas_commit(&cv, 0, 0, 0, 0); goto fallback; }
@@ -1852,48 +1810,37 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
 
     r5_paint_indicator(cr, x, y, sz, itype, set, bg);
 
-    /* label: the SAME font the dialog's other text is drawn in (captured from our text hook), so the
-     * width matches what Motif reserved; vertically centered on the widget. */
-    llen = r5_widget_label(w, label, sizeof label);
-    if (llen > 0) {
-        R5Font lf;
-        char utf[512];
-        cairo_text_extents_t te;
-        double fr, fg2, fb;
-        int avail = (int)ww - label_x - (int)mw;         /* room Motif left for the text */
-        if (r5_have_last_label) {
-            lf = r5_last_label;
-        } else {                                         /* first paint, no sample yet: derive a size */
-            double fpx = hh * 0.62;
-            if (fpx < 10) fpx = 10;
-            if (fpx > 22) fpx = 22;
-            lf.family = r5_family_for(0, 0);
-            lf.slant  = CAIRO_FONT_SLANT_NORMAL;
-            lf.weight = CAIRO_FONT_WEIGHT_NORMAL;
-            lf.size   = fpx;
-        }
-        r5_latin1_utf8(label, llen, utf, sizeof utf);
-        r5_cairo_font(cr, &lf);
-        /* Motif sized this widget from the toggle's OWN font metrics; our captured font is only close,
-         * so a long label can be a hair too wide and clip at the widget edge. Measure it and, only if
-         * it would overflow, shrink the font just enough to fit — no clip, minimal size change. */
-        cz.text_extents(cr, utf, &te);
-        if (avail > 8 && te.x_advance > avail) {
-            lf.size *= (double)avail / te.x_advance;
-            if (lf.size < 8) lf.size = 8;
-            r5_cairo_font(cr, &lf);
-        }
-        r5_pixel_rgb(dpy, fgpix, &fr, &fg2, &fb);
-        cz.set_source_rgb(cr, fr, fg2, fb);
-        cz.move_to(cr, (double)label_x, (hh + lf.size * 0.72) / 2.0);
-        cz.show_text(cr, utf);
-    }
-
-    r5_canvas_commit(&cv, 0, 0, ww, hh);                 /* present the whole toggle in one blit */
+    /* Blit our background + indicator, then let Motif's own XmLabel expose paint the LABEL on top.
+     * The label thus comes out in the toggle's exact font, size and position (XmLabel draws only the
+     * TextRect via _XmStringDraw, whose glyphs flow through our cairo text hook — so it is our UI font
+     * yet perfectly consistent with every other label in the dialog, never a guessed/shrunk size).
+     * XmLabel touches only the text region, so our indicator to its left is untouched. */
+    r5_canvas_commit(&cv, 0, 0, ww, hh);
+    if (r5_orig_label_expose) r5_orig_label_expose(w, ev, region);
     return;
 
 fallback:
-    if (r5_orig_toggle_expose) r5_orig_toggle_expose(w, ev, region);
+    if (r5_orig_toggle_expose) {
+        r5_in_toggle_expose = 1;                         /* Redisplay re-enters XmLabel expose (ours) */
+        r5_orig_toggle_expose(w, ev, region);
+        r5_in_toggle_expose = 0;
+    }
+}
+
+/* The shared XmLabel expose (XmToggleButton's superclass). Motif redraws a toggle's label on arm/
+ * select/disarm by calling xmLabelClassRec.core_class.expose DIRECTLY — a path that bypasses the
+ * toggle's own expose entirely — so without owning it too, that redraw would paint a SECOND copy of
+ * the label over ours (offset, wrecking the antialiasing). We take it over: a toggle routes to our
+ * full painter (one label, our position, no double); every other label-derived widget falls straight
+ * through to Motif, unchanged. r5_toggle_class is the XmToggleButton class record for this build. */
+static uintptr_t r5_toggle_class;
+
+void retro5_LabelExpose(void *w, XEvent *ev, Region region) {
+    if (w && r5_toggle_class && *(void **)((char *)w + 4) == (void *)r5_toggle_class) {
+        retro5_ToggleButtonExpose(w, ev, region);
+        return;
+    }
+    if (r5_orig_label_expose) r5_orig_label_expose(w, ev, region);
 }
 
 /* ======================================================================================= *
@@ -1964,11 +1911,28 @@ static void takeoverWP80(void) {
         { 0x08050660, 0x087d875c, retro5_XFreeFont,        "XFreeFont"        },
     };
     r5_xsyms = 0;                       /* 8.0 is dynamic-X: resolve X/Xt entry points by name */
-    r5_addr_XmStringGetLtoR = 0x0869dc40;  /* statically-linked Xm; the toggle expose reads labels */
+    r5_toggle_class = 0x087d1ae8;          /* XmToggleButton class record (retro5_LabelExpose gate) */
 
     /* Appearance takeover — cheap (byte patches + one class-record word each), no library loads. */
     takeover_entries(entries, sizeof entries / sizeof entries[0]);
     takeover_methods(methods, sizeof methods / sizeof methods[0]);
+
+    /* Also own the SHARED XmLabel expose (the toggle's superclass), because a toggle's arm/select
+     * redraw calls it directly, off the toggle's own expose path. Its address isn't a literal: read
+     * the toggle class record's superclass (offset 0) to get the XmLabel class record, and its live
+     * expose slot as the guard value. retro5_LabelExpose routes toggles to us, all else to Motif. */
+    if (!range_unmapped((void *)r5_toggle_class, 4)) {
+        uintptr_t label_class = *(uintptr_t *)r5_toggle_class;
+        if (label_class && !range_unmapped((void *)(label_class + R5_EXPOSE_OFF), 4)) {
+            R5Method lm[1];
+            lm[0].class_rec = label_class;
+            lm[0].expect    = *(uintptr_t *)(label_class + R5_EXPOSE_OFF);
+            lm[0].target    = retro5_LabelExpose;
+            lm[0].saved     = (void **)&r5_orig_label_expose;
+            lm[0].name      = "XmLabel";
+            takeover_methods(lm, 1);
+        }
+    }
 
     /* The cairo text layer — the ONLY expensive part of retro5. Everything here is gated behind
        RETRO5_TEXT so it can be switched off wholesale: with r5_text=0 we do NOT dlopen cairo, do
