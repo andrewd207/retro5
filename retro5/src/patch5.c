@@ -953,6 +953,34 @@ static void r5_parse_xlfd(const char *xlfd, char *family, int fsz,
         strstr(xlfd, "ruler") || strstr(xlfd, "wpicon")) *symbolic = 1;
 }
 
+/* ---- the DPI-aware UI scale ----
+ * WP was built for late-'90s displays (~75-96 dpi), where its fixed-pixel fonts looked comfortably
+ * large; on a modern high-dpi panel the same pixel counts render tiny. r5_scale() is the factor we
+ * grow the UI by: render size AND the metrics WP measures (so controls reserve the extra room), kept
+ * in lock-step so text still fits its widget. Default is derived from the screen's real dpi against a
+ * 96 baseline; RETRO5_UI_SCALE overrides it outright. Floored at 1.0 — we never render SMALLER than
+ * stock — and capped so a mis-reported dpi can't blow the UI up. Computed once, when a Display first
+ * exists (it does by font-load time). */
+static double r5_ui_scale_env;                          /* RETRO5_UI_SCALE, 0 = unset */
+static double r5_ui_scale_cache;                        /* 0 = not yet computed */
+static Display *r5_dpy;                                 /* stashed Display for the no-Display metrics */
+static double r5_scale(void) {
+    double s = 1.0;
+    if (r5_ui_scale_cache > 0) return r5_ui_scale_cache;
+    if (r5_ui_scale_env > 0) {
+        s = r5_ui_scale_env;
+    } else if (r5_dpy) {
+        int scr = DefaultScreen(r5_dpy);
+        int mm  = DisplayHeightMM(r5_dpy, scr);
+        int px  = DisplayHeight(r5_dpy, scr);
+        if (mm > 0 && px > 0) s = (px * 25.4 / mm) / 96.0;
+    }
+    if (s < 1.0)  s = 1.0;                               /* never below stock */
+    if (s > 1.75) s = 1.75;                              /* guard a bogus dpi */
+    if (r5_ui_scale_env > 0 || r5_dpy) r5_ui_scale_cache = s;   /* cache once we had a basis */
+    return s;
+}
+
 /* Build (or fetch cached) our cairo record for an already-loaded font, keyed by fs->fid. The
  * XLFD is taken from `xlfd_hint` (the name WP passed to XLoadQueryFont) when known, else from the
  * font's own XA_FONT property. Does NOT free fs — the caller owns it. */
@@ -990,8 +1018,9 @@ static R5Font *r5_font_intern(Display *dpy, XFontStruct *fs, const char *xlfd_hi
     slot->slant  = italic ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
     slot->weight = bold ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL;
     /* cairo em size from the X pixel height. 0.92 keeps our glyphs a touch tighter than the box,
-       matching how a modern UI font sits vs. a bitmap face of the same nominal height. */
-    { int hgt = fs->ascent + fs->descent; if (hgt < 6) hgt = 13; slot->size = hgt * 0.92; }
+       matching how a modern UI font sits vs. a bitmap face of the same nominal height. The UI scale
+       grows it on high-dpi screens; r5_rewrite_metrics grows the measured box by the SAME factor. */
+    { int hgt = fs->ascent + fs->descent; if (hgt < 6) hgt = 13; slot->size = hgt * 0.92 * r5_scale(); }
     return slot;
 }
 
@@ -1032,9 +1061,7 @@ static int r5_latin1_utf8(const char *s, int len, char *out, int outsz) {
     return o;
 }
 
-/* The Display, stashed from any call that carries one, so the no-Display metrics calls
- * (XTextWidth/XTextExtents) can still query fonts. */
-static Display *r5_dpy;
+/* r5_dpy (the stashed Display for the no-Display metrics calls) is defined up by r5_scale(). */
 
 /* One persistent 1x1 image context for measuring (no per-call surface churn). */
 static cairo_t *r5_measure_cr;
@@ -1188,10 +1215,11 @@ void retro5_XDrawImageString(Display *dpy, Drawable d, GC gc, int x, int y, cons
  * them, so its size negotiation converges instead of re-measuring "Program" forever (root cause
  * found in gdb: cairo XTextWidth vs native max_bounds.width disagreed -> non-convergent loop).
  *
- * Vertical metrics (ascent/descent) are left native, so line heights don't move. Symbol/pi fonts
- * and multi-byte (fontset) fonts are left entirely alone. This runs at font-LOAD time, does only
- * in-memory edits + cairo measurement on an image surface (no X traffic, no dlsym), so it is safe
- * even inside WP's startup handshake — and it must run then, because that is when the fonts load. */
+ * Vertical metrics are scaled by the UI scale (a no-op at 1.0), so line heights track the enlarged
+ * glyphs on high-dpi screens and stay put on stock ones. Symbol/pi fonts and multi-byte (fontset)
+ * fonts are left entirely alone. This runs at font-LOAD time, does only in-memory edits + cairo
+ * measurement on an image surface (no X traffic, no dlsym), so it is safe even inside WP's startup
+ * handshake — and it must run then, because that is when the fonts load. */
 static void r5_rewrite_metrics(Display *dpy, XFontStruct *fs, const char *xlfd_hint) {
     R5Font *fnt;
     unsigned c, first, last;
@@ -1221,6 +1249,22 @@ static void r5_rewrite_metrics(Display *dpy, XFontStruct *fs, const char *xlfd_h
         char ch = 'n';
         double a = r5_advance(fnt, &ch, 1);
         if (a > 0) fs->min_bounds.width = fs->max_bounds.width = (short)(a + 0.5);
+    }
+
+    /* Grow the HEIGHT metrics by the UI scale too. Widths already scaled (they are cairo advances at
+     * the scaled render size); the vertical metrics are what WP reads for row/control height and the
+     * text baseline, so without this our enlarged glyphs would be taller than the box WP reserved and
+     * clip. At scale 1.0 this is a no-op, so stock-dpi displays are untouched. */
+    {
+        double s = r5_scale();
+        if (s > 1.0001) {
+            fs->ascent  = (int)(fs->ascent  * s + 0.5);
+            fs->descent = (int)(fs->descent * s + 0.5);
+            fs->max_bounds.ascent  = (short)(fs->max_bounds.ascent  * s + 0.5);
+            fs->max_bounds.descent = (short)(fs->max_bounds.descent * s + 0.5);
+            fs->min_bounds.ascent  = (short)(fs->min_bounds.ascent  * s + 0.5);
+            fs->min_bounds.descent = (short)(fs->min_bounds.descent * s + 0.5);
+        }
     }
 }
 
@@ -1730,7 +1774,8 @@ void retro5_DrawToggle(void *w) {
      * Motif reserved (indicatorSize) so the label — placed by Motif after that cell — is never
      * clipped. */
     edge = height - 2 * (hlt + st);
-    if (edge > 13) edge = 13;                            /* Motif's label sits close; stay clear of it */
+    { long hi = (long)(13 * r5_scale());                 /* cap grows with the UI scale */
+      if (edge > hi) edge = hi; }
     if (edge < 10) edge = 10;
     sz = (int)edge;
     /* Hug the widget's left edge (drop the highlight margin) so a clear gap opens before the label,
@@ -1804,7 +1849,8 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     hlt &= 0xffff; st &= 0xffff; mw &= 0xffff;
     height = (long)hh;
     edge = height - 2 * (hlt + st);                      /* same indicator geometry as DrawToggle */
-    if (edge > 13) edge = 13;
+    { long hi = (long)(13 * r5_scale());
+      if (edge > hi) edge = hi; }
     if (edge < 10) edge = 10;
     sz = (int)edge;
     x  = (int)(st + mw);
@@ -2015,6 +2061,11 @@ static void findBinaryFixes(void) {
     const struct known_binary *b = matchBinaryHash();
     const char *skin = getenv("RETRO5_SKIN");
     const char *text = getenv("RETRO5_TEXT");
+    const char *uiscale = getenv("RETRO5_UI_SCALE");
+    if (uiscale && uiscale[0]) {                         /* override the dpi-derived UI scale */
+        double v = atof(uiscale);
+        if (v >= 1.0 && v <= 3.0) r5_ui_scale_env = v;
+    }
     if (skin && skin[0] == '0') r5_skin = 0;             /* stock Motif drawing, for A/B */
     if (text) {
         if (text[0] == '0')             r5_text = 0;     /* text layer off */
