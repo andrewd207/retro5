@@ -1891,30 +1891,42 @@ void retro5_PushButtonExpose(void *w, XEvent *ev, Region region) {
 /* ---- bigger icon toolbar buttons under the UI scale ----
  * An XmDrawnButton with a pixmap sizes itself in Motif's XmLabel SetSize: core = TextRect(pixmap) +
  * margins + 2*(marginW + shadow + highlight), but ONLY when core.width is still 0 (initial sizing).
- * SetSize is reached through DrawnButton's `resize` method, so we take that over and inflate the icon
- * slot (label.TextRect) by the UI scale BEFORE the original runs — SetSize then computes
+ * We inflate the icon slot (label.TextRect) by the UI scale BEFORE SetSize runs — it then computes
  * core = round(icon*scale) + the constant chrome, and re-centers, with no reimplementation. The
  * core.width==0 gate makes it a one-shot per widget (later resizes keep the already-inflated slot).
- * Instance-field offsets verified for this build (guarded by the class-record `expect` in the swap):
- * core.width +0x20, TextRect.width +0xf4, TextRect.height +0xf6. No-op at scale 1.0.
+ * Instance-field offsets verified for this build: core.width +0x20, TextRect.width +0xf4,
+ * TextRect.height +0xf6. No-op at scale 1.0.
+ *
+ * We take this over by jmp-patching the resize THUNK at 0x086bae18, NOT the class-record slot: the
+ * slot is an INHERITED method that Xt re-resolves at first widget creation, silently clobbering any
+ * load-time slot swap (see MOTIF-DRAW-TAKEOVER-PLAN.md / memory). Patching the function entry is
+ * immune to that. The thunk is a two-line trampoline whose whole body is `SetSize(w, 5)` (push $5;
+ * push widget; call 0x086baea4) — we reproduce it by calling that worker directly after inflating.
+ * The thunk is shared by XmDrawnButton AND XmPushButton, so we gate the inflate to the DrawnButton
+ * class (toolbar icons); dialog PushButtons pass straight through and are never double-scaled (their
+ * text already scales via the font metrics). No-op at scale 1.0, so stock-dpi displays are untouched.
  *
  * NB: XCopyArea does not scale, so this enlarges the BUTTON (icon centered with more padding); the
  * icon glyph itself only grows via a larger source pixmap (the planned SVG-by-hash replacement). */
 #define R5_RESIZE_OFF (R5_EXPOSE_OFF - 4)                /* offsetof(CoreClassPart, resize) = 64 */
-static void (*r5_orig_drawnbutton_resize)(void *);
+#define R5_DRAWNBUTTON_CLASS 0x087cd050                  /* XmDrawnButtonClassRec */
+static void (*r5_label_setsize)(void *, int) = (void (*)(void *, int))0x086baea4;  /* the resize worker */
 
 void retro5_DrawnButtonResize(void *w) {
     if (r5_skin && w) {
-        double s = r5_scale();
-        unsigned short *cw = (unsigned short *)((char *)w + 0x20);   /* core.width */
-        if (s > 1.0001 && *cw == 0) {                    /* initial sizing only -> inflate icon slot */
-            unsigned short *tw = (unsigned short *)((char *)w + 0xf4);   /* label.TextRect.width  */
-            unsigned short *th = (unsigned short *)((char *)w + 0xf6);   /* label.TextRect.height */
-            if (*tw && *tw < 2000) *tw = (unsigned short)(*tw * s + 0.5);
-            if (*th && *th < 2000) *th = (unsigned short)(*th * s + 0.5);
+        if (!r5_XtClass) *(void **)&r5_XtClass = r5_realsym("XtClass");
+        if (r5_XtClass && r5_XtClass(w) == (void *)R5_DRAWNBUTTON_CLASS) {  /* toolbar icons only */
+            double s = r5_scale();
+            unsigned short *cw = (unsigned short *)((char *)w + 0x20);   /* core.width */
+            if (s > 1.0001 && *cw == 0) {                /* initial sizing only -> inflate icon slot */
+                unsigned short *tw = (unsigned short *)((char *)w + 0xf4);   /* label.TextRect.width  */
+                unsigned short *th = (unsigned short *)((char *)w + 0xf6);   /* label.TextRect.height */
+                if (*tw && *tw < 2000) *tw = (unsigned short)(*tw * s + 0.5);
+                if (*th && *th < 2000) *th = (unsigned short)(*th * s + 0.5);
+            }
         }
     }
-    if (r5_orig_drawnbutton_resize) r5_orig_drawnbutton_resize(w);   /* SetSize computes core from it */
+    r5_label_setsize(w, 5);                              /* the thunk's body: SetSize(w, 5) */
 }
 
 /* True when a widget is insensitive (disabled). XtIsSensitive is the correct test — it folds in
@@ -2271,6 +2283,10 @@ static void takeoverWP80(void) {
         { 0x086bebf8, "\x55\x89\xe5\x83\xec\x6c", 6, retro5_XmDrawSeparator },  /* hairlines  */
         { 0x086bf468, "\x55\x89\xe5\x83\xec\x2c", 6, retro5_XmDrawHighlight },  /* focus ring */
         { 0x08695018, "\x55\x89\xe5\x83\xec\x0c", 6, retro5_DrawToggle      },  /* radio+check indicator */
+        /* toolbar button up-scale: the XmLabel resize thunk (push $5; push w; call 0x086baea4).
+         * Patched at the FUNCTION entry, not the class slot, because the inherited slot is clobbered
+         * by Xt class-init. Guard pins the whole thunk incl. the worker call target. */
+        { 0x086bae18, "\x55\x89\xe5\x6a\x05\xff\x75\x08\xe8\x7f\x00\x00\x00", 13, retro5_DrawnButtonResize },
     };
     /* Widget class methods. class_rec + expected current expose fn (read live off the running
        binary's class records — see MOTIF-DRAW-TAKEOVER-PLAN.md). */
@@ -2319,24 +2335,9 @@ static void takeoverWP80(void) {
         }
     }
 
-    /* Bigger icon toolbar buttons: take over XmDrawnButton's `resize` (class 0x087cd050, slot +64)
-     * so its SetSize reserves UI-scaled space per icon. Guarded by the live resize fn value. No-op at
-     * scale 1.0, so stock-dpi displays are untouched. */
-    {
-        static const R5Method rz[] = {
-            { 0x087cd050, 0x086495bc, retro5_DrawnButtonResize,
-              (void **)&r5_orig_drawnbutton_resize, "XmDrawnButton.resize" },
-        };
-        unsigned i;
-        for (i = 0; i < sizeof rz / sizeof rz[0]; i++) {
-            int ok = patch_method(rz[i].class_rec, R5_RESIZE_OFF, rz[i].expect, rz[i].target, rz[i].saved);
-            if (r5_trace) {
-                char b[80]; int k = snprintf(b, sizeof b, "retro5: resize takeover %-20s %s\n",
-                                             rz[i].name, ok ? "ok" : "SKIPPED (guard mismatch)");
-                if (k > 0) write(2, b, (size_t)k);
-            }
-        }
-    }
+    /* (Toolbar button up-scaling is taken over as a FUNCTION-entry patch in `entries[]` above — the
+     * XmLabel resize thunk at 0x086bae18 — because the class-record resize slot is inherited and gets
+     * clobbered by Xt class-init, which silently defeated the old slot-swap takeover here.) */
 
     /* The cairo text layer — the ONLY expensive part of retro5. Everything here is gated behind
        RETRO5_TEXT so it can be switched off wholesale: with r5_text=0 we do NOT dlopen cairo, do
