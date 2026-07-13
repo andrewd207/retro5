@@ -2319,10 +2319,39 @@ void retro5_DrawnButtonResize(void *w) {
  * is byte-for-byte WP's own. Any failure (no cairo, bad glyph table) falls back to WP's bitmap blit. */
 static int r5_docfont;                                   /* RETRO5_DOCFONT: cairo-render the canvas */
 #define R5_DOC_TEXT_VA   0x085b54e0                       /* draw_text_run (8.0) */
-#define R5_DOC_GLYPHTAB  0x08808794                       /* -> current font's glyph table base */
+/* The current font's glyph table is the RETURN of this getter (draw_text_run itself calls it, then
+ * stores it at -0x98(ebp)); it is NOT a plain global deref — reading 0x08808794 gave nothing. */
+static unsigned (*r5_glyphtab_get)(void) = (unsigned (*)(void))0x085b9840;
 static void (*r5_doc_text_orig)(void *, int, int, int, int, int);  /* trampoline to the real body */
-static unsigned char r5_doc_chars[1024];                 /* filtered glyph-bearing chars, in order */
-static int r5_doc_nchars, r5_doc_idx, r5_doc_active;
+static int r5_doc_active;                                /* set only during our draw_text_run call */
+static double r5_doc_px;                                 /* RETRO5_DOCFONT_PX size override (0 = auto) */
+#define R5_PEN_X   0x87bdd5c                              /* device pen X (glyph origin), set per glyph */
+#define R5_PEN_Y   0x87bdd60                              /* device pen Y (baseline),     set per glyph */
+/* Reverse map: WP rasterises glyphs LAZILY (pixmap at glyphTable[c*12]->+0x18 is 0 until first draw),
+ * so pre-filtering the buffer by pixmap!=0 dropped not-yet-rendered chars and desynced the mapping.
+ * At BLIT time the pixmap IS populated and uniquely identifies the char, so recover the char from the
+ * XCopyPlane source pixmap by scanning the (now-live) glyph table. Cached by pixmap. */
+static struct { unsigned pm; unsigned char c; } r5_pmc[256];
+static int r5_pmc_n;
+static unsigned char r5_pixmap_to_char(unsigned pm) {
+    int i; unsigned tab;
+    if (!pm) return 0;
+    for (i = 0; i < r5_pmc_n; i++) if (r5_pmc[i].pm == pm) return r5_pmc[i].c;
+    tab = r5_glyphtab_get();
+    if (!tab || range_unmapped((void *)(uintptr_t)tab, 12)) return 0;
+    for (i = 1; i < 256; i++) {
+        unsigned entry = tab + (unsigned)i * 12, glyph, gpm = 0;
+        if (range_unmapped((void *)(uintptr_t)entry, 4)) continue;
+        glyph = *(unsigned *)(uintptr_t)entry;
+        if (glyph && !range_unmapped((void *)(uintptr_t)(glyph + 0x18), 4))
+            gpm = *(unsigned *)(uintptr_t)(glyph + 0x18);
+        if (gpm && gpm == pm) {
+            if (r5_pmc_n < 256) { r5_pmc[r5_pmc_n].pm = pm; r5_pmc[r5_pmc_n].c = (unsigned char)i; r5_pmc_n++; }
+            return (unsigned char)i;
+        }
+    }
+    return 0;
+}
 
 /* Build a callable trampoline for a jmp-patched function: copy `keep` prologue bytes (whole
  * instructions, >=5, position-independent) to fresh RWX memory + a jmp back to va+keep. */
@@ -2339,24 +2368,27 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
     return tr;
 }
 
-/* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP blits the
- * glyph pixmap (w x h) top-left at (dx,dy) on the canvas window `dst`; we approximate the baseline as
- * the ink-box bottom and size the font so the ink fills the box — good enough to read crisply; exact
- * bearings are the tuning knob. Uses the reskin UI serif for now (a system face); a future step keys
- * the face off the font record's .pfb (+0x10). */
-static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned h,
-                               int dx, int dy, unsigned char c) {
+/* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
+ * set the device pen for this glyph in the globals: origin x = [R5_PEN_X], baseline y = [R5_PEN_Y]
+ * (dst_x/dst_y in the blit are the ink box, offset by the glyph's bearings — using the pen origin +
+ * baseline is exact for cairo's show_text). Size is one run-consistent value (the per-glyph ink box
+ * height varies, so we do NOT size by it): RETRO5_DOCFONT_PX overrides; else a heuristic from the box
+ * height (a rough cap-height -> em). Uses the reskin UI face; a later step keys off the .pfb. */
+static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned h, unsigned char c) {
     cairo_surface_t *sf; cairo_t *cr; char s[2];
-    if (!cz.icons_ok || w < 1 || h < 1 || w > 400 || h > 400) return 0;
-    sf = cz.xlib_surface_create(dpy, dst, DefaultVisual(dpy, DefaultScreen(dpy)), (int)(dx + w), (int)(dy + h));
+    int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
+    double sz = r5_doc_px > 0 ? r5_doc_px : (double)h * 1.35;
+    if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
+    if (penx < 0 || peny < 0 || penx > 20000 || peny > 20000) return 0;   /* sanity */
+    sf = cz.xlib_surface_create(dpy, dst, DefaultVisual(dpy, DefaultScreen(dpy)), penx + 64, peny + 24);
     if (!sf || cz.surface_status(sf)) { if (sf) cz.surface_destroy(sf); return 0; }
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
     s[0] = (char)c; s[1] = 0;
     cz.select_font_face(cr, r5_family_for(0, 0), CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cz.set_font_size(cr, (double)h * 1.05);              /* box height ~ cap height of the run */
-    cz.set_source_rgb(cr, R5_RD(0x000000u), R5_GD(0x000000u), R5_BD(0x000000u));
-    cz.move_to(cr, (double)dx, (double)dy + (double)h);  /* baseline ~ ink-box bottom */
+    cz.set_font_size(cr, sz);
+    cz.set_source_rgb(cr, 0.0, 0.0, 0.0);
+    cz.move_to(cr, (double)penx, (double)peny);          /* pen origin x, baseline y */
     cz.show_text(cr, s);
     cz.surface_flush(sf);
     cz.destroy(cr);
@@ -2364,43 +2396,30 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned 
     return 1;
 }
 
-/* XCopyPlane — redirect-aware for the canvas. During a doc_text run we replace each 1-bit glyph blit
- * with a cairo glyph; otherwise a plain passthrough (WP uses XCopyPlane for many things). */
+/* XCopyPlane — redirect-aware for the canvas. During a doc_text run we recover the char from the
+ * source glyph pixmap and cairo-render it; otherwise a plain passthrough (WP uses XCopyPlane widely). */
 static int (*r5_real_CopyPlane_x)(Display *, Drawable, Drawable, GC, int, int, unsigned, unsigned, int, int, unsigned long);
 void retro5_XCopyPlane(Display *dpy, Drawable src, Drawable dst, GC gc,
                        int sx, int sy, unsigned w, unsigned h, int dx, int dy, unsigned long plane) {
-    if (r5_doc_active && r5_doc_idx < r5_doc_nchars) {
-        unsigned char c = r5_doc_chars[r5_doc_idx++];
-        if (r5_doc_render_glyph(dpy, dst, w, h, dx, dy, c)) return;   /* rendered via cairo */
+    if (r5_doc_active) {
+        unsigned char c = r5_pixmap_to_char((unsigned)src);       /* recover char from glyph pixmap */
+        if (c && r5_doc_render_glyph(dpy, dst, w, h, c)) return;   /* rendered via cairo */
     }
     if (!r5_real_CopyPlane_x) *(void **)&r5_real_CopyPlane_x = r5_realsym("XCopyPlane");
     if (r5_real_CopyPlane_x) r5_real_CopyPlane_x(dpy, src, dst, gc, sx, sy, w, h, dx, dy, plane);
 }
 
-/* draw_text_run takeover: pre-filter the buffer to glyph-bearing chars (same pixmap!=0 test WP uses),
- * then run WP's own body — its XCopyPlane calls now land in our cairo renderer, one per filtered char. */
+/* draw_text_run takeover: just flag the run and let WP's own body compute every glyph position/advance
+ * and issue the XCopyPlane blits; our hook turns each into a cairo glyph. No pre-filtering (the lazy
+ * rasterisation made that unreliable) — the char is recovered from the pixmap at blit time. */
 void retro5_doc_text(void *buf, int count, int px, int py, int flag, int mode) {
-    int i, n = 0;
-    unsigned tab;
-    if (!r5_docfont || !buf || count <= 0 || !r5_cairo() || !cz.icons_ok || !r5_doc_text_orig) goto plain;
-    tab = *(unsigned *)R5_DOC_GLYPHTAB;                  /* current font's glyph table base */
-    if (!tab || range_unmapped((void *)(uintptr_t)tab, 12)) goto plain;
-    for (i = 0; i < count && n < (int)sizeof r5_doc_chars; i++) {
-        unsigned char c = ((unsigned char *)buf)[i];
-        unsigned entry = tab + (unsigned)c * 12;         /* glyphTable[c*12] */
-        unsigned glyph, pm = 0;
-        if (range_unmapped((void *)(uintptr_t)entry, 4)) continue;
-        glyph = *(unsigned *)(uintptr_t)entry;
-        if (glyph && !range_unmapped((void *)(uintptr_t)(glyph + 0x18), 4))
-            pm = *(unsigned *)(uintptr_t)(glyph + 0x18);
-        if (pm) r5_doc_chars[n++] = c;                   /* WP will blit this one -> we render it */
+    if (!r5_docfont || !r5_cairo() || !cz.icons_ok || !r5_doc_text_orig) {
+        if (r5_doc_text_orig) r5_doc_text_orig(buf, count, px, py, flag, mode);
+        return;
     }
-    r5_doc_nchars = n; r5_doc_idx = 0; r5_doc_active = 1;
+    r5_doc_active = 1;
     r5_doc_text_orig(buf, count, px, py, flag, mode);
     r5_doc_active = 0;
-    return;
-plain:
-    if (r5_doc_text_orig) r5_doc_text_orig(buf, count, px, py, flag, mode);
 }
 
 /* True when a widget is insensitive (disabled). XtIsSensitive is the correct test — it folds in
@@ -2914,6 +2933,7 @@ static void findBinaryFixes(void) {
     if (getenv("RETRO5_ICON_DUMP")) r5_icon_dump = 1;    /* log each toolbar icon's content hash */
     r5_icons_cfg = getenv("RETRO5_ICONS");               /* hash->file replacement map (NULL = off) */
     if (getenv("RETRO5_DOCFONT")) r5_docfont = 1;        /* cairo-render the document canvas text */
+    { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
         write(2, p, strlen(p));
