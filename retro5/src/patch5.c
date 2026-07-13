@@ -2381,10 +2381,12 @@ static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
 #define R5_FONT_CTX    0x08808798               /* -> current font context; +0x04 hi16 = px size     */
 
 /* Constant device-pixel size for the whole run, from the font context ([0x08808798]->+0x04 high
- * word). Confirmed live: 12pt at the 100 resolution divisor -> 16 px, and it is one value per font
- * (so glyph size no longer wobbles with each glyph's ink-box height). RETRO5_DOCFONT_PX overrides;
- * the old ink-box heuristic remains only as a last resort if the context is unreadable. */
-static double r5_doc_pixsize(unsigned inkbox_h) {
+ * word). Confirmed live: 12pt at the 100 resolution divisor -> 16 px, one value per font (so glyph
+ * size no longer wobbles with each glyph's ink-box height). Returns 0 when there is NO reliable run
+ * size: draw_text_run also renders the status bar / chrome, where the context size reads 0 — for
+ * those we must NOT guess from the ink-box height (that is the size-wobble), so we return 0 and the
+ * caller falls back to WP's own crisp 1-bit blit. RETRO5_DOCFONT_PX overrides. */
+static double r5_doc_pixsize(void) {
     unsigned ctx, sz;
     if (r5_doc_px > 0) return r5_doc_px;
     if (!range_unmapped((void *)(uintptr_t)R5_FONT_CTX, 4)) {
@@ -2394,7 +2396,7 @@ static double r5_doc_pixsize(unsigned inkbox_h) {
             if (sz >= 4 && sz <= 400) return (double)sz;
         }
     }
-    return (double)inkbox_h * 1.35;
+    return 0.0;                                          /* no doc run size -> let WP draw it */
 }
 
 static const char *r5_face_to_family(const char *face, int *slant, int *weight) {
@@ -2456,17 +2458,44 @@ static const char *r5_doc_family(int *slant, int *weight) {
     return r5_doc_facecache.fam;
 }
 
+/* Extract one channel from an X pixel value given its visual mask (handles any TrueColor depth). */
+static double r5_chan(unsigned long px, unsigned long mask) {
+    unsigned long m = mask, v; int shift = 0, bits = 0;
+    if (!m) return 0.0;
+    while (!(m & 1)) { m >>= 1; shift++; }
+    while (m & 1)    { m >>= 1; bits++; }
+    v = (px & mask) >> shift;
+    return bits ? (double)v / (double)((1UL << bits) - 1) : 0.0;
+}
+/* WP carries the text COLOUR in the GC foreground used for the glyph blit (the 1-bit plane is drawn
+ * in that colour). Read it and map the pixel through the canvas visual so coloured text renders in
+ * its real colour instead of always black. Falls back to black if the GC value isn't cached. */
+static int (*r5_XGetGCValues)(Display *, GC, unsigned long, XGCValues *);
+static void r5_doc_text_color(Display *dpy, GC gc, double *r, double *g, double *b) {
+    XGCValues gv; Visual *v = DefaultVisual(dpy, DefaultScreen(dpy));
+    *r = *g = *b = 0.0;                                   /* default black */
+    if (!gc || !v) return;
+    if (!r5_XGetGCValues) *(void **)&r5_XGetGCValues = r5_realsym("XGetGCValues");
+    if (!r5_XGetGCValues || !r5_XGetGCValues(dpy, gc, GCForeground, &gv)) return;
+    if (!v->red_mask || !v->green_mask || !v->blue_mask) return;   /* non-TrueColor -> keep black */
+    *r = r5_chan(gv.foreground, v->red_mask);
+    *g = r5_chan(gv.foreground, v->green_mask);
+    *b = r5_chan(gv.foreground, v->blue_mask);
+}
+
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
  * set the device pen for this glyph in the globals: origin x = [R5_PEN_X], baseline y = [R5_PEN_Y]
  * (dst_x/dst_y in the blit are the ink box, offset by the glyph's bearings — using the pen origin +
  * baseline is exact for cairo's show_text). Size is one run-consistent value (the per-glyph ink box
  * height varies, so we do NOT size by it): RETRO5_DOCFONT_PX overrides; else a heuristic from the box
- * height (a rough cap-height -> em). Face is matched from the current font record's .pfb (+0x10). */
-static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned h, unsigned char c) {
-    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight;
+ * height (a rough cap-height -> em). Face is matched from the current font record's .pfb (+0x10);
+ * colour comes from the blit GC's foreground. */
+static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, unsigned h, unsigned char c) {
+    cairo_surface_t *sf; cairo_t *cr; char s[2]; int slant, weight; double cr_, cg, cb;
     const char *fam = r5_doc_family(&slant, &weight);
     int penx = *(int *)(uintptr_t)R5_PEN_X, peny = *(int *)(uintptr_t)R5_PEN_Y;
-    double sz = r5_doc_pixsize(h);
+    double sz = r5_doc_pixsize();
+    if (sz <= 0) return 0;                                /* not a sized doc run -> WP draws it */
     if (!cz.icons_ok || c < 32 || w < 1 || h < 1 || w > 400 || h > 400) return 0;
     if (penx < 0 || peny < 0 || penx > 20000 || peny > 20000) return 0;   /* sanity */
     sf = cz.xlib_surface_create(dpy, dst, DefaultVisual(dpy, DefaultScreen(dpy)), penx + 64, peny + 24);
@@ -2474,9 +2503,10 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, unsigned w, unsigned 
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
     s[0] = (char)c; s[1] = 0;
+    r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
     cz.select_font_face(cr, fam, slant, weight);
     cz.set_font_size(cr, sz);
-    cz.set_source_rgb(cr, 0.0, 0.0, 0.0);
+    cz.set_source_rgb(cr, cr_, cg, cb);
     cz.move_to(cr, (double)penx, (double)peny);          /* pen origin x, baseline y */
     cz.show_text(cr, s);
     cz.surface_flush(sf);
@@ -2492,7 +2522,7 @@ void retro5_XCopyPlane(Display *dpy, Drawable src, Drawable dst, GC gc,
                        int sx, int sy, unsigned w, unsigned h, int dx, int dy, unsigned long plane) {
     if (r5_doc_active) {
         unsigned char c = r5_pixmap_to_char((unsigned)src);       /* recover char from glyph pixmap */
-        if (c && r5_doc_render_glyph(dpy, dst, w, h, c)) return;   /* rendered via cairo */
+        if (c && r5_doc_render_glyph(dpy, dst, gc, w, h, c)) return; /* rendered via cairo */
     }
     if (!r5_real_CopyPlane_x) *(void **)&r5_real_CopyPlane_x = r5_realsym("XCopyPlane");
     if (r5_real_CopyPlane_x) r5_real_CopyPlane_x(dpy, src, dst, gc, sx, sy, w, h, dx, dy, plane);
