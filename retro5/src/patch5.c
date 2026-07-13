@@ -1732,25 +1732,19 @@ static const char *r5_icon_lookup(uint32_t h) {
 }
 
 /* FNV-1a over the icon's pixels (via XGetPixel, so row padding can't destabilise it) + dims/depth.
- * Same WP icon -> same hash, regardless of where or when it is drawn.
+ * Same icon content -> same hash, wherever/whenever drawn.
  *
- * CACHED by pixmap XID: XGetImage is a full synchronous server round-trip, and a button repaints on
- * every hover (Motif redraws the armed/raised highlight). Recomputing the hash per repaint made the
- * toolbar visibly flicker under hover. A button's icon content is stable, so we read it back once. */
-static struct { Pixmap pm; uint32_t hash; } r5_hash_cache[256];
-static int r5_hash_cache_n;
-static int r5_hash_fresh;                                 /* set by r5_pixmap_hash: 1 on cache miss */
-
+ * Recomputed on EVERY call — deliberately NOT cached by pixmap XID. The palette / dropdown buttons
+ * (e.g. the Justification "current selection" face) REUSE one pixmap XID and redraw different content
+ * into it as the selection changes, so an XID->hash cache goes stale and shows the previous icon.
+ * XGetImage on a ~20x18 pixmap is cheap, and since we took over Motif's border_highlight the button
+ * no longer repaints on hover, so re-reading per expose does not flicker. The expensive step (SVG/PNG
+ * render) stays cached by (hash,size) in r5_icon_cache, so only the small readback repeats. */
 static uint32_t r5_pixmap_hash(Display *dpy, Pixmap pm, unsigned pw, unsigned ph, unsigned pdep) {
     XImage *im;
     uint32_t h = 2166136261u;
     unsigned x, y;
-    int i;
-    r5_hash_fresh = 0;
     if (!r5x.GetImage) return 0;
-    for (i = 0; i < r5_hash_cache_n; i++)                 /* cache hit -> no readback */
-        if (r5_hash_cache[i].pm == pm) return r5_hash_cache[i].hash;
-    r5_hash_fresh = 1;
     im = r5x.GetImage(dpy, pm, 0, 0, pw, ph, AllPlanes, ZPixmap);
     if (!im) return 0;
 #define R5_FNV(b) do { h ^= (uint32_t)(unsigned char)(b); h *= 16777619u; } while (0)
@@ -1762,9 +1756,6 @@ static uint32_t r5_pixmap_hash(Display *dpy, Pixmap pm, unsigned pw, unsigned ph
         }
 #undef R5_FNV
     XDestroyImage(im);
-    i = (r5_hash_cache_n < 256) ? r5_hash_cache_n++ : (int)(pm % 256);  /* append, else evict-by-id */
-    r5_hash_cache[i].pm = pm;
-    r5_hash_cache[i].hash = h;
     return h;
 }
 
@@ -2057,7 +2048,7 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
         /* Emit a config-skeleton line the first time each distinct hash is seen: "<hash> - <hint>".
          * The '-' is the blank filename (nothing mapped yet); the hint is WP's button name. Redirect
          * these into a file and set RETRO5_ICONS to it, then replace '-' with an icon path per row. */
-        if (r5_icon_dump && hash && r5_hash_fresh && r5_dump_first_time(hash)) {
+        if (r5_icon_dump && hash && r5_dump_first_time(hash)) {   /* dedup by hash, not by pixmap */
             const char *hint = r5_widget_hint(w);
             const char *nm   = r5_widget_name(w);
             const char *lbl  = (hint && hint[0]) ? hint : (nm ? nm : "?");
