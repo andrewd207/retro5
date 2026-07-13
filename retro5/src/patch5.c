@@ -1725,6 +1725,48 @@ static Pixmap r5_icon_for(void *w, Pixmap original, uint32_t hash) {
     return 0;                                            /* rendering of the mapped file: next step */
 }
 
+/* ---- highlight takeover ----
+ * On EnterWindow/LeaveWindow Motif draws (then erases) its highlight border by calling the widget's
+ * border_highlight / border_unhighlight class methods DIRECTLY on the window — outside the expose we
+ * own. That is mixed drawing: Motif's border flashes against our fully-painted button, visible as
+ * flicker on mouse enter and leave. We replace those two methods with a no-op so the button we
+ * painted is never touched on hover; if a hover accent is ever wanted, it belongs in our expose.
+ *
+ * The two methods are the first slots of XmPrimitiveClassPart, which follows the 116-byte 32-bit
+ * CoreClassPart -> +116 and +120 (confirmed live: +124 holds the heap XtTranslations pointer).
+ *
+ * Patched LAZILY, from the paint path, NOT at load time: Xt resolves class-method inheritance when
+ * WP creates the first widget (after our constructor has run), which clobbers any load-time swap of
+ * an inherited slot — exactly what silently defeats the resize takeover. By the time expose runs,
+ * the class record is fully initialised, so reading the live slot as the guard makes the swap stick.
+ */
+#define R5_BORDER_HL_OFF   116
+#define R5_BORDER_UNHL_OFF 120
+static void retro5_NoHighlight(void *w) { (void)w; }     /* we own the whole button; Motif draws nothing */
+
+static void *(*r5_XtClass)(void *);
+static void  *r5_hl_done[16];
+static int    r5_hl_done_n;
+static void r5_take_highlight(void *w) {
+    void *cls, *saved; int i; uintptr_t hl, unhl;
+    if (!r5_XtClass) *(void **)&r5_XtClass = r5_realsym("XtClass");
+    if (!r5_XtClass || !w) return;
+    cls = r5_XtClass(w);
+    if (!cls || range_unmapped((char *)cls + R5_BORDER_UNHL_OFF, 4)) return;
+    for (i = 0; i < r5_hl_done_n; i++) if (r5_hl_done[i] == cls) return;  /* this class already done */
+    if (r5_hl_done_n < 16) r5_hl_done[r5_hl_done_n++] = cls;
+    hl   = *(uintptr_t *)((char *)cls + R5_BORDER_HL_OFF);
+    unhl = *(uintptr_t *)((char *)cls + R5_BORDER_UNHL_OFF);
+    if (hl   != (uintptr_t)retro5_NoHighlight)
+        patch_method((uintptr_t)cls, R5_BORDER_HL_OFF,   hl,   (void *)retro5_NoHighlight, &saved);
+    if (unhl != (uintptr_t)retro5_NoHighlight)
+        patch_method((uintptr_t)cls, R5_BORDER_UNHL_OFF, unhl, (void *)retro5_NoHighlight, &saved);
+    if (r5_trace) {
+        char b[96]; int k = snprintf(b, sizeof b, "retro5: highlight takeover class %p (no-op)\n", cls);
+        if (k > 0) write(2, b, (size_t)k);
+    }
+}
+
 /* Paint a Label-derived button end to end: face, border, icon. Nothing of Motif's drawing survives
  * — we do not call the original — so the appearance is entirely ours, including the icon blit.
  *
@@ -1749,6 +1791,7 @@ static int retro5_paint_button(void *w, int flat_at_rest) {
     dpy = r5x.XtDisplayOfObject(w);
     win = r5x.XtWindowOfObject(w);
     if (!dpy || !win) return 0;
+    r5_take_highlight(w);                                 /* stop Motif's enter/leave border flicker */
 
     args[0].name = (char *)"labelPixmap"; args[0].value = (long)&pm;
     args[1].name = (char *)"background";  args[1].value = (long)&bg;
@@ -2075,6 +2118,7 @@ void retro5_ToggleButtonExpose(void *w, XEvent *ev, Region region) {
     dpy = r5x.XtDisplayOfObject(w);
     win = r5x.XtWindowOfObject(w);
     if (!dpy || !win) return;                            /* no window yet: nothing to paint, no fallback */
+    r5_take_highlight(w);                                /* stop Motif's enter/leave border flicker */
     if (!r5x.GetGeometry(dpy, win, &root, &wx, &wy, &ww, &hh, &bwid, &dep)) goto fallback;
 
     a[0].name = (char *)"set";                a[0].value = (long)&set;
