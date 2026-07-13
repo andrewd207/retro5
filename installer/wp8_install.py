@@ -1339,10 +1339,13 @@ export RETRO5_WPEXC_ID=$$
 #                  2 = also cairo-render the UI chrome (status bar + Font preview).
 # RETRO5_ALLFONTS: 1 = unfilter the font selector + merge system (fontconfig) fonts (WIP).
 # RETRO5_CUPS    : 1 = route printing through CUPS (printertocups.so) instead of xwpdest (WIP).
+# RETRO5_EWMH    : 1 = stamp _NET_WM hints (PID, client-machine, window-type) on WP's Motif
+#                  toplevels so modern window managers handle them properly (8.0; 8.1 no-op WIP).
 : "${{RETRO5_DOCFONT:=2}}";  export RETRO5_DOCFONT
 : "${{RETRO5_ALLFONTS:=0}}"; export RETRO5_ALLFONTS
 : "${{RETRO5_CUPS:=0}}";     export RETRO5_CUPS
-echo "retroXt: DOCFONT=$RETRO5_DOCFONT ALLFONTS=$RETRO5_ALLFONTS CUPS=$RETRO5_CUPS ICONS=${{RETRO5_ICONS:+on}}" >&2
+: "${{RETRO5_EWMH:=1}}";     export RETRO5_EWMH
+echo "retroXt: DOCFONT=$RETRO5_DOCFONT ALLFONTS=$RETRO5_ALLFONTS CUPS=$RETRO5_CUPS EWMH=$RETRO5_EWMH ICONS=${{RETRO5_ICONS:+on}}" >&2
 # Stale-state cleanup: WP's /tmp/wpc-<user>-<host> dir accumulates dead-instance
 # lock/manifest/FIFO files. Remove _WP__<pid>a_ client locks whose pid is gone,
 # and print-server manifests whose server pid (manifest byte 0x140) is dead
