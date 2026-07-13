@@ -274,12 +274,33 @@ void abort(void) {
 }
 /* exit: glibc's exit runs _IO_cleanup (flush all glibc streams), which
  * segfaults given our interposed/libc5-layout FILEs. Run the registered
- * atexit/__cxa_atexit handlers ourselves, then _exit — skipping the crash. */
+ * atexit/__cxa_atexit handlers ourselves, then _exit — skipping the crash.
+ *
+ * But __cxa_finalize itself can still fault: libstdc++'s iostream `Init`
+ * destructor (dragged in transitively by cairo's text path -> harfbuzz) flushes
+ * std::cout, which is the copy-relocated *libc5* _IO_stdout_, using the DEEPBIND
+ * libstdc++'s *glibc* fflush -> it walks a glibc vtable that isn't there and
+ * segfaults. That Init object is constructed at C++ startup (earliest), so its
+ * destructor runs LAST in __cxa_finalize, after WP's own atexit handlers. So we
+ * guard the finalize with a SIGSEGV catch: WP's cleanup runs, and if the trailing
+ * libstdc++ flush faults we siglongjmp out and _exit cleanly instead of dying. */
 extern void __cxa_finalize(void *);
 extern void _exit(int);
+/* If the trailing libstdc++ flush faults, just _exit from the handler — we are
+ * already terminating, WP's own handlers ran first, and _exit is a direct
+ * syscall (async-signal-safe). No setjmp: retro5 exports a libc5 siglongjmp but
+ * imports glibc's __sigsetjmp, so that pair is mismatched and unreliable. */
+static volatile int r5_exit_code;
+static void r5_exit_segv(int sig) { (void)sig; _exit(r5_exit_code); }
 void exit(int code) {
     static int busy = 0;
-    if (!busy) { busy = 1; __cxa_finalize(0); }
+    if (!busy) {
+        busy = 1;
+        r5_exit_code = code;
+        sighandler_t prev = signal(11 /*SEGV*/, r5_exit_segv);
+        __cxa_finalize(0);               /* faults in the tail -> handler _exit()s */
+        signal(11 /*SEGV*/, prev);       /* no fault: restore the crash logger */
+    }
     _exit(code);
 }
 /* atexit is NOT dynamically exported by modern glibc (it's in
