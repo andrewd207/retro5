@@ -3449,7 +3449,21 @@ static void r5_install_injection(void) {
  * (0x20 clear) — every freed pointer is an independent malloc block, so WP frees our entries cleanly.
  * Gated on RETRO5_ALLFONTS && RETRO5_FONTCOLL (FONTCOLL defaults to ALLFONTS). */
 extern void free(void *);
+extern void qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 static void *(*r5_collbuild_orig)(void *, void *, unsigned, void *);
+
+/* Alphabetise the picker: order two 16-byte FaceEntries by their faceRec name (the string at
+ * entry+0x4), case-insensitively. Sorting the whole 16-byte record moves each entry's styles
+ * pointer (entry+0xc -> StyleVar.fontcode) with it, so name<->fontcode<->record stays intact and
+ * selection still resolves. A NULL/empty name sorts last so a bad entry never derails the compare. */
+static int r5_faceentry_cmp(const void *a, const void *b) {
+    const char *na = *(const char *const *)((const char *)a + 4);
+    const char *nb = *(const char *const *)((const char *)b + 4);
+    if (na == nb) return 0;
+    if (!na) return 1;
+    if (!nb) return -1;
+    return strcasecmp(na, nb);
+}
 
 static void r5_inject_collection(void *coll) {
     uint32_t *arr; unsigned reccnt, count, ntotal, added, i;
@@ -3496,8 +3510,16 @@ static void r5_inject_collection(void *coll) {
         added++;
     }
     *(uint32_t *)coll = count + added;                       /* publish new count */
+    /* Alphabetise the WHOLE list (WP's base faces + our appended ones) by faceRec name, so the
+     * picker reads A..Z merged instead of base-then-injected. Sorting the 16-byte FaceEntry records
+     * keeps each entry's styles/fontcode with its name, so selection still resolves; the list-model
+     * C and the display array are (re)built from these entries AFTER this hook, so they inherit the
+     * order. faceRec holds the real name (the leading 'Q' in the cell is a chrome artifact, not in
+     * the string), so this is a true alphabetical sort. */
+    if (count + added > 1)
+        qsort(entries, (size_t)(count + added), 16, r5_faceentry_cmp);
     if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
-        "retro5: collection +%u face(s), COLL count now %u (was %u)\n", added, count + added, count);
+        "retro5: collection +%u face(s), COLL count now %u (was %u), sorted\n", added, count + added, count);
         if (k > 0) write(2, b, (size_t)k); }
 }
 
