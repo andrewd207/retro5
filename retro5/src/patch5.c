@@ -35,7 +35,7 @@
  * ======================================================================================= */
 
 /* is any page of [p, p+n) unmapped? (cheap, fault-free — safe on any host binary) */
-static int range_unmapped(const void *p, size_t n) {
+int range_unmapped(const void *p, size_t n) {   /* non-static: shared with takeover81.c (r5core.h) */
     if (!n) return 0;
     long pg = sysconf(_SC_PAGESIZE); if (pg <= 0) pg = 4096;
     uintptr_t a = (uintptr_t)p, start = a & ~(uintptr_t)(pg - 1);
@@ -84,7 +84,7 @@ static void patch_call(uintptr_t va, const void *guard5, void *target) {
  * Verified safe for the Motif draw primitives: all are cdecl (plain `ret`, caller cleans), so even a
  * mis-declared arg count cannot imbalance the stack. `guard`/`glen` may cover more than the 5 bytes
  * we overwrite (we match the sub-esp imm too), which pins the exact build. */
-static void patch_entry(uintptr_t va, const void *guard, unsigned glen, void *target) {
+void patch_entry(uintptr_t va, const void *guard, unsigned glen, void *target) {   /* non-static: takeover81.c */
     if (range_unmapped((void *)va, glen)) return;
     if (memcmp((void *)va, guard, glen) != 0) return;     /* wrong build / already patched */
     uint8_t buf[6];
@@ -218,6 +218,13 @@ void retro5_guarded_XtVaGetValues(void *w, ...) {
  */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>   /* Region (the third arg of every Xt expose method) */
+#include <X11/Intrinsic.h>   /* Widget / ArgList / Cardinal / WidgetList — for the shared R5Syms table */
+
+/* Shared data contracts (R5Entry/R5Import/R5Method/R5Syms/R5P2CPrinter + the wheel handler protos).
+ * takeover81.c includes the same header, so both TUs agree on r5s's layout byte-for-byte and the
+ * one `r5s` instance (defined non-static below) is safe to share.  This replaces the formerly inline
+ * copies of these typedefs further down in this file. */
+#include "r5syms.h"
 
 /* shadow_type (arg 10 of _XmDrawShadows). These are Motif's real XmShadowType values, confirmed by
  * tracing the live binary — the toolbar sends 8 at rest and 7 when latched. (Beware: they are NOT
@@ -265,7 +272,8 @@ static int r5_text = 1;             /* cairo text layer: RETRO5_TEXT=
                                      *                constructors, but no fontconfig init and no hooks.
                                      *   "warm"    -> DIAGNOSTIC: load + FcInit (font scan), still NO hooks.
                                      *                load vs warm vs full isolates libs / fontconfig / hooks. */
-static int r5_trace;                /* RETRO5_TRACE=1 -> log every draw call + its widget */
+int r5_trace;                       /* RETRO5_TRACE=1 -> log every draw call + its widget (shared, r5core.h) */
+static int r5_wheel = 1;            /* RETRO5_WHEEL=0 -> disable mouse-wheel scrolling (default ON) */
 
 /* True once the text layer is fully wired at library init (cairo loaded, all reals resolved, hooks
  * installed). Set before WP runs, so every hooked call from WP finds a pure, linker-free hook. */
@@ -407,7 +415,7 @@ static void *r5_caller_widget(void) {
 }
 
 /* Class name of a widget recovered above, or NULL. Validated to be a plausible C string. */
-static const char *r5_widget_class(void *w) {
+const char *r5_widget_class(void *w) {   /* non-static: shared with takeover81.c */
     void *cls;
     const char *name;
     int i;
@@ -1541,29 +1549,8 @@ static void r5_resolve_reals(void) {
 
 /* ---- the two reusable takeover tables ----
  * A per-binary takeoverXxx() is nothing but these two tables plus (for static hosts) an R5XSyms.
- * Everything they point at is shared, binary-independent code. */
-typedef struct {
-    uintptr_t   va;           /* function entry to replace          */
-    const char *guard;        /* bytes that must be there (the build fingerprint) */
-    unsigned    glen;
-    void       *target;       /* our replacement                    */
-} R5Entry;
-
-typedef struct {
-    uintptr_t   plt;          /* the host's PLT stub for this import */
-    uintptr_t   got;          /* its GOT slot (proved by the stub)   */
-    void       *target;       /* our replacement                     */
-    const char *name;         /* for RETRO5_DEBUG                    */
-} R5Import;
-
-typedef struct {
-    uintptr_t   class_rec;    /* widget class record                */
-    uintptr_t   expect;       /* expose fn currently in the slot    */
-    void       *target;       /* our replacement                    */
-    void      **saved;        /* where to stash the original        */
-    const char *name;         /* for RETRO5_DEBUG                   */
-} R5Method;
-
+ * Everything they point at is shared, binary-independent code.
+ * (R5Entry / R5Import / R5Method are now defined in r5syms.h, included at the top of this file.) */
 static void takeover_entries(const R5Entry *t, unsigned n) {
     unsigned i;
     for (i = 0; i < n; i++)
@@ -2435,36 +2422,10 @@ static int r5_fontcoll;                                  /* RETRO5_FONTCOLL: app
  * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
  * function and the selector patch read r5s.<field>. 8.1 differs from 8.0 in relocated globals and in
  * STATIC-linked Xlib (XCopyPlane is a static fn with no GOT), hence both a GOT-interpose path (8.0)
- * and a call-site path (8.1). See installer/wp81port/FONT-RENDERING-MAP.md §14. */
-typedef struct {
-    uintptr_t doc_text_va;        /* draw_text_run entry (8.0: entry-patch + trampoline)          */
-    uintptr_t blit_site;          /* glyph-blit XCopyPlane call site (8.1 call-site patch); 0 on 8.0 */
-    unsigned char blit_call[5];   /* guard bytes at blit_site (8.1)                                */
-    uintptr_t xcp_plt, xcp_got;   /* XCopyPlane PLT/GOT for GOT interpose (8.0); 0 on 8.1          */
-    uintptr_t xcp_fn;             /* real static XCopyPlane (8.1); 0 => resolve dynamically (8.0)  */
-    uintptr_t pen_x, pen_y;       /* device pen X (glyph origin) / Y (baseline)                    */
-    uintptr_t metric_ptr;         /* -> current metric struct; +0x00 = face-name char*            */
-    uintptr_t font_ctx;           /* -> current font context; +0x04 hi16 = device px size          */
-    uintptr_t fontrec_arr, fontrec_cnt;                  /* font-record ptr array + live count u16 */
-    uintptr_t fontrec_snap;       /* base-count SNAPSHOT u16 — what the F9 list builder iterates    */
-    unsigned (*glyphtab_get)(void);                      /* returns the current glyph table         */
-    uintptr_t sel_filter_jne;     /* the "record+0x1e != 0" list filter jne to NOP (all-fonts)     */
-    unsigned char sel_filter_bytes[2];                   /* guard: expected `75 XX`                 */
-    /* system-font injection: grow the record table + remap and append records */
-    uintptr_t fontrec_cap;        /* record-array capacity u16                                     */
-    uintptr_t remap_arr, remap_cap;  /* remap[0xfff-code]->index ptr + capacity u16               */
-    uintptr_t freecode;           /* next-free 12-bit fontcode counter u16 (inits 0xfff, counts down) */
-    uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
-    uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
-    uintptr_t fontcoll_build_va;  /* printer-font COLLECTION builder (detour: append system faces)  */
-    /* printer subsystem takeover (RETRO5_CUPS) — see FONT-RENDERING-MAP §15/§19. Addresses only;
-       the array-injection detour is wired once §19 confirms the flat/rich array fill relationship. */
-    uintptr_t printer_scan_va;    /* printer-list scan-core: int(void *ctx, int category) cdecl     */
-    uintptr_t printer_rich_arr, printer_rich_cnt;  /* rich entry buffer calloc(cnt,0x9c) + count u16 */
-    uintptr_t printer_flat_arr, printer_flat_cnt;  /* flat display-name char** + count u16 (dialog)  */
-    uintptr_t cur_printer_name;   /* current-printer record name (+0x4c): the selected queue        */
-} R5Syms;
-static R5Syms r5s;
+ * and a call-site path (8.1). See installer/wp81port/FONT-RENDERING-MAP.md §14.
+ * The R5Syms shape now lives in r5syms.h (shared with takeover81.c); `r5s` is the one instance and is
+ * NON-static so the 8.1 wheel module can reach it. */
+R5Syms r5s;
 
 /* --- printertocups bridge (RETRO5_CUPS) ---------------------------------------------------------
  * retro5 deep-loads printertocups.so (RTLD_DEEPBIND, like cairo/librsvg) so libcups' modern glibc/
@@ -2474,7 +2435,7 @@ static R5Syms r5s;
  * we p2c_init (starts the worker) and p2c_prefetch (warms the destination cache in the background),
  * so the Select-Printer dialog is instant. */
 static int r5_cups;                               /* RETRO5_CUPS: back WP's printer subsystem with CUPS */
-typedef struct { char name[128]; char info[128]; int is_default; } R5P2CPrinter;  /* == P2CPrinter */
+/* R5P2CPrinter (== P2CPrinter) is defined in r5syms.h, included above. */
 static struct {
     int   ready;
     void *h;
@@ -2670,7 +2631,7 @@ static unsigned char r5_pixmap_to_char(unsigned pm) {
 
 /* Build a callable trampoline for a jmp-patched function: copy `keep` prologue bytes (whole
  * instructions, >=5, position-independent) to fresh RWX memory + a jmp back to va+keep. */
-static void *r5_make_trampoline(uintptr_t va, unsigned keep) {
+void *r5_make_trampoline(uintptr_t va, unsigned keep) {   /* non-static: takeover81.c */
     long pg = sysconf(_SC_PAGESIZE); if (pg <= 0) pg = 4096;
     unsigned char *tr = (unsigned char *)mmap(0, (size_t)pg, PROT_READ | PROT_WRITE | PROT_EXEC,
                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -3667,6 +3628,53 @@ static void r5_apply_allfonts(void) {
 /* WordPerfect 8.0.0076, dynamic-X build ("build B"). .text base 0x08048000. */
 static void takeoverWP80(void);          /* appearance table for this build, below */
 
+/* ---- 8.0 mouse-wheel install (RETRO5_WHEEL, default ON) --------------------------------------
+ * SAME shared handlers as 8.1 (t81_XtDispatchEvent/AddGrab/RemoveGrab/ManageChild/ManageChildren),
+ * but installed by GOT interpose over 8.0's DYNAMIC Xt imports instead of static detours.  8.0 leaves
+ * the *_va detour targets at 0; it fills the r5s.Xt* the shared wheel logic calls and the r5s.real_*
+ * the handlers chain to (both from libXt via r5_realsym), then repoints the 5 GOT slots at our hooks.
+ * GOT/PLT pairs were read live from wpbin/xwp's PLT stubs (jmp *GOT). */
+static void takeoverWP80_wheel(void) {
+    if (!r5_wheel) return;
+    t81_wheel_config();                                  /* RETRO5_WHEEL_LINES / RETROXT_WHEEL_LINES */
+
+    r5s.xt_dispatch_va = r5s.xt_addgrab_va = r5s.xt_removegrab_va = 0;   /* no detours on 8.0 */
+    r5s.xt_managechild_va = r5s.xt_managechildren_va = 0;
+
+    /* Xt calls the shared wheel logic makes — real libXt via r5_realsym (never our own exports). */
+    r5s.XtWindowToWidget = (Widget (*)(Display *, Window))          r5_realsym("XtWindowToWidget");
+    r5s.XtParent         = (Widget (*)(Widget))                    r5_realsym("XtParent");
+    r5s.XtName           = (char  *(*)(Widget))                    r5_realsym("XtName");
+    r5s.XtWindow         = (Window (*)(Widget))                    r5_realsym("XtWindow");
+    r5s.XtHasCallbacks   = (int    (*)(Widget, char *))            r5_realsym("XtHasCallbacks");
+    r5s.XtCallCallbacks  = (void   (*)(Widget, char *, XtPointer)) r5_realsym("XtCallCallbacks");
+    r5s.XtVaSetValues    = (void   (*)(Widget, ...))               r5_realsym("XtVaSetValues");
+    r5s.XtGetValues      = (void   (*)(Widget, ArgList, Cardinal)) r5_realsym("XtGetValues");
+    r5s.XtAppNextEvent   = (void   (*)(XtAppContext, XEvent *))    r5_realsym("XtAppNextEvent");
+
+    /* Originals the shared handlers chain to (8.0: the real dynamic Xt entrypoints). */
+    r5s.real_dispatch       = (Boolean (*)(XEvent *))             r5_realsym("XtDispatchEvent");
+    r5s.real_addgrab        = (void (*)(Widget, Boolean, Boolean))r5_realsym("XtAddGrab");
+    r5s.real_removegrab     = (void (*)(Widget))                  r5_realsym("XtRemoveGrab");
+    r5s.real_managechild    = (void (*)(Widget))                  r5_realsym("XtManageChild");
+    r5s.real_managechildren = (void (*)(WidgetList, Cardinal))    r5_realsym("XtManageChildren");
+
+    /* GOT interpose the dynamic imports -> the shared handlers (PLT/GOT read from wpbin/xwp).
+     * XtAppMainLoop is interposed too: it is WP's primary event loop and its internal XtDispatchEvent
+     * is libXt-private, so without replacing the loop the doc window would never see the wheel. */
+    { int ok = 0;
+      ok += patch_import(0x0804ff00, 0x087d8584, (void *)t81_XtDispatchEvent);   /* XtDispatchEvent  */
+      ok += patch_import(0x08050bc0, 0x087d88b4, (void *)t81_XtAddGrab);         /* XtAddGrab        */
+      ok += patch_import(0x0804ff10, 0x087d8588, (void *)t81_XtRemoveGrab);      /* XtRemoveGrab     */
+      ok += patch_import(0x08050380, 0x087d86a4, (void *)t81_XtManageChild);     /* XtManageChild    */
+      ok += patch_import(0x0804fa40, 0x087d8454, (void *)t81_XtManageChildren);  /* XtManageChildren */
+      ok += patch_import(0x0804f5d0, 0x087d8338, (void *)t81_XtAppMainLoop);     /* XtAppMainLoop    */
+      if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
+          "retro5: 8.0 wheel install %d/6 GOT interposes\n", ok);
+          if (k > 0) write(2, b, (size_t)k); }
+    }
+}
+
 static void applyWp8_0_dynX_Fixes(void) {
     /* Per-build symbol table for this (8.0 dynamic-X) binary — see FONT-RENDERING-MAP §14. */
     r5s.doc_text_va = 0x085b54e0;
@@ -3698,6 +3706,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     patch_call(0x080f2a52, "\xe8\xe9\xc9\xf5\xff", retro5_guarded_XtVaGetValues);
 
     if (r5_skin) takeoverWP80();
+    takeoverWP80_wheel();                                /* mouse-wheel scrolling (shared handlers) */
     r5_apply_allfonts();
     r5_install_injection();
     r5_install_collection_injection();
@@ -3906,6 +3915,7 @@ static void applyWp8_1_Fixes(void) {
     r5s.cur_printer_name = 0x08832b88;
     /* 8.1 doc-font port (static-X). Motif appearance reskin not yet ported. */
     takeoverWP81();
+    if (r5_wheel) takeoverWP81_full();                  /* mouse-wheel scrolling (shared handlers, static detours) */
     r5_apply_allfonts();
     r5_install_injection();
     r5_install_resolver_hook();
@@ -3969,6 +3979,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
+    { const char *e = getenv("RETRO5_WHEEL");      if (e && e[0] == '0') r5_wheel = 0; }             /* mouse-wheel scrolling (default ON) */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
     if (getenv("RETRO5_DEBUG")) {
         const char *p = b ? "retro5: applying fixes for " : "retro5: no fixes (unrecognised binary)\n";
