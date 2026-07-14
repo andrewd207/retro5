@@ -860,6 +860,7 @@ static struct {
     void *(*ft_font_face_create)(void *ftface, int load_flags);   /* cairo_ft_font_face_create_for_ft_face */
     void  (*set_font_face)(cairo_t *, void *face);                 /* cairo_set_font_face */
     void  (*font_face_destroy)(void *face);                       /* cairo_font_face_destroy */
+    void  (*show_glyphs)(cairo_t *, const cairo_glyph_t *, int);  /* cairo_show_glyphs (draw by GID) */
 } cz;
 
 /* Non-blocking check used by the draw/measure hot path: is cairo ready to use? We NEVER dlopen from
@@ -910,6 +911,7 @@ static int r5_cairo_load(void) {
     CZ3(ft_font_face_create, "cairo_ft_font_face_create_for_ft_face");
     CZ3(set_font_face,       "cairo_set_font_face");
     CZ3(font_face_destroy,   "cairo_font_face_destroy");
+    CZ3(show_glyphs,         "cairo_show_glyphs");
 #undef CZ3
     cz.ftface_ok = (cz.ft_font_face_create && cz.set_font_face && cz.font_face_destroy);
     cz.ready = 1;
@@ -2875,12 +2877,16 @@ static int r5_utf8(unsigned cp, char *o) {                       /* encode cp ->
  * cairo-FT bypasses name-matching entirely: deterministic, cache-independent. FreeType lives in the
  * process already (cairo depends on it); we resolve its 3 syms via dlopen(NOLOAD). The (FT_Face,
  * cairo_font_face) pair is cached per (path,index) so we load each face once, not per glyph. */
+/* FT_Encoding tags (FT_ENC_TAG). We resolve FreeType opaquely (no headers), so spell the constants out. */
+#define R5_FT_ENC_ADOBE_CUSTOM   0x41444243u   /* 'A','D','B','C' -> the font's own /Encoding array */
 static struct {
     int ready;                                          /* 0 unknown, 1 ok, -1 failed */
     void *lib;                                          /* FT_Library */
     int (*Init_FreeType)(void **);
     int (*New_Face)(void *lib, const char *path, long idx, void **face);
     int (*Done_Face)(void *face);
+    int (*Select_Charmap)(void *face, unsigned enc);    /* FT_Select_Charmap -> 0 on success */
+    unsigned (*Get_Char_Index)(void *face, unsigned long code);  /* FT_Get_Char_Index -> GID (0=none) */
 } ftz;
 static int r5_ft_init(void) {
     void *h;
@@ -2889,9 +2895,11 @@ static int r5_ft_init(void) {
     if (!(h = dlopen("libfreetype.so.6", RTLD_NOLOAD | RTLD_NOW)))
         h = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_DEEPBIND);
     if (!h) return 0;
-    *(void **)&ftz.Init_FreeType = dlsym(h, "FT_Init_FreeType");
-    *(void **)&ftz.New_Face      = dlsym(h, "FT_New_Face");
-    *(void **)&ftz.Done_Face     = dlsym(h, "FT_Done_Face");
+    *(void **)&ftz.Init_FreeType   = dlsym(h, "FT_Init_FreeType");
+    *(void **)&ftz.New_Face        = dlsym(h, "FT_New_Face");
+    *(void **)&ftz.Done_Face       = dlsym(h, "FT_Done_Face");
+    *(void **)&ftz.Select_Charmap  = dlsym(h, "FT_Select_Charmap");
+    *(void **)&ftz.Get_Char_Index  = dlsym(h, "FT_Get_Char_Index");
     if (!ftz.Init_FreeType || !ftz.New_Face || !ftz.Done_Face) return 0;
     if (ftz.Init_FreeType(&ftz.lib) != 0 || !ftz.lib) return 0;
     ftz.ready = 1;
@@ -2899,24 +2907,42 @@ static int r5_ft_init(void) {
 }
 /* (FT_Face, cairo_font_face) cache keyed by (path,index). Bounded; on overflow we stop caching new
  * faces (existing bound ones keep working) rather than churn. Never freed — WP runs one process. */
-static struct { char path[256]; int idx; void *ftface; void *cface; } r5_facecache[128];
+/* `custom` marks a face whose built-in /Encoding is ADOBE_CUSTOM (WP's symbol/Greek/Cyrillic/Hebrew/
+ * Arabic/math/dingbat pfb). For those, WP's raw byte is the pfb Encoding CODE — we render by glyph
+ * index (FT_Get_Char_Index on the CUSTOM charmap + cairo_show_glyphs), which is script-independent, so
+ * NO cp1252/Unicode step. Latin faces (ADOBE_STANDARD builtin) and injected TTFs are custom=0 and stay
+ * on the cp1252->Unicode->show_text path (WP's Latin byte is cp1252, NOT the pfb StandardEncoding). */
+static struct { char path[256]; int idx; void *ftface; void *cface; int custom; } r5_facecache[128];
 static int r5_facecache_n;
-static void *r5_ftface_for(const char *path, int idx) {   /* -> cairo_font_face_t*, or NULL */
-    int i; void *ft = 0, *cf;
+static void *r5_ftface_for(const char *path, int idx, void **ftface_out, int *custom_out) { /* -> cairo_font_face_t*, or NULL */
+    int i; void *ft = 0, *cf; int custom;
+    if (ftface_out) *ftface_out = 0;
+    if (custom_out) *custom_out = 0;
     if (!path || !path[0] || !cz.ftface_ok) return 0;
     for (i = 0; i < r5_facecache_n; i++)
-        if (r5_facecache[i].idx == idx && !strcmp(r5_facecache[i].path, path))
+        if (r5_facecache[i].idx == idx && !strcmp(r5_facecache[i].path, path)) {
+            if (ftface_out) *ftface_out = r5_facecache[i].ftface;
+            if (custom_out) *custom_out = r5_facecache[i].custom;
             return r5_facecache[i].cface;
+        }
     if (!r5_ft_init()) return 0;
     if (ftz.New_Face(ftz.lib, path, (long)idx, &ft) != 0 || !ft) return 0;
+    /* Detect + arm the CUSTOM path: if the font carries an ADOBE_CUSTOM builtin, select it now so
+     * FT_Get_Char_Index maps WP's byte via the pfb /Encoding. On failure FT leaves the default (unicode)
+     * charmap untouched, which is what cairo's show_text wants for the Latin faces. */
+    custom = (ftz.Select_Charmap && ftz.Get_Char_Index
+              && ftz.Select_Charmap(ft, R5_FT_ENC_ADOBE_CUSTOM) == 0);
     cf = cz.ft_font_face_create(ft, 0);                 /* load_flags 0: use the face as-is */
     if (!cf) { ftz.Done_Face(ft); return 0; }
+    if (ftface_out) *ftface_out = ft;
+    if (custom_out) *custom_out = custom;
     if (r5_facecache_n < (int)(sizeof r5_facecache / sizeof r5_facecache[0])) {
         strncpy(r5_facecache[r5_facecache_n].path, path, sizeof r5_facecache[0].path - 1);
         r5_facecache[r5_facecache_n].path[sizeof r5_facecache[0].path - 1] = 0;
         r5_facecache[r5_facecache_n].idx = idx;
         r5_facecache[r5_facecache_n].ftface = ft;
         r5_facecache[r5_facecache_n].cface = cf;
+        r5_facecache[r5_facecache_n].custom = custom;
         r5_facecache_n++;
     }
     return cf;
@@ -2934,16 +2960,34 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     const char *fam = r5_doc_family(&slant, &weight, &symbolic);
     int penx = *(int *)r5s.pen_x, peny = *(int *)r5s.pen_y;
     double sz = r5_doc_pixsize();
+    void *cface, *ftface = 0; int custom = 0; unsigned gid = 0;
     unsigned cp;
     if (!r5_wp2uni_ready) r5_wp2uni_init();
     cp = r5_wp2uni[c];                                    /* WP byte -> Unicode (cp1252 for Latin faces) */
+    /* Bind the EXACT face the resolver stored for this run: an injected system .ttf (Phase A, r5_ftface)
+     * or a WP-stock Type1 .pfb (Phase B, r5_pfbface) — both via the same (path->FT_Face->cairo_font_face)
+     * cache. r5_cur_path is set ONLY when the relevant flag is on, so non-empty => bind. `custom` is set
+     * when the face's builtin /Encoding is ADOBE_CUSTOM (WP's symbol/non-Latin pfb). */
+    cface = r5_cur_path[0] ? r5_ftface_for(r5_cur_path, r5_cur_idx, &ftface, &custom) : 0;
+    /* CUSTOM path: WP's RAW byte is the pfb /Encoding code -> glyph index directly (no cp1252/Unicode),
+     * so Greek/Cyrillic/Hebrew/Arabic/Symbol/dingbat/math all render even though r5_doc_family flags
+     * them 'symbolic'. gid 0 = this code has no glyph in the font -> fall through to WP's native blit. */
+    if (cface && custom && cz.show_glyphs && ftface) {
+        ftz.Select_Charmap(ftface, R5_FT_ENC_ADOBE_CUSTOM);  /* re-arm: cairo may touch the shared charmap */
+        gid = ftz.Get_Char_Index(ftface, (unsigned long)c);
+    }
     if (r5_trace && c >= 0x80) {                          /* codepage probe: which byte is a high char? */
-        char m[160]; int k = snprintf(m, sizeof m, "retro5: docglyph byte=0x%02x -> U+%04X fam=%s%s\n",
-            c, cp, fam ? fam : "?", symbolic ? " [sym]" : "");
+        char m[192]; int k;
+        if (custom) k = snprintf(m, sizeof m, "retro5: docglyph byte=0x%02x -> gid %u [CUSTOM] fam=%s\n",
+                                 c, gid, fam ? fam : "?");
+        else        k = snprintf(m, sizeof m, "retro5: docglyph byte=0x%02x -> U+%04X fam=%s%s\n",
+                                 c, cp, fam ? fam : "?", symbolic ? " [sym]" : "");
         if (k > 0) write(2, m, (size_t)k);
     }
-    if (symbolic) return 0;                               /* symbol/pi/non-Latin -> WP's native glyph */
-    if (!cp) return 0;                                    /* no Unicode mapping -> WP's native glyph */
+    if (!(custom && gid)) {                               /* not the CUSTOM glyph path -> Latin/Unicode rules */
+        if (symbolic) return 0;                           /* symbol/pi/non-Latin, no CUSTOM glyph -> WP native */
+        if (!cp) return 0;                                /* no Unicode mapping -> WP's native glyph */
+    }
     if (sz <= 0) {
         /* No font-context run size => UI chrome drawn by the same engine (status bar, F9 preview).
          * RETRO5_DOCFONT=2 renders those with cairo too; use ONE size per run (locked from the first
@@ -2959,20 +3003,19 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     if (!sf || cz.surface_status(sf)) { if (sf) cz.surface_destroy(sf); return 0; }
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
-    s[r5_utf8(cp, s)] = 0;                               /* Unicode -> UTF-8 (cairo's show_text wants it) */
     r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
-    /* Bind the EXACT face when the resolver stored a real font file for this run: an injected system
-     * .ttf (Phase A, r5_ftface) or a WP-stock Type1 .pfb (Phase B, r5_pfbface) — both go through the
-     * same (path->FT_Face->cairo_font_face) cache. r5_cur_path is set ONLY when the relevant flag is on,
-     * so a non-empty path always means "bind it". Fall back to fontconfig name matching (bitmap stock
-     * faces with no .pfb, or if the FT load fails). */
-    { void *cface = r5_cur_path[0] ? r5_ftface_for(r5_cur_path, r5_cur_idx) : 0;
-      if (cface) cz.set_font_face(cr, cface);
-      else       cz.select_font_face(cr, fam, slant, weight); }
+    if (cface) cz.set_font_face(cr, cface);              /* exact bound face (.ttf / .pfb) */
+    else       cz.select_font_face(cr, fam, slant, weight);  /* fallback: fontconfig name match */
     cz.set_font_size(cr, sz);
     cz.set_source_rgb(cr, cr_, cg, cb);
-    cz.move_to(cr, (double)penx, (double)peny);          /* pen origin x, baseline y */
-    cz.show_text(cr, s);
+    if (custom && gid) {                                 /* draw by glyph index at the pen (script-independent) */
+        cairo_glyph_t g; g.index = gid; g.x = (double)penx; g.y = (double)peny;
+        cz.show_glyphs(cr, &g, 1);
+    } else {                                             /* draw by cp1252->Unicode text (Latin faces) */
+        s[r5_utf8(cp, s)] = 0;                           /* Unicode -> UTF-8 (cairo's show_text wants it) */
+        cz.move_to(cr, (double)penx, (double)peny);      /* pen origin x, baseline y */
+        cz.show_text(cr, s);
+    }
     cz.surface_flush(sf);
     cz.destroy(cr);
     cz.surface_destroy(sf);
@@ -3910,13 +3953,12 @@ static int r5_resolve_font_file(const char *p, char *out, size_t osz) {
 }
 /* Phase B: for a WP-stock face, bind its genuine Type1 .pfb (record+0x08) via the SAME cairo-FT cache
  * as the injected .ttf path. Only the glyph FACE is affected — WP keeps positioning the pen, and because
- * we now render the exact .pfb WP measured, cairo's outline agrees with WP's metrics for free. Skips
- * symbol/pi/non-Latin faces (they pass through to WP's native blit) and bitmap faces (no .pfb). */
+ * we now render the exact .pfb WP measured, cairo's outline agrees with WP's metrics for free. Binds ALL
+ * WP-stock .pfb, symbol/non-Latin included: the render path decides HOW to draw from the pfb's builtin
+ * charmap (ADOBE_CUSTOM -> glyph-index path, else cp1252). Bitmap faces (no .pfb) fall through to native. */
 static void r5_resolve_stock_pfb(const char *nm, uintptr_t rec) {
-    int s, w, sym; const char *pfb; char full[1024]; size_t L;
+    const char *pfb; char full[1024]; size_t L;
     if (!r5_pfbface || !rec || range_unmapped((void *)(rec + 0x08), 4)) return;
-    r5_face_to_family(nm, &s, &w, &sym);
-    if (sym) return;                                      /* symbol/pi/non-Latin -> WP native glyph */
     pfb = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(rec + 0x08));   /* WpFontRecord.pfb_path */
     if (!pfb || range_unmapped((void *)pfb, 1)) return;
     L = strlen(pfb);
