@@ -3927,6 +3927,11 @@ static void takeoverWP80_wheel(void) {
     r5s.XtGetValues      = (void   (*)(Widget, ArgList, Cardinal)) r5_realsym("XtGetValues");
     r5s.XtAppNextEvent   = (void   (*)(XtAppContext, XEvent *))    r5_realsym("XtAppNextEvent");
 
+    /* Scrollbar left-drag pointer grab (RETRO5_SBGRAB): the real libX11 grab pair. */
+    r5s.XGrabPointer   = (int (*)(Display *, Window, Bool, unsigned int, int, int, Window, Cursor, Time))
+                             r5_realsym("XGrabPointer");
+    r5s.XUngrabPointer = (int (*)(Display *, Time)) r5_realsym("XUngrabPointer");
+
     /* Originals the shared handlers chain to (8.0: the real dynamic Xt entrypoints). */
     r5s.real_dispatch       = (Boolean (*)(XEvent *))             r5_realsym("XtDispatchEvent");
     r5s.real_addgrab        = (void (*)(Widget, Boolean, Boolean))r5_realsym("XtAddGrab");

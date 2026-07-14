@@ -50,6 +50,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <X11/Intrinsic.h>   /* Widget / XEvent / Boolean / Cardinal / WidgetList / Dimension … */
+#include <X11/Xlib.h>        /* XGrabPointer/XUngrabPointer masks, GrabModeAsync, None, GrabSuccess */
 
 #include "r5syms.h"          /* R5Syms + the shared instance r5s (holds the wheel/Xt fields) */
 #include "r5core.h"          /* range_unmapped, patch_entry, r5_make_trampoline, r5_trace */
@@ -121,6 +122,16 @@ static Widget    t81_tallsb;            /* fallback: tallest vertical scrollbar 
 static Dimension t81_tallh;
 static int       t81_menu_depth;        /* >0 while a Motif (XmMenuShell) menu is posted    */
 static int       t81_wheel_lines = 3;   /* text lines per wheel notch (RETROXT/RETRO5_WHEEL_LINES) */
+
+/* ---- scrollbar left-drag pointer grab (RETRO5_SBGRAB, default ON) --------------------------------
+ * Motif's XmScrollBar does NOT take an explicit pointer grab on Btn1Down — its Select action only
+ * XtGrabKeyboard + XAllowEvents(AsyncPointer), relying on X's implicit passive grab for the drag.
+ * Something in the retro5/WP stack defeats that implicit grab once the pointer leaves the window, so a
+ * thumb drag stops scrolling off-window.  We add an EXPLICIT XGrabPointer on a Btn1 press that lands on
+ * the SLIDER rect (arrows/trough are left exactly as-is) and release it on Btn1 up. */
+static int       t81_sbgrab = 1;        /* RETRO5_SBGRAB=0 -> disable the scrollbar drag grab       */
+static int       t81_sb_grabbed;        /* 1 while we hold the extra pointer grab for a thumb drag   */
+static Display  *t81_sb_dpy;            /* display the grab was taken on (for a defensive ungrab)    */
 
 /* class name of a widget OR gadget, via the shared fault-safe helper (NULL-safe). */
 static const char *t81_class(Widget w)
@@ -255,6 +266,40 @@ static int t81_do_wheel(Widget sb, int dir /* -1 up, +1 down */, XEvent *ev)
     return 1;
 }
 
+/* ---- scrollbar left-drag grab helpers -------------------------------------------------------- *
+ * The XmScrollBar whose OWN window received this button event.  We require the event window to be the
+ * scrollbar itself (not a child/gadget) so ev->xbutton.x/y are in the scrollbar's coordinate space —
+ * exactly what the slider hit-test needs.  (t81_wheel_target walks UP to find a scrollbar to *drive*;
+ * here we must not, or the press coords would not line up with that scrollbar's slider rect.) */
+static Widget t81_scrollbar_for_window(Display *dpy, Window win)
+{
+    Widget w;
+    if (!r5s.XtWindowToWidget) return 0;
+    w = r5s.XtWindowToWidget(dpy, win);
+    if (!w) return 0;
+    return strcmp(t81_class(w), "XmScrollBar") == 0 ? w : 0;
+}
+
+/* True iff (ex,ey) — a button press in the scrollbar's own coords — is inside the SLIDER (thumb) rect,
+ * the SAME test Motif's Select() uses to set sliding_on (Xm/ScrollBar.c):
+ *     x >= slider_x && x <= slider_x+slider_width-1 && y >= slider_y && y <= slider_y+slider_height-1
+ * slider_{x,y,width,height} are `short` in XmScrollBarPart; their byte offsets in the 32-bit instance
+ * record are byte-verified from the Motif 1.2.4 headers (offsetof against Xm/ScrollBarP.h, -m32):
+ *     slider_x=288 slider_y=290 slider_width=292 slider_height=294.
+ * A bogus/zero rect (wrong build layout) fails the size guard and we simply do NOT grab — arrows and
+ * trough then keep their current behavior, i.e. the feature fails safe. */
+static int t81_press_on_slider(Widget sb, int ex, int ey)
+{
+    const volatile short *r;
+    int sx, sy, sw, sh;
+    if (!sb) return 0;
+    if (range_unmapped((const void *)((const char *)sb + 288), 8)) return 0;
+    r  = (const volatile short *)((const char *)sb + 288);
+    sx = r[0]; sy = r[1]; sw = r[2]; sh = r[3];
+    if (sw <= 0 || sh <= 0) return 0;                    /* rect looks bogus -> leave arrows/trough */
+    return ex >= sx && ex <= sx + sw - 1 && ey >= sy && ey <= sy + sh - 1;
+}
+
 /* ============================================================================================ *
  *  Detour hooks (installed over xwp's static prologues by takeoverWP81_full)
  * ============================================================================================ */
@@ -276,6 +321,44 @@ Boolean t81_XtDispatchEvent(XEvent *ev)
                 return 1;                              /* swallow press AND release */
             }
             /* nothing to scroll -> let WP have the event */
+        }
+        /* LEFT-button scrollbar THUMB drag: take an explicit pointer grab so the drag keeps scrolling
+         * no matter where the pointer goes while Btn1 is held, and release it on Btn1 up.  We grab with
+         * owner_events=FALSE so EVERY pointer-motion event is delivered to the scrollbar (the grab
+         * window), relative to it — exactly like a native slider drag.  owner_events=TRUE was wrong:
+         * it re-routes motion that lands on another window OF THIS APP (e.g. the document text area) to
+         * THAT window, so Motif's Moved action stops firing the instant the pointer leaves the
+         * scrollbar but is still inside the app (off-window happened to work only because no app window
+         * is under the pointer there).  With FALSE, Motif's own Select/Moved/Release still fire because
+         * they run on the scrollbar, which now receives every drag event.  We do NOT swallow the button
+         * (real_dispatch still runs Motif's actions).  We never grab while a Motif menu holds
+         * its modal grab (t81_menu_depth>0): combo drop-list scrollbars post NO XmMenuShell grab so
+         * they still grab fine; a true in-menu scrollbar just forgoes the off-window extension rather
+         * than risk fighting the menu's server grab.  The gate is the SLIDER rect only, so arrow and
+         * trough presses are completely untouched. */
+        if (t81_sbgrab && b == Button1) {
+            if (ev->type == ButtonPress) {
+                if (!t81_sb_grabbed && t81_menu_depth == 0 && r5s.XGrabPointer && r5s.XtWindow) {
+                    Widget sb = t81_scrollbar_for_window(ev->xbutton.display, ev->xbutton.window);
+                    if (sb && t81_press_on_slider(sb, ev->xbutton.x, ev->xbutton.y)) {
+                        Window w = r5s.XtWindow(sb);
+                        if (w && r5s.XGrabPointer(ev->xbutton.display, w, False,
+                                    ButtonReleaseMask | Button1MotionMask | PointerMotionMask,
+                                    GrabModeAsync, GrabModeAsync, None, None,
+                                    ev->xbutton.time) == GrabSuccess) {
+                            t81_sb_grabbed = 1;
+                            t81_sb_dpy     = ev->xbutton.display;
+                            t81_log("sbgrab: thumb pressed -> pointer grabbed");
+                        }
+                    }
+                }
+            } else if (t81_sb_grabbed) {              /* ButtonRelease of Button1 -> always ungrab */
+                if (r5s.XUngrabPointer)
+                    r5s.XUngrabPointer(ev->xbutton.display, ev->xbutton.time);
+                t81_sb_grabbed = 0;
+                t81_sb_dpy     = 0;
+                t81_log("sbgrab: released -> pointer ungrabbed");
+            }
         }
     }
     return r5s.real_dispatch ? r5s.real_dispatch(ev) : 0;
@@ -368,6 +451,9 @@ void t81_wheel_config(void)
     const char *wl = getenv("RETRO5_WHEEL_LINES");
     if (!wl || !*wl) wl = getenv("RETROXT_WHEEL_LINES");
     if (wl && *wl) { int n = atoi(wl); if (n > 0 && n < 100) t81_wheel_lines = n; }
+    /* Scrollbar left-drag pointer grab: default ON, RETRO5_SBGRAB=0 disables it.  Read here so it
+     * applies to BOTH installs (8.0 patch5.c and 8.1 takeoverWP81_full both call t81_wheel_config). */
+    { const char *sg = getenv("RETRO5_SBGRAB"); if (sg && sg[0] == '0') t81_sbgrab = 0; }
 }
 
 void takeoverWP81_full(void)
@@ -397,6 +483,10 @@ void takeoverWP81_full(void)
     /* The wheel READS scrollbar values through the non-varargs XtGetValues (the varargs XtVaGetValues
      * form is not symbolized in xwp's static build).  0x08659f70 is xwp's static XtGetValues. */
     r5s.XtGetValues      = (void   (*)(Widget, ArgList, Cardinal))   0x08659f70;
+    /* Scrollbar drag grab: xwp's STATIC XGrabPointer/XUngrabPointer (installer/wp81port/wp81_names.s;
+     * cross-checked against wp81_fullsyms.s .org 0x2dc90 / 0x3a2a0 over BASE 0x0864d9d0). */
+    r5s.XGrabPointer     = (int (*)(Display *, Window, Bool, unsigned int, int, int, Window, Cursor, Time)) 0x0867b660;
+    r5s.XUngrabPointer   = (int (*)(Display *, Time))                0x08687c70;
 
     /* ---- install the detours over xwp's static prologues (shared trampoline + entry writer) ----
      * The trampoline (original prologue + jmp back) is captured straight into r5s.real_*, which is

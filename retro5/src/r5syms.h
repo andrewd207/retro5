@@ -118,6 +118,14 @@ typedef struct {
     void    (*real_managechild)(Widget);
     void    (*real_managechildren)(WidgetList, Cardinal);
 
+    /* ---- scrollbar left-drag pointer grab (RETRO5_SBGRAB, default ON) --------------------------
+     * When the LEFT button presses the scrollbar SLIDER (thumb), we take an explicit XGrabPointer so
+     * the drag keeps scrolling after the pointer leaves the window (WP's stack defeats X's implicit
+     * passive grab off-window).  Released on Btn1 up.  Arrows/trough are NOT grabbed (hit-test gates
+     * on the slider rect only).  Per-build fill: 8.1 = xwp static VAs; 8.0 = r5_realsym'd libX11. */
+    int  (*XGrabPointer)(Display *, Window, Bool, unsigned int, int, int, Window, Cursor, Time);
+    int  (*XUngrabPointer)(Display *, Time);
+
     /* ---- §17.1 REAL FIX: base-space NAME->code resolver (8.0; 0 on 8.1) -------------------------
      * FUN_085b7a20 converts a stored font NAME to a 12-bit display code by bsearch()ing the display
      * record table (fontrec_arr / fontrec_snap) — which is sorted by name. retro5 appends injected
