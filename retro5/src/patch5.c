@@ -2423,6 +2423,13 @@ void retro5_DrawnButtonResize(void *w) {
 static int r5_docfont;                                   /* RETRO5_DOCFONT: cairo-render the canvas */
 static int r5_docfont81;                                 /* RETRO5_DOCFONT81: EXPERIMENTAL 8.1 canvas */
 static int r5_allfonts;                                  /* RETRO5_ALLFONTS: unfilter the font selector */
+static int r5_fontcoll;                                  /* RETRO5_FONTCOLL: append system faces to the
+                                                          * printer-font COLLECTION that every font picker
+                                                          * (F9 + toolbar combos) enumerates from. This is
+                                                          * what makes injected fonts actually LIST + select.
+                                                          * Defaults to ALLFONTS (set 0 to opt out). See
+                                                          * r5_install_collection_injection — LIVE-VERIFIED
+                                                          * working + teardown-safe (2026-07-13). */
 
 /* Per-build symbol/address table. Filled once at load time by the detected build's takeover
  * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
@@ -2449,6 +2456,7 @@ typedef struct {
     uintptr_t freecode;           /* next-free 12-bit fontcode counter u16 (inits 0xfff, counts down) */
     uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
     uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
+    uintptr_t fontcoll_build_va;  /* printer-font COLLECTION builder (detour: append system faces)  */
     /* printer subsystem takeover (RETRO5_CUPS) — see FONT-RENDERING-MAP §15/§19. Addresses only;
        the array-injection detour is wired once §19 confirms the flat/rich array fill relationship. */
     uintptr_t printer_scan_va;    /* printer-list scan-core: int(void *ctx, int category) cdecl     */
@@ -3384,6 +3392,133 @@ static void r5_install_injection(void) {
         patch_entry(r5s.builder_va, (const char *)g, sizeof g, (void *)retro5_font_builder);
 }
 
+/* ---- printer-font COLLECTION injection (the printer-driven picker source) --------------------
+ * WP has TWO ways a font picker (F9 Font-Face + the toolbar font combos) gets its list, depending on
+ * the active printer:
+ *   (a) NO real printer / fallback (the common Linux case, RETRO5_CUPS=0): the pickers enumerate the
+ *       merged font-record table 0x08808754 directly, filtered by record+0x1e. The record-table
+ *       injection above (RETRO5_ALLFONTS) already grows that table AND r5_apply_allfonts NOPs the
+ *       filter, so system families LIST + select + render with NO help from this function. (Verified
+ *       live: with RETRO5_FONTCOLL=0, both F9 and the toolbar combo still list DejaVu/Liberation/etc.)
+ *   (b) A real printer with a .prs selected (§13.7): the picker instead reads the per-dialog printer
+ *       "collection" (COLL) built by fontcoll_build 0x0852acd0 from that printer's fonts — which does
+ *       NOT contain our injected records. There the record-table injection is invisible and this
+ *       COLL-append is what makes injected families appear.
+ * So this detour is the (b) half of "list in EVERY picker regardless of printer": it appends a
+ * FaceEntry to COLL for each system record we injected, each carrying a StyleVar whose packed fontcode
+ * (code<<16) remaps 1:1 back to our injected record — so selecting it reaches the resolver with a code
+ * that resolves to the right family (no substitution), and RETRO5_DOCFONT renders it via cairo. On the
+ * (a) config it is redundant but harmless (the pickers read the record table, not COLL, so it adds no
+ * duplicates — verified: FONTCOLL=0 and FONTCOLL=1 produce identical lists).
+ *
+ * Structures (LIVE-VERIFIED, names.txt / fontcoll_fill 0x0852af70 disassembly):
+ *   COLL      { u32 count@+0; FaceEntry *entries@+4 }          (calloc(1,8), per-dialog)
+ *   FaceEntry { u32 flags@+0 (live 0x87); void *faceRec@+4; u16 nstyles@+8; StyleVar *styles@+0xc }
+ *   StyleVar  { u32 fontcode@+0 (code<<16); void *styleRec@+4; u32 0@+8; u32 0@+0xc }
+ * faceRec and styleRec are NOT structs — fontcoll_fill mallocs each as a bare NUL-terminated name
+ * string (faceRec = strcpy(family), styleRec = strcpy("Regular")). So there are NO other faceRec
+ * fields to template: a strdup of the name is a complete, valid faceRec. flags is copied verbatim
+ * from a real entry so any flag bits the enumerator/display read (0x87) are present.
+ *
+ * All work is bounds/mincore-guarded; a bad append degrades to "fewer fonts listed", never a fault.
+ * Only appends the records r5_inject_fonts already added (so the codes are guaranteed live in the
+ * record table).
+ *
+ * LIVE-VERIFIED 2026-07-13 (Xvfb :157, xwp 8.0, ALLFONTS=1 FONTCOLL=1 CUPS=0 DOCFONT=2, gdb): the
+ * COLL-driven populate DOES work when it is the source — injected system families (Liberation
+ * Sans/Serif/Mono, Helvetica, P052, Standard Symbols PS, STIX*, ...) list, are selectable, apply
+ * without crash, and render via cairo in the picked family (no substitution).
+ *
+ * How the COLL populate works (corrects an earlier mis-diagnosis that claimed a parallel list-model C
+ * stays at 62): when a COLL-sourced picker builds its list, f9_dialog_ctor's list-builder
+ * 0x08522080(COLL) reads COLL->count (uint16) LIVE at populate time (`cmpw (%ecx)` / `movzwl (%ecx)`),
+ * calloc's an array of that many display strings — one WP rich string per FaceEntry, name taken from
+ * faceRec — and hands the widget items+itemCount = COLL->count. Because our detour has already grown
+ * COLL by the time the ctor calls 0x08522080 (build is at 0x08520a3a, the builder call at 0x08520bf8),
+ * the widget receives every appended item; timing is NOT a problem (the earlier note's worry that the
+ * detour "runs too early" is moot — the builder re-reads COLL, it does not cache a count). The
+ * list-model C at *(model[1]+0x140) that the earlier note fixated on is the SEARCH/SELECTION model,
+ * walked by 0x086634e4 with the per-row +0xa byte marking the SELECTED row — NOT the list-populate
+ * source; it also grows in step with COLL.
+ *
+ * Teardown is SAFE — verified across 23+ open/close/apply cycles with zero glibc free errors. On close,
+ * fontcoll_destroy 0x0852b7d0 walks COLL->count and, per FaceEntry, frees: each StyleVar's styleRec
+ * (style+4), the styles array (entry+0xc), and faceRec (entry+4); it frees style+0xc's deep pointer
+ * ONLY iff (flags & 0x20). Our appended entries give it exactly that shape — faceRec = strdup(name),
+ * styles = calloc(1,16) (one StyleVar), styleRec = strdup("Regular"), nstyles = 1, flags templated 0x87
+ * (0x20 clear) — every freed pointer is an independent malloc block, so WP frees our entries cleanly.
+ * Gated on RETRO5_ALLFONTS && RETRO5_FONTCOLL (FONTCOLL defaults to ALLFONTS). */
+extern void free(void *);
+static void *(*r5_collbuild_orig)(void *, void *, unsigned, void *);
+
+static void r5_inject_collection(void *coll) {
+    uint32_t *arr; unsigned reccnt, count, ntotal, added, i;
+    void **pentries; void *entries, *ne; unsigned char *fe; uint32_t flags0;
+    if (!r5_allfonts || !r5_fontcoll || !coll || range_unmapped(coll, 8)) return;
+    if (r5_inj_base <= 0) return;                            /* record-table injection never ran */
+    if (!r5s.fontrec_arr || !r5s.fontrec_cnt
+        || range_unmapped((void *)r5s.fontrec_arr, 4) || range_unmapped((void *)r5s.fontrec_cnt, 2))
+        return;
+    arr    = *(uint32_t **)r5s.fontrec_arr;
+    reccnt = *(unsigned short *)r5s.fontrec_cnt;
+    if (!arr || range_unmapped(arr, 4) || reccnt <= (unsigned)r5_inj_base || reccnt > 8000) return;
+    ntotal = reccnt - (unsigned)r5_inj_base;                 /* # injected system records to mirror */
+
+    count    = *(uint32_t *)coll;                            /* COLL.count  */
+    pentries = (void **)((char *)coll + 4);                  /* &COLL.entries */
+    entries  = *pentries;
+    if (count < 1 || count > 100000 || !entries || range_unmapped(entries, 16)) return;
+    flags0 = *(uint32_t *)entries;                           /* template the flags dword from entry[0] */
+
+    ne = realloc(entries, (size_t)(count + ntotal) * 16);
+    if (!ne) return;
+    entries = ne; *pentries = ne;
+    fe = (unsigned char *)entries + (size_t)count * 16;
+    added = 0;
+    for (i = 0; i < ntotal; i++) {
+        unsigned char *rec = (unsigned char *)(uintptr_t)arr[(unsigned)r5_inj_base + i];
+        unsigned short code; const char *name; char *faceRec, *styleRec, *styles;
+        if (!rec || range_unmapped(rec, 0x20)) continue;
+        code = *(unsigned short *)(rec + 0x06);              /* this record's own fontcode */
+        name = (const char *)(uintptr_t)(*(uint32_t *)(rec + 0x10));  /* +0x10 = system family name */
+        if (!name || range_unmapped(name, 1) || !name[0]) continue;
+        faceRec = strdup(name);                              /* faceRec IS the family name string */
+        styleRec = strdup("Regular");
+        styles  = (char *)calloc(1, 16);                     /* one StyleVar */
+        if (!faceRec || !styleRec || !styles) { free(faceRec); free(styleRec); free(styles); continue; }
+        *(uint32_t *)(styles + 0) = (uint32_t)code << 16;    /* packed fontcode -> remaps to our record */
+        *(void   **)(styles + 4)  = styleRec;
+        *(uint32_t *)(fe + 0)     = flags0;                  /* flags (templated) */
+        *(void   **)(fe + 4)      = faceRec;
+        *(uint32_t *)(fe + 8)     = 1;                       /* nstyles = 1 */
+        *(void   **)(fe + 0xc)    = styles;
+        fe += 16;
+        added++;
+    }
+    *(uint32_t *)coll = count + added;                       /* publish new count */
+    if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
+        "retro5: collection +%u face(s), COLL count now %u (was %u)\n", added, count + added, count);
+        if (k > 0) write(2, b, (size_t)k); }
+}
+
+/* Detour: run the real builder (trampoline, keep=9 for the 55 89 e5 81 ec 10 01 00 00 prologue),
+ * take the COLL it returns in eax, and append our faces. Args are forwarded intact (cdecl). */
+static void *retro5_fontcoll_build(void *a1, void *a2, unsigned a3, void *a4) {
+    void *coll = r5_collbuild_orig ? r5_collbuild_orig(a1, a2, a3, a4) : 0;
+    r5_inject_collection(coll);
+    return coll;
+}
+static void r5_install_collection_injection(void) {
+    static const unsigned char g[] = {0x55,0x89,0xe5,0x81,0xec,0x10,0x01,0x00,0x00};
+    if (!r5_allfonts || !r5_fontcoll || !r5s.fontcoll_build_va) return;
+    if (range_unmapped((void *)r5s.fontcoll_build_va, sizeof g)
+        || memcmp((void *)r5s.fontcoll_build_va, g, sizeof g)) return;
+    r5_collbuild_orig = (void *(*)(void *, void *, unsigned, void *))
+                        r5_make_trampoline(r5s.fontcoll_build_va, 9);
+    if (r5_collbuild_orig)
+        patch_entry(r5s.fontcoll_build_va, (const char *)g, sizeof g, (void *)retro5_fontcoll_build);
+}
+
 /* ---- injected-font rendering (Phase 3) -------------------------------------------------------
  * Injected records all share WP's fallback (wphv) metric, so they can't be told apart at blit time
  * by metric name. Instead, hook the font RESOLVER (called with the packed fontcode on every font
@@ -3459,6 +3594,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.sel_filter_jne = 0x085b7c98; r5s.sel_filter_bytes[0]=0x75; r5s.sel_filter_bytes[1]=0x4f;
     r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
     r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500; r5s.resolver_va = 0x085b7860;
+    r5s.fontcoll_build_va = 0x0852acd0;                  /* printer-font collection builder (pickers) */
     /* printer subsystem (RETRO5_CUPS) — FONT-RENDERING-MAP §15/§19 */
     r5s.printer_scan_va  = 0x0852cb40;
     r5s.printer_rich_arr = 0x08803140; r5s.printer_rich_cnt = 0x08803144;
@@ -3479,6 +3615,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     if (r5_skin) takeoverWP80();
     r5_apply_allfonts();
     r5_install_injection();
+    r5_install_collection_injection();
     r5_install_resolver_hook();
     /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
      * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
@@ -3744,6 +3881,7 @@ static void findBinaryFixes(void) {
       if (d && *d) { int v = atoi(d); r5_docfont = v <= 0 ? 0 : (v >= 2 ? 2 : 1); } }
     { const char *e = getenv("RETRO5_DOCFONT81"); if (e && *e && e[0] != '0') r5_docfont81 = 1; }  /* EXPERIMENTAL 8.1 canvas */
     { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
+    { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *p = getenv("RETRO5_DOCFONT_PX"); if (p && *p) r5_doc_px = atof(p); }  /* size tuning */
