@@ -64,6 +64,7 @@ static void write_code(uintptr_t va, const uint8_t *bytes, unsigned len) {
 }
 
 /* byte-guarded raw replace: only touch a site whose current bytes match `guard` (len bytes) */
+__attribute__((unused))
 static void patch_bytes(uintptr_t va, const void *guard, const void *repl, unsigned len) {
     if (range_unmapped((void *)va, len)) return;
     if (memcmp((void *)va, guard, len) != 0) return;      /* already patched / wrong build */
@@ -2449,6 +2450,14 @@ static int r5_pfbface = 1;              /* RETRO5_PFBFACE: bind WP's OWN stock T
  * r5_cur_path/r5_cur_idx (once per font switch, not per glyph); r5_doc_render_glyph binds that exact face. */
 static char r5_cur_path[1024];          /* current run's injected face .ttf path, or "" (stock/WP) */
 static int  r5_cur_idx;                 /* current run's face index within the .ttf collection */
+static int  r5_cur_injected;            /* 1 iff r5_cur_path is an INJECTED system .ttf (Phase A), NOT a
+                                         * WP-stock .pfb (Phase B). Only injected TTFs get the FT metric
+                                         * override — WP's own .pfb metrics are already authentic. */
+static int r5_ftmetrics = 1;            /* RETRO5_FTMETRICS (§17.2 Phase B): hook the reformat width array
+                                         * (reformat_char_append 0x083fa990) so WP lays out injected TTFs on
+                                         * the REAL face's advances, not the placeholder Type1's. Default ON
+                                         * (proven on Go Mono; matches RETRO5_FTFACE default ON — real face +
+                                         * real metrics must travel together or spacing mismatches). */
 
 /* Per-build symbol/address table. Filled once at load time by the detected build's takeover
  * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
@@ -2946,6 +2955,140 @@ static void *r5_ftface_for(const char *path, int idx, void **ftface_out, int *cu
         r5_facecache_n++;
     }
     return cf;
+}
+
+/* ---- §17.2 Phase B: FreeType METRIC override (fix injected-TTF SPACING; display==print) ------------
+ * PROBLEM: injected system TTFs now RENDER as their real face (Phase A), but WP still LAYS OUT on the
+ * placeholder Type1's advances, so the real glyphs overlap/drift (worst on MONOSPACE faces). FIX: give
+ * WP the real face's advance at the ONE place document layout consumes it — the REFORMAT width array.
+ *
+ * MECHANISM (8.0, RE ghidra_hl/ghidra_proj80 program xwp80, MD5 89781a). Body text is NOT laid out from
+ * any per-glyph device metric (glyphrec[0] @font_metric_loader 0x085b9ea0, the +0x5a0 provider, and
+ * font_percharadvance_rd 0x080e4fa0 were all DISPROVEN — they feed draw_text_run's param_5==NULL FALLBACK
+ * or a caret/preview redraw, never the page loop). It is laid out from a precomputed per-char width
+ * array in WP DESIGN UNITS (1/1200 inch, point-size baked in) at &DAT_087fe9b8, indexed by the u16
+ * counter DAT_087a21d6. The REFORMAT engine builds it one char at a time in FUN_083fa990 (0x083fa990):
+ *   width source -> FUN_0836e680 (sums FUN_08387e20 -> FUN_0837e2d0, the .prs/.pfm per-char metric) or
+ *   FUN_0841eab0 (kerned); result stored at (&DAT_087fe9b8)[DAT_087a21d6]; then DAT_087a21d6++ .
+ * That array is threaded to the draw path VERBATIM: the reformat calls the render-context vtable slot
+ * [0x1e]=line_render_dispatch 0x0811f620(count, &DAT_08812e3c text, &DAT_087fe9b8 widths) ->
+ * line_segment_draw 0x0811e240(param_6) -> draw_text_run_main_caller 0x0811e1e0 -> draw_text_run
+ * 0x085b54e0(param_5). In draw_text_run, param_5!=NULL drives the pen: local_a0 += *param_5;
+ * penx = (local_a0 * DAT_087a42e4 + 600) / 0x4b0  (device px = design_units * screen_dpi / 1200), and
+ * penx is the very [R5_PEN_X] our cairo glyph render draws at. The same array feeds the print emit.
+ *
+ * UNIT (confirmed live, gdb Xvfb :208): Courier 12pt -> every slot = 120 units; Courier em advance 0.6:
+ *   width_1200 = round(em_fraction * ptsize * 1200/72)  ==  round(em_fraction * r5_doc_pixsize() * 1200/96)
+ * (r5_doc_pixsize() = em square in px at 96 dpi; device dpi cancels). Go Mono 25pt: 0.6*25*1200/72 = 250
+ * units -> 250*96/1200 = 20 px/char, the correct monospace grid.
+ *
+ * FIX: entry-hook FUN_083fa990; run WP's body (it writes the placeholder width + bumps the index), then
+ * for an injected TTF in a real doc run overwrite the just-written slot with the REAL width. Non-injected
+ * / multi-byte / chrome -> leave WP's authentic value. display==print + WYSIWYG are structural: one array
+ * feeds both the on-screen pen (= our cairo glyph position) and the print PostScript; we do NOT touch the
+ * render-side advance (no double-apply). Supersedes the disproven glyphrec[0]/+0x5a0/percharadvance hooks. */
+#define R5_FTM_EM 2048.0                              /* measure em size (large -> hinting rounding negligible) */
+static cairo_t *r5_ftm_cr;                            /* dedicated 1x1 measure context */
+static struct { void *cface; unsigned ch; double adv; } r5_ftm_cache[4096];   /* x_advance in em fractions */
+static int r5_ftm_cache_n;
+volatile int r5_ftm_calls;                            /* DIAG: reformat hook entries with injected run active */
+volatile int r5_ftm_calls_inj;                        /* DIAG: entries where WP wrote a width slot */
+volatile int r5_ftm_writes;                           /* DIAG: width-slot overwrites performed */
+
+/* Real-face x_advance for one WP byte, in EM fractions (cairo font size 1.0). <0 => no override / not
+ * measurable. Multiply by the run's device-pixel size to get the device-px advance WP lays out on.
+ * Cached per (cface, char). */
+static double r5_ftadvance_em(const char *path, int idx, unsigned char ch) {
+    void *cface, *ft = 0; int custom = 0, i, n; cairo_text_extents_t te; char u8[8]; unsigned cp;
+    if (!cz.ftface_ok || !cz.set_font_face || !cz.set_font_size || !cz.text_extents) return -1.0;
+    cface = r5_ftface_for(path, idx, &ft, &custom);
+    if (!cface || custom) return -1.0;               /* injected TTFs are Unicode (custom==0) */
+    for (i = 0; i < r5_ftm_cache_n; i++)
+        if (r5_ftm_cache[i].cface == cface && r5_ftm_cache[i].ch == ch) return r5_ftm_cache[i].adv;
+    if (!r5_wp2uni_ready) r5_wp2uni_init();
+    cp = r5_wp2uni[ch];                              /* WP byte -> Unicode (cp1252 for Latin faces) */
+    if (!cp) return -1.0;
+    n = r5_utf8(cp, u8); u8[n] = 0;
+    if (!r5_ftm_cr) {
+        cairo_surface_t *ms = cz.image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        if (!ms) return -1.0;
+        r5_ftm_cr = cz.create(ms); cz.surface_destroy(ms);
+        if (!r5_ftm_cr) return -1.0;
+    }
+    cz.set_font_face(r5_ftm_cr, cface);
+    /* Measure at a LARGE em (not 1.0): at 1px FreeType hinting rounds the advance to whole pixels
+     * (e.g. Go Mono's 0.6em -> 1.0), which would scale spacing ~1.7x. At 2048px the rounding is in the
+     * noise, so adv/2048 recovers the true em fraction. */
+    cz.set_font_size(r5_ftm_cr, R5_FTM_EM);
+    cz.text_extents(r5_ftm_cr, u8, &te);
+    if (cz.status(r5_ftm_cr)) { cz.destroy(r5_ftm_cr); r5_ftm_cr = 0; return -1.0; }   /* poisoned -> rebuild */
+    {
+        double adv = te.x_advance / (double)R5_FTM_EM;   /* -> em fraction */
+        if (adv < 0) adv = 0;
+        if (r5_ftm_cache_n < (int)(sizeof r5_ftm_cache / sizeof r5_ftm_cache[0])) {
+            r5_ftm_cache[r5_ftm_cache_n].cface = cface;
+            r5_ftm_cache[r5_ftm_cache_n].ch    = ch;
+            r5_ftm_cache[r5_ftm_cache_n].adv   = adv;
+            r5_ftm_cache_n++;
+        }
+        return adv;
+    }
+}
+
+/* Reformat per-char width detour (FUN_083fa990 @ 0x083fa990). WP's "append one char to the line" routine:
+ * it computes the char's advance in WP DESIGN UNITS (1/1200 inch, point-size baked in), stores it into
+ * (&DAT_087fe9b8)[DAT_087a21d6], then increments the u16 index DAT_087a21d6. That array is the one the
+ * draw path consumes (line_render_dispatch -> ... -> draw_text_run param_5), so overriding the slot here
+ * fixes on-screen pen (= our cairo glyph position) AND print together.
+ *
+ * We run WP's body, then if the current run is an injected TTF and WP actually appended a width slot
+ * (index advanced by exactly one — skip line-flush/reset boundaries) for a single-byte Latin char in a
+ * real document run, overwrite that slot with the REAL FT advance:
+ *   width_1200 = round(em_fraction * r5_doc_pixsize() * 1200/96).
+ * Non-injected / multi-byte / chrome (r5_doc_pixsize()==0) / not-measurable -> leave WP's value.
+ * cdecl (int reformat_ctx, int char16); both forwarded to the trampoline (which runs WP's original). */
+#define R5_REFORMAT_WIDX 0x087a21d6u                 /* u16 line width-array index (chars appended so far) */
+#define R5_REFORMAT_WBUF 0x087fe9b8u                 /* u16[] line width array (WP design units, 1/1200 in) */
+static void (*r5_reformat_orig)(int, int);
+void retro5_reformat_char(int p1, int ch) {          /* non-static: patched target */
+    unsigned short idx0, idx1; unsigned c; double em, sz; long w;
+    if (!r5_ftmetrics || !r5_cur_injected || !r5_cur_path[0]) { r5_reformat_orig(p1, ch); return; }
+    r5_ftm_calls++;                                                             /* DIAG */
+    idx0 = *(volatile unsigned short *)(uintptr_t)R5_REFORMAT_WIDX;
+    r5_reformat_orig(p1, ch);                                                    /* WP writes width + bumps idx */
+    idx1 = *(volatile unsigned short *)(uintptr_t)R5_REFORMAT_WIDX;
+    if (idx1 != (unsigned short)(idx0 + 1)) return;                              /* no single slot appended */
+    r5_ftm_calls_inj++;                                                         /* DIAG */
+    c = (unsigned)(ch & 0xffff);
+    if (c > 0xff) return;                                                        /* multi-byte -> leave WP's */
+    sz = r5_doc_pixsize();                                                       /* 0 unless a real doc run */
+    if (sz <= 0) return;
+    em = r5_ftadvance_em(r5_cur_path, r5_cur_idx, (unsigned char)c);
+    if (em < 0) return;                                                          /* not measurable -> leave WP's */
+    w = (long)(em * sz * (1200.0 / 96.0) + 0.5);                                 /* em-fraction -> WP design units */
+    if (w < 0) w = 0;
+    if (w > 0xffff) w = 0xffff;
+    ((volatile unsigned short *)(uintptr_t)R5_REFORMAT_WBUF)[idx0] = (unsigned short)w;
+    r5_ftm_writes++;                                                            /* DIAG */
+}
+
+/* Install the reformat width detour: jmp-patch FUN_083fa990's 8.0 entry (0x083fa990) to ours via a
+ * trampoline that runs WP's original body first. Byte-guarded on the exact 9-byte prologue
+ * (push ebp; mov ebp,esp; sub esp,0xbc); gated RETRO5_FTMETRICS (OFF). */
+static void r5_install_reformat_hook(void) {
+    static const unsigned char g[9] = {0x55,0x89,0xe5,0x81,0xec,0xbc,0x00,0x00,0x00};
+    uintptr_t va = 0x083fa990;
+    if (!r5_ftmetrics) return;
+    if (range_unmapped((void *)va, sizeof g) || memcmp((void *)va, g, sizeof g) != 0) {
+        if (r5_trace) { const char *m = "retro5: FTMETRICS reformat hook SKIPPED (guard mismatch)\n";
+                        write(2, m, strlen(m)); }
+        return;
+    }
+    r5_reformat_orig = (void (*)(int, int))r5_make_trampoline(va, 9);
+    if (!r5_reformat_orig) return;
+    patch_entry(va, (const char *)g, sizeof g, (void *)retro5_reformat_char);
+    if (r5_trace) { const char *m = "retro5: FTMETRICS reformat width hook installed (0x083fa990)\n";
+                    write(2, m, strlen(m)); }
 }
 
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
@@ -3978,7 +4121,7 @@ static void r5_resolve_stock_pfb(const char *nm, uintptr_t rec) {
 }
 static void r5_resolve_cur_path(unsigned slot, const char *nm, uintptr_t rec) {
     int fi = -1, i;
-    r5_cur_path[0] = 0; r5_cur_idx = 0;
+    r5_cur_path[0] = 0; r5_cur_idx = 0; r5_cur_injected = 0;
     if (!nm || !nm[0]) return;
     /* Phase A: an INJECTED system face -> its real .ttf from the retro5 side table. */
     if (r5_ftface && r5_inj_base > 0) {
@@ -3992,6 +4135,7 @@ static void r5_resolve_cur_path(unsigned slot, const char *nm, uintptr_t rec) {
             strncpy(r5_cur_path, r5_fcpath[fi], sizeof r5_cur_path - 1);
             r5_cur_path[sizeof r5_cur_path - 1] = 0;
             r5_cur_idx = r5_fcidx[fi];
+            r5_cur_injected = 1;                          /* injected TTF -> eligible for FT metric override */
             if (r5_trace) { char b[320]; int k = snprintf(b, sizeof b,
                 "retro5: FTface '%s' -> %s [%d]\n", nm, r5_cur_path, r5_cur_idx);
                 if (k > 0) write(2, b, (size_t)k); }
@@ -4004,7 +4148,7 @@ static void r5_resolve_cur_path(unsigned slot, const char *nm, uintptr_t rec) {
 int retro5_resolver(unsigned codeattr) {
     if (!r5_membership_added) r5_fontres_add_members();   /* §17.1 lazy safety net (cheap once done) */
     r5_cur_family[0] = 0;
-    r5_cur_path[0] = 0; r5_cur_idx = 0;
+    r5_cur_path[0] = 0; r5_cur_idx = 0; r5_cur_injected = 0;
     /* §17.1 REAL FIX: the base name->code hook (retro5_name_to_code) now keeps an injected face's OWN
      * display code through render + reload, so by the time we get here `codeattr` already carries the
      * injected code — the block below reads that record's real family straight from the table. (The old
@@ -4280,6 +4424,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_install_resolver_hook();
     r5_install_fontset_hook();          /* capture injected pick -> resolver renders it (interim; §17.1 = full) */
     r5_install_name_to_code_hook();     /* §17.1 REAL FIX: injected NAME->own code on render + reload */
+    r5_install_reformat_hook();         /* §17.2: FT advance override in reformat width array (injected-TTF spacing); gated OFF */
     /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
      * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
      * interactive print path, so bypassing its spawn was both unnecessary and the cause of the
@@ -4549,6 +4694,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
     { const char *e = getenv("RETRO5_FTFACE");    if (e && e[0] == '0') r5_ftface = 0; }                  /* Phase A: bind injected faces by real .ttf via cairo-FT (default ON) */
     { const char *e = getenv("RETRO5_PFBFACE");   if (e && e[0] == '0') r5_pfbface = 0; }                 /* Phase B: bind WP-stock Type1 faces by real .pfb via cairo-FT (default ON) */
+    { const char *e = getenv("RETRO5_FTMETRICS"); if (e && e[0] == '0') r5_ftmetrics = 0; }              /* §17.2: lay out injected TTFs on their REAL FT advances (default ON; matches FTFACE) */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *e = getenv("RETRO5_WHEEL");      if (e && e[0] == '0') r5_wheel = 0; }             /* mouse-wheel scrolling (default ON) */
