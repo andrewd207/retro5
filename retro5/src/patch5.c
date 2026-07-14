@@ -2433,6 +2433,11 @@ static int r5_fontcoll;                                  /* RETRO5_FONTCOLL: app
 static int r5_ftface = 1;               /* RETRO5_FTFACE: bind injected faces by their real .ttf via cairo-FT
                                          * (Phase A). Default ON; only ever active for an INJECTED face that
                                          * has a stored path, so stock/WP fonts are untouched. 0 = off. */
+static int r5_pfbface = 1;              /* RETRO5_PFBFACE: bind WP's OWN stock Type1 faces from their genuine
+                                         * .pfb (WpFontRecord.pfb_path, record+0x08) via the SAME cairo-FT path
+                                         * as Phase A — FreeType renders Type1 .pfb natively. Default ON. Only
+                                         * the glyph FACE changes; WP still positions the pen (its metrics are
+                                         * authentic for its own .pfb, so spacing agrees for free). 0 = off. */
 
 /* ---- Phase A: injected-face -> real .ttf side table -----------------------------------------------
  * HARD CONSTRAINT: the font FILE PATH lives ONLY here (retro5-side), keyed by the injected family. It is
@@ -2956,9 +2961,12 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
     s[r5_utf8(cp, s)] = 0;                               /* Unicode -> UTF-8 (cairo's show_text wants it) */
     r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
-    /* Phase A: for an injected face with a stored .ttf, bind that EXACT face (cache-independent);
-     * otherwise fall back to fontconfig name matching (stock/WP fonts, or if FT load fails). */
-    { void *cface = (r5_ftface && r5_cur_path[0]) ? r5_ftface_for(r5_cur_path, r5_cur_idx) : 0;
+    /* Bind the EXACT face when the resolver stored a real font file for this run: an injected system
+     * .ttf (Phase A, r5_ftface) or a WP-stock Type1 .pfb (Phase B, r5_pfbface) — both go through the
+     * same (path->FT_Face->cairo_font_face) cache. r5_cur_path is set ONLY when the relevant flag is on,
+     * so a non-empty path always means "bind it". Fall back to fontconfig name matching (bitmap stock
+     * faces with no .pfb, or if the FT load fails). */
+    { void *cface = r5_cur_path[0] ? r5_ftface_for(r5_cur_path, r5_cur_idx) : 0;
       if (cface) cz.set_font_face(cr, cface);
       else       cz.select_font_face(cr, fam, slant, weight); }
     cz.set_font_size(cr, sz);
@@ -3880,23 +3888,76 @@ static int (*r5_resolver_orig)(unsigned);
  * table, into r5_cur_path/r5_cur_idx. Index-aligned lookup (arr[r5_inj_base+i] carries r5_fcfam[i]),
  * verified by name; a name-search fallback keeps it correct even if the alignment assumption ever
  * breaks. Sets nothing (clears) for stock/base faces. Runs once per font switch, never per glyph. */
-static void r5_resolve_cur_path(unsigned slot, const char *nm) {
+/* Phase B: resolve a WP font path (WpFontRecord.pfb_path, record+0x08) to a real openable file. WP's
+ * loader stores either an absolute path or a basename/relative path under a WP font dir; resolve it the
+ * same way — try it verbatim, then its basename under $WPC/shlib10 and $WPC (WPC = the runtime install
+ * root, e.g. /usr/wplinux). Returns 1 + fills out[] with an openable path, else 0. */
+static int r5_resolve_font_file(const char *p, char *out, size_t osz) {
+    const char *wpc, *base, *q; char cand[1024];
+    if (!p || !p[0] || osz < 2) return 0;
+    if (access(p, R_OK) == 0) {                           /* absolute, or relative-to-cwd, as stored */
+        strncpy(out, p, osz - 1); out[osz - 1] = 0; return 1;
+    }
+    for (base = p, q = p; *q; q++) if (*q == '/' || *q == '\\') base = q + 1;   /* basename */
+    wpc = getenv("WPC");
+    if (wpc && wpc[0]) {
+        snprintf(cand, sizeof cand, "%s/shlib10/%s", wpc, base);
+        if (access(cand, R_OK) == 0) { strncpy(out, cand, osz - 1); out[osz - 1] = 0; return 1; }
+        snprintf(cand, sizeof cand, "%s/%s", wpc, base);
+        if (access(cand, R_OK) == 0) { strncpy(out, cand, osz - 1); out[osz - 1] = 0; return 1; }
+    }
+    return 0;
+}
+/* Phase B: for a WP-stock face, bind its genuine Type1 .pfb (record+0x08) via the SAME cairo-FT cache
+ * as the injected .ttf path. Only the glyph FACE is affected — WP keeps positioning the pen, and because
+ * we now render the exact .pfb WP measured, cairo's outline agrees with WP's metrics for free. Skips
+ * symbol/pi/non-Latin faces (they pass through to WP's native blit) and bitmap faces (no .pfb). */
+static void r5_resolve_stock_pfb(const char *nm, uintptr_t rec) {
+    int s, w, sym; const char *pfb; char full[1024]; size_t L;
+    if (!r5_pfbface || !rec || range_unmapped((void *)(rec + 0x08), 4)) return;
+    r5_face_to_family(nm, &s, &w, &sym);
+    if (sym) return;                                      /* symbol/pi/non-Latin -> WP native glyph */
+    pfb = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(rec + 0x08));   /* WpFontRecord.pfb_path */
+    if (!pfb || range_unmapped((void *)pfb, 1)) return;
+    L = strlen(pfb);
+    if (L < 4 || strcasecmp(pfb + L - 4, ".pfb")) return; /* only Type1 .pfb; bitmap fonts stay native */
+    if (!r5_resolve_font_file(pfb, full, sizeof full)) {
+        if (r5_trace) { char b[360]; int k = snprintf(b, sizeof b,
+            "retro5: PFBface '%s' -> %s UNRESOLVED (fallback to substitute)\n", nm, pfb);
+            if (k > 0) write(2, b, (size_t)k); }
+        return;
+    }
+    strncpy(r5_cur_path, full, sizeof r5_cur_path - 1);
+    r5_cur_path[sizeof r5_cur_path - 1] = 0;
+    r5_cur_idx = 0;                                       /* Type1 .pfb = a single face */
+    if (r5_trace) { char b[400]; int k = snprintf(b, sizeof b,
+        "retro5: PFBface '%s' -> %s\n", nm, r5_cur_path);
+        if (k > 0) write(2, b, (size_t)k); }
+}
+static void r5_resolve_cur_path(unsigned slot, const char *nm, uintptr_t rec) {
     int fi = -1, i;
     r5_cur_path[0] = 0; r5_cur_idx = 0;
-    if (!r5_ftface || !nm || !nm[0] || r5_inj_base <= 0) return;
-    if (slot >= (unsigned)r5_inj_base) {                  /* injected range: try the aligned slot first */
-        int cand = (int)slot - r5_inj_base;
-        if (cand >= 0 && cand < r5_fcfam_n && !strcasecmp(r5_fcfam[cand], nm)) fi = cand;
+    if (!nm || !nm[0]) return;
+    /* Phase A: an INJECTED system face -> its real .ttf from the retro5 side table. */
+    if (r5_ftface && r5_inj_base > 0) {
+        if (slot >= (unsigned)r5_inj_base) {              /* injected range: try the aligned slot first */
+            int cand = (int)slot - r5_inj_base;
+            if (cand >= 0 && cand < r5_fcfam_n && !strcasecmp(r5_fcfam[cand], nm)) fi = cand;
+        }
+        if (fi < 0)                                       /* fallback: match the family by name */
+            for (i = 0; i < r5_fcfam_n; i++) if (!strcasecmp(r5_fcfam[i], nm)) { fi = i; break; }
+        if (fi >= 0 && r5_fcpath[fi][0]) {
+            strncpy(r5_cur_path, r5_fcpath[fi], sizeof r5_cur_path - 1);
+            r5_cur_path[sizeof r5_cur_path - 1] = 0;
+            r5_cur_idx = r5_fcidx[fi];
+            if (r5_trace) { char b[320]; int k = snprintf(b, sizeof b,
+                "retro5: FTface '%s' -> %s [%d]\n", nm, r5_cur_path, r5_cur_idx);
+                if (k > 0) write(2, b, (size_t)k); }
+            return;
+        }
     }
-    if (fi < 0)                                           /* fallback: match the family by name */
-        for (i = 0; i < r5_fcfam_n; i++) if (!strcasecmp(r5_fcfam[i], nm)) { fi = i; break; }
-    if (fi < 0 || !r5_fcpath[fi][0]) return;
-    strncpy(r5_cur_path, r5_fcpath[fi], sizeof r5_cur_path - 1);
-    r5_cur_path[sizeof r5_cur_path - 1] = 0;
-    r5_cur_idx = r5_fcidx[fi];
-    if (r5_trace) { char b[320]; int k = snprintf(b, sizeof b,
-        "retro5: FTface '%s' -> %s [%d]\n", nm, r5_cur_path, r5_cur_idx);
-        if (k > 0) write(2, b, (size_t)k); }
+    /* Phase B: a WP-stock Type1 face -> its genuine .pfb (record+0x08). */
+    r5_resolve_stock_pfb(nm, rec);
 }
 int retro5_resolver(unsigned codeattr) {
     if (!r5_membership_added) r5_fontres_add_members();   /* §17.1 lazy safety net (cheap once done) */
@@ -3924,7 +3985,7 @@ int retro5_resolver(unsigned codeattr) {
                 if (nm && !range_unmapped(nm, 1)) {
                     strncpy(r5_cur_family, nm, sizeof r5_cur_family - 1);
                     r5_cur_family[sizeof r5_cur_family - 1] = 0;
-                    r5_resolve_cur_path(slot, nm);        /* Phase A: bind the real .ttf for this face */
+                    r5_resolve_cur_path(slot, nm, (uintptr_t)arr[slot]);  /* bind real .ttf/.pfb */
                 }
             }
         }
@@ -4445,6 +4506,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_MEMBERS");   if (e && *e) r5_member_limit = atoi(e); }        /* §17.1 de-risk: cap appended member faces (0 = all) */
     { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
     { const char *e = getenv("RETRO5_FTFACE");    if (e && e[0] == '0') r5_ftface = 0; }                  /* Phase A: bind injected faces by real .ttf via cairo-FT (default ON) */
+    { const char *e = getenv("RETRO5_PFBFACE");   if (e && e[0] == '0') r5_pfbface = 0; }                 /* Phase B: bind WP-stock Type1 faces by real .pfb via cairo-FT (default ON) */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *e = getenv("RETRO5_WHEEL");      if (e && e[0] == '0') r5_wheel = 0; }             /* mouse-wheel scrolling (default ON) */
