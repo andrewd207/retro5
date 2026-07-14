@@ -3465,8 +3465,48 @@ static int r5_faceentry_cmp(const void *a, const void *b) {
     return strcasecmp(na, nb);
 }
 
+/* Is `name` one of the system families we injected into the record table (indices [inj_base,reccnt))?
+ * Those records are the fontconfig faces that render via cairo (TTF/OTF); a base COLL entry carrying the
+ * same name is the legacy Type1 (.pfb) face — WP's built-ins and any user-installed Type1 conversions.
+ * Matching against the actually-injected record names (not the raw fontconfig list) guarantees a dropped
+ * base face always HAS a surviving TTF replacement, even if injection was truncated at the code ceiling.
+ * Case-insensitive; O(base*injected) but both sets are small and this runs once per dialog open. */
+static int r5_name_is_injected(const char *name, uint32_t *arr, unsigned inj_base, unsigned reccnt) {
+    unsigned i;
+    if (!name || !*name) return 0;
+    for (i = inj_base; i < reccnt; i++) {
+        unsigned char *rec = (unsigned char *)(uintptr_t)arr[i];
+        const char *nm;
+        if (!rec || range_unmapped(rec, 0x14)) continue;
+        nm = (const char *)(uintptr_t)(*(uint32_t *)(rec + 0x10));   /* record's family name (+0x10) */
+        if (nm && !range_unmapped(nm, 1) && !strcasecmp(name, nm)) return 1;
+    }
+    return 0;
+}
+
+/* Free a base FaceEntry we are dropping, exactly as fontcoll_destroy 0x0852b7d0 would on dialog close —
+ * so removing it from COLL leaks nothing, and because we also drop it from the array + count, WP never
+ * double-frees it. Frees each StyleVar's styleRec (style+4), the styles array (entry+0xc), and faceRec
+ * (entry+4). We deliberately do NOT touch the flags&0x20 "deep" pointer the destructor conditionally
+ * frees: every base entry observed carries flags 0x87 (0x20 clear) so that branch is dead, and skipping
+ * it removes any risk of a mis-offset free (worst case a leak that, in practice, never occurs). */
+static void r5_free_faceentry(unsigned char *be) {
+    unsigned nst = *(unsigned short *)(be + 8);
+    unsigned char *styles = *(unsigned char **)(be + 0xc);
+    char *faceRec = *(char **)(be + 4);
+    unsigned k;
+    if (styles && !range_unmapped(styles, (size_t)nst * 16)) {
+        for (k = 0; k < nst; k++) {
+            char *sr = *(char **)(styles + k * 16 + 4);
+            if (sr) free(sr);
+        }
+        free(styles);
+    }
+    if (faceRec) free(faceRec);
+}
+
 static void r5_inject_collection(void *coll) {
-    uint32_t *arr; unsigned reccnt, count, ntotal, added, i;
+    uint32_t *arr; unsigned reccnt, count, orig_count, ntotal, added, i;
     void **pentries; void *entries, *ne; unsigned char *fe; uint32_t flags0;
     if (!r5_allfonts || !r5_fontcoll || !coll || range_unmapped(coll, 8)) return;
     if (r5_inj_base <= 0) return;                            /* record-table injection never ran */
@@ -3479,6 +3519,7 @@ static void r5_inject_collection(void *coll) {
     ntotal = reccnt - (unsigned)r5_inj_base;                 /* # injected system records to mirror */
 
     count    = *(uint32_t *)coll;                            /* COLL.count  */
+    orig_count = count;                                      /* base count before dedup (for the trace) */
     pentries = (void **)((char *)coll + 4);                  /* &COLL.entries */
     entries  = *pentries;
     if (count < 1 || count > 100000 || !entries || range_unmapped(entries, 16)) return;
@@ -3487,6 +3528,27 @@ static void r5_inject_collection(void *coll) {
     ne = realloc(entries, (size_t)(count + ntotal) * 16);
     if (!ne) return;
     entries = ne; *pentries = ne;
+
+    /* Dedup, preferring TTF over Type1: drop (and free) every base FaceEntry whose name matches a
+     * system family we injected -> the fontconfig/cairo (TTF/OTF) face wins, the legacy Type1 (.pfb)
+     * face is removed. Compact survivors down; `count` becomes the deduped base count, and the injected
+     * faces are appended after it, so each family lands exactly once. */
+    {
+        unsigned kept = 0, j;
+        for (j = 0; j < count; j++) {
+            unsigned char *be = (unsigned char *)entries + (size_t)j * 16;
+            const char *nm = *(char **)(be + 4);
+            if (nm && !range_unmapped(nm, 1)
+                && r5_name_is_injected(nm, arr, (unsigned)r5_inj_base, reccnt)) {
+                r5_free_faceentry(be);                          /* drop the Type1 duplicate cleanly */
+                continue;
+            }
+            if (kept != j) memcpy((char *)entries + (size_t)kept * 16, be, 16);
+            kept++;
+        }
+        count = kept;
+    }
+
     fe = (unsigned char *)entries + (size_t)count * 16;
     added = 0;
     for (i = 0; i < ntotal; i++) {
@@ -3518,8 +3580,9 @@ static void r5_inject_collection(void *coll) {
      * the string), so this is a true alphabetical sort. */
     if (count + added > 1)
         qsort(entries, (size_t)(count + added), 16, r5_faceentry_cmp);
-    if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
-        "retro5: collection +%u face(s), COLL count now %u (was %u), sorted\n", added, count + added, count);
+    if (r5_trace) { char b[128]; int k = snprintf(b, sizeof b,
+        "retro5: collection +%u face(s), dropped %u Type1 dup(s), COLL count now %u (base was %u), sorted\n",
+        added, orig_count - count, count + added, orig_count);
         if (k > 0) write(2, b, (size_t)k); }
 }
 
