@@ -1348,6 +1348,9 @@ export RETRO5_WPEXC_ID=$$
 # RETRO5_PRINTER_ADMIN : command launched when WP's "Printer Control"/"Printer Create-Edit" actions
 #                  fire (legacy xwppmgr is repointed here). Only used when RETRO5_CUPS=1.
 : "${{RETRO5_PRINTER_ADMIN:=gnome-control-center printers}}"; export RETRO5_PRINTER_ADMIN
+# RETRO5_PRINT_PDF : 1 = convert each print job PS->PDF (fonts embedded, via Ghostscript) before
+#                  sending to CUPS; 0 = raw PostScript. Only used when RETRO5_CUPS=1.
+: "${{RETRO5_PRINT_PDF:=1}}"; export RETRO5_PRINT_PDF
 echo "retroXt: DOCFONT=$RETRO5_DOCFONT ALLFONTS=$RETRO5_ALLFONTS CUPS=$RETRO5_CUPS EWMH=$RETRO5_EWMH ICONS=${{RETRO5_ICONS:+on}}" >&2
 [ "$RETRO5_CUPS" != 0 ] && echo "retroXt: PRINTER_ADMIN=\"$RETRO5_PRINTER_ADMIN\"" >&2
 # Stale-state cleanup: WP's /tmp/wpc-<user>-<host> dir accumulates dead-instance
