@@ -3336,11 +3336,146 @@ static void r5_inject_fonts(void) {
         if (k > 0) write(2, b, (size_t)k); }
 }
 
+/* ---- §17.1: make injected faces first-class printer-font MEMBERS ----------------------------
+ * The problem (handoff §2/§3): WP's font_code_to_record 0x085b69f0 validates a picked code against
+ * the ACTIVE font-set's dense codemap; an injected code_index >= codemap.count MISSES, so WP rewrites
+ * the stored code to the printer default (the "collapse") and the face reverts + shows the wrong name.
+ * Forcing the membership gate alone SIGSEGVs because the face has no name-pool entry either.
+ *
+ * The fix (recipe §"The fix"): append a real codemap entry + font-entry for each injected face to the
+ * active set, and intern its name in the pool, so font_printres_member finds it naturally, the name
+ * read lands on real UTF-16, the code survives to the document, and the resolver renders it distinctly.
+ *
+ * STEP-0 LIVE RESULT (Xvfb :167, this exact build): *0x087bddf8 (0xa062380, the "base/display" font
+ * resource) != *0x08812f90 (0xa047bb0, the printer resource).  font_code_to_record's resource_ctx_push
+ * copies 0x087bddf8/fc INTO 0x08812f90/8c BEFORE the membership check, so the set actually checked is
+ * element (token) of the container at *0x087bddf8 — NOT the printer resource.  So we append THERE.
+ *   base set0 at rest: set+0x02 count=1, codemap(+0x18) count=127 (elem 0xa8), entries(+0x1c) count=127
+ *   (elem 0x14).  Base display faces hold codes 0xfff..0xf81 (codemap idx 0..126); retro5's freecode
+ *   injection continues at 0xf80 downward, so injected display slot i (127..N-1) already carries code
+ *   0xfff-i, i.e. code_index == i == the codemap slot a sequential append lands in.  ALIGNMENT IS FREE:
+ *   we verify 0xfff-code == codemap.count per face and append in display order; no code reassignment.
+ *
+ * Primitives are pure/self-contained (recipe) and called at their 8.0 VAs from inside WP (this runs as
+ * the builder detour / hook, i.e. WP's own context — calling them is exactly what WP does). Idempotent:
+ * appends once, when the base set is populated; re-tries (no-op) until then. Gated by RETRO5_ALLFONTS. */
+typedef int   (*r5_res_append_fn)(void *c, const void *src);                 /* 0x0841fe50 -> 1 ok */
+typedef int   (*r5_namepool_add_fn)(const void *u16, unsigned short blen,
+                                    unsigned short out[2], char append);     /* 0x0840e600 -> 1 ok */
+typedef void *(*r5_res_get_fn)(void *c, unsigned idx);                        /* 0x08420140 */
+#define R5_RES_APPEND   ((r5_res_append_fn)0x0841fe50)
+#define R5_NAMEPOOL_ADD ((r5_namepool_add_fn)0x0840e600)
+#define R5_RES_GET      ((r5_res_get_fn)0x08420140)
+
+static int r5_membership_added;      /* one-shot: appended for the current base set */
+static int r5_member_limit;          /* RETRO5_MEMBERS: cap appended faces (de-risk); 0 = all */
+
+/* Read a WpResContainer's live element count (+0x14). */
+static unsigned r5_ctr_count(void *c) { return *(unsigned *)((char *)c + 0x14); }
+
+static void r5_fontres_add_members(void) {
+    void *base_res, *set, *codemap, *entries, *by_name, *tcm, *te;
+    uint32_t *arr; unsigned reccnt, defidx, first_code, i; int added = 0;
+    unsigned char cm[0xa8], fe[0x14], bn[0xc]; int have_bn = 0; /* templated entry copies */
+    if (!r5_allfonts || r5_membership_added || r5_inj_base <= 0) return;
+    if (!r5s.fontrec_arr || !r5s.fontrec_cnt) return;
+    if (range_unmapped((void *)0x087bddf8, 4) || range_unmapped((void *)0x087bddfc, 2)) return;
+    if (range_unmapped((void *)r5s.fontrec_arr, 4) || range_unmapped((void *)r5s.fontrec_cnt, 2)) return;
+
+    base_res = *(void **)0x087bddf8;                     /* container active at the membership check */
+    if (!base_res || range_unmapped(base_res, 0x34)) return;
+    set = R5_RES_GET(base_res, *(unsigned short *)0x087bddfc);   /* element 0 = the font-set */
+    if (!set || range_unmapped(set, 0x24)) return;
+    if (*(unsigned short *)((char *)set + 0x02) == 0) return;    /* set not built yet -> retry later */
+    codemap = *(void **)((char *)set + 0x18);
+    entries = *(void **)((char *)set + 0x1c);
+    if (!codemap || range_unmapped(codemap, 0x34) || !entries || range_unmapped(entries, 0x34)) return;
+    /* §17.1 (2nd pass): the NAME->code re-resolver on the APPLY path searches the font-set's by_name
+     * (+0x20) 12-byte index (see printer_fontset_face_add 0x08416b10). Membership populated codemap+
+     * entries+namepool but NOT by_name, so injected names miss and collapse to the nearest base face.
+     * Also append a by_name record per injected face. Template = by_name[0] (default) so the non-key
+     * bytes (+0x08 flag/+0x09 weight/+0x0a) stay sane; we patch name_block/offset + code_index. */
+    by_name = *(void **)((char *)set + 0x20);
+    if (by_name && !range_unmapped(by_name, 0x34) && r5_ctr_count(by_name) > 0) {
+        void *b0 = R5_RES_GET(by_name, 0);
+        if (b0 && !range_unmapped(b0, 0xc)) { memcpy(bn, b0, 0xc); have_bn = 1; }
+    }
+
+    arr    = *(uint32_t **)r5s.fontrec_arr;
+    reccnt = *(unsigned short *)r5s.fontrec_cnt;
+    if (!arr || range_unmapped(arr, 4) || reccnt <= (unsigned)r5_inj_base) return;
+
+    /* Alignment gate (also the "base set populated?" gate): the first injected face's code_index must
+     * equal the current codemap append slot.  If not, the base set isn't the 127-face set yet (or codes
+     * drifted) -> bail WITHOUT marking done, so we retry on the next hook. */
+    { unsigned char *r0 = (unsigned char *)(uintptr_t)arr[r5_inj_base];
+      if (!r0 || range_unmapped(r0, 0x20)) return;
+      first_code = *(unsigned short *)(r0 + 0x06); }
+    if ((unsigned)(0xfff - first_code) != r5_ctr_count(codemap)) {
+        if (r5_trace) { char b[96]; int k = snprintf(b, sizeof b,
+            "retro5: §17.1 not ready (codemap.count=%u, want %u) — retry\n",
+            r5_ctr_count(codemap), 0xfff - first_code); if (k > 0) write(2, b, (size_t)k); }
+        return;
+    }
+
+    /* Template = the printer default face's codemap entry + its metric entry (sane size_denom etc). */
+    defidx = 0xfff - ((*(unsigned *)0x087bdfe4 >> 16) & 0xfff);
+    tcm = R5_RES_GET(codemap, defidx);
+    if (!tcm || range_unmapped(tcm, 0xa8)) return;
+    te  = R5_RES_GET(entries, *(short *)((char *)tcm + 0x04));
+    if (!te || range_unmapped(te, 0x14)) return;
+    memcpy(cm, tcm, 0xa8);
+    memcpy(fe, te, 0x14);
+
+    for (i = (unsigned)r5_inj_base; i < reccnt; i++) {
+        unsigned char *rec = (unsigned char *)(uintptr_t)arr[i];
+        const char *name; unsigned short code, code_index, out[2]; unsigned short u16[128];
+        int j, entry_idx; unsigned short blen;
+        if (r5_member_limit && added >= r5_member_limit) break;
+        if (!rec || range_unmapped(rec, 0x20)) break;
+        code       = *(unsigned short *)(rec + 0x06);
+        code_index = (unsigned short)(0xfff - code);
+        name       = (const char *)(uintptr_t)(*(uint32_t *)(rec + 0x10));
+        if (!name || range_unmapped(name, 1) || !name[0]) break;
+        /* per-face alignment: the append must land exactly at code_index */
+        if (code_index != r5_ctr_count(codemap)) break;
+        /* ASCII family -> UTF-16LE (WP names are 16-bit); NUL-terminated. */
+        for (j = 0; j < 126 && name[j]; j++) u16[j] = (unsigned char)name[j];
+        u16[j] = 0;
+        blen = (unsigned short)((j + 1) * 2);            /* bytes incl. terminator (== utf16len+2) */
+        if (!R5_NAMEPOOL_ADD(u16, blen, out, 1)) break;
+        /* append the metric entry, then the codemap entry that points at it */
+        if (!R5_RES_APPEND(entries, fe)) break;
+        entry_idx = (int)r5_ctr_count(entries) - 1;
+        *(unsigned short *)(cm + 0x00) = code_index;     /* this slot's own index      */
+        *(short          *)(cm + 0x04) = (short)entry_idx;/* -> entries[entry_idx]     */
+        *(unsigned short *)(cm + 0x0a) = out[0];         /* name-pool block            */
+        *(unsigned short *)(cm + 0x0c) = out[1];         /* name-pool byte offset      */
+        *(unsigned short *)(cm + 0xa6) = 0xffff;         /* end of sort chain          */
+        if (!R5_RES_APPEND(codemap, cm)) break;          /* lands at index code_index  */
+        /* by_name index: {name_block,name_offset,code_index,code_index_dup,flag,weight,param4} */
+        if (have_bn) {
+            *(unsigned short *)(bn + 0x00) = out[0];      /* name-pool block  */
+            *(unsigned short *)(bn + 0x02) = out[1];      /* name-pool offset */
+            *(unsigned short *)(bn + 0x04) = code_index;  /* -> the injected code */
+            *(unsigned short *)(bn + 0x06) = code_index;  /* dup (see 0x08416b10) */
+            R5_RES_APPEND(by_name, bn);                   /* non-fatal if it fails */
+        }
+        added++;
+    }
+    r5_membership_added = (added > 0);                   /* mark done only if we actually appended */
+    if (r5_trace) { char b[160]; int k = snprintf(b, sizeof b,
+        "retro5: §17.1 added %d injected face(s) as members (codemap=%u by_name=%u have_bn=%d)\n",
+        added, r5_ctr_count(codemap), by_name ? r5_ctr_count(by_name) : 0, have_bn);
+        if (k > 0) write(2, b, (size_t)k); }
+}
+
 /* Builder detour: run WP's real builder (trampoline), then append our fonts. Same 6-byte prologue
  * on both builds (55 89 e5 83 ec 0c), so keep=6. */
 static int retro5_font_builder(void) {
     int r = r5_builder_orig ? r5_builder_orig() : 0;
     r5_inject_fonts();
+    r5_fontres_add_members();       /* §17.1: real fix — make injected faces genuine members */
     return r;
 }
 static void r5_install_injection(void) {
@@ -3572,40 +3707,15 @@ static void r5_install_collection_injection(void) {
  * and if it is one we injected, stash its real fontconfig family in r5_cur_family. r5_doc_family()
  * then renders the cairo glyph in that family. Cleared for stock fonts so they keep metric-name
  * matching. Gated with the doc-font canvas (RETRO5_DOCFONT) + injection (RETRO5_ALLFONTS). */
-/* ---- injected-font SELECTION survival (render-side; see §17.2 + names.txt) ---------------------
- * WP collapses a picked injected-only face to the printer default BEFORE storing it (the gate is the
- * printer-resource membership test 0x08417900; on a miss the caller rewrites the code to the default
- * *0x087bdfe4). Preventing the collapse (forcing membership) CRASHES — WP then strlens a null name from
- * the printer name pool, which also lacks the face — so a persistent fix needs printer-resource AND
- * name-pool membership (§17.1, resource 0x08812f90 / pool 0x08812f80; add-primitive not yet reversed).
- * As a SAFE interim we capture the pick upstream (retro5_fontset, the font-set command handler, sees the
- * chosen code pre-collapse) and, in the resolver, render that family for the substituted runs while the
- * injected face is the active selection. Limitation: all injected faces collapse to the SAME default
- * code in the document, so this renders only the *currently selected* injected face, and injected text
- * reverts to the default once another face is picked; multi-injected-font docs and a true property-bar
- * name need the §17.1 resource extension. Selecting any non-injected face clears the capture. */
-static char r5_forced_family[80];        /* injected family the user just picked, or "" */
-#define R5_SUB_PENDING (-2)              /* learn the collapsed code on the next resolve */
-static int  r5_forced_subcode12 = -1;    /* the 12-bit code the pick collapsed to; -1 none, -2 pending */
-static int r5_code12_is_injected(unsigned code12, const char **name_out);   /* fwd */
-
 static int (*r5_resolver_orig)(unsigned);
 int retro5_resolver(unsigned codeattr) {
-    unsigned c12 = (codeattr >> 16) & 0xfff;
+    if (!r5_membership_added) r5_fontres_add_members();   /* §17.1 lazy safety net (cheap once done) */
     r5_cur_family[0] = 0;
-    /* Learn the collapsed (substitute) code on the first resolve after an injected pick, then render the
-     * picked family for every run carrying that code while this injected face stays selected. */
-    if (r5_forced_family[0]) {
-        if (r5_forced_subcode12 == R5_SUB_PENDING) {
-            if (r5_code12_is_injected(c12, 0)) { r5_forced_family[0] = 0; r5_forced_subcode12 = -1; }
-            else r5_forced_subcode12 = (int)c12;
-        }
-        if (r5_forced_family[0] && r5_forced_subcode12 >= 0 && (int)c12 == r5_forced_subcode12) {
-            strncpy(r5_cur_family, r5_forced_family, sizeof r5_cur_family - 1);
-            r5_cur_family[sizeof r5_cur_family - 1] = 0;
-            return r5_resolver_orig ? r5_resolver_orig(codeattr) : 0;
-        }
-    }
+    /* §17.1 REAL FIX: the base name->code hook (retro5_name_to_code) now keeps an injected face's OWN
+     * display code through render + reload, so by the time we get here `codeattr` already carries the
+     * injected code — the block below reads that record's real family straight from the table. (The old
+     * r5_forced_family interim, which force-rendered the last pick for a COLLAPSED code, is obsolete and
+     * was removed: the code no longer collapses.) */
     /* Capture the SELECTED font's own record name (+0x10) — WP substitutes display/injected fonts to
      * a stock face for its Type1 engine (e.g. "DejaVu Sans" -> BroadwayEngraved metric), so the metric
      * name is wrong; the record name is what the user picked. r5_doc_family renders from this. */
@@ -3639,51 +3749,18 @@ static void r5_install_resolver_hook(void) {
         patch_entry(r5s.resolver_va, (const char *)g, sizeof g, (void *)retro5_resolver);
 }
 
-/* Does 12-bit display code `code12` name a font WE injected? (remap slot in [inj_base, cnt)) */
-static int r5_code12_is_injected(unsigned code12, const char **name_out) {
-    unsigned short *remap; uint32_t *arr; unsigned cnt, idx, slot;
-    if (name_out) *name_out = 0;
-    if (r5_inj_base <= 0 || !r5s.remap_arr || !r5s.fontrec_arr || !r5s.fontrec_cnt) return 0;
-    if (range_unmapped((void *)r5s.remap_arr, 4) || range_unmapped((void *)r5s.fontrec_arr, 4)) return 0;
-    remap = *(unsigned short **)r5s.remap_arr;
-    arr   = *(uint32_t **)r5s.fontrec_arr;
-    cnt   = *(unsigned short *)r5s.fontrec_cnt;
-    if (!remap || !arr) return 0;
-    idx = 0x0fff - (code12 & 0x0fff);
-    if (range_unmapped(&remap[idx], 2)) return 0;
-    slot = remap[idx];
-    if (slot < (unsigned)r5_inj_base || slot >= cnt || range_unmapped(&arr[slot], 4) || !arr[slot]) return 0;
-    if (name_out && !range_unmapped((void *)(uintptr_t)(arr[slot] + 0x10), 4)) {
-        const char *nm = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(arr[slot] + 0x10));
-        if (nm && !range_unmapped(nm, 1)) *name_out = nm;
-    }
-    return 1;
-}
-
-/* Font-set command handler capture (RETRO5_ALLFONTS + DOCFONT). WP's font-set handler receives the
- * user's chosen packed code (arg2, 12-bit face in bits 16..27) BEFORE the display->printer collapse.
- * We run the real handler (which collapses injected-only faces to the printer default and stores that),
- * then, if the pick was one of ours, remember the family so the resolver renders it for the substituted
- * runs (it learns the collapsed code on the first following draw). A non-injected pick clears the
- * capture, leaving stock fonts exactly as before. cdecl (arg1, reqcode, op, arg4); op 0xbf = set face. */
+/* ---- injected-font SELECTION: ensure membership before the pick ----------------------------------
+ * Hook the font-set command handler only to GUARANTEE the injected faces are already members of the
+ * base set (r5_fontres_add_members) by the time a pick is classified — this keeps the F9 dialog's
+ * "Resulting Font" showing the real injected name. The actual keep-the-code fix is elsewhere: the base
+ * name->code hook (retro5_name_to_code) makes the render/reload path resolve an injected NAME to its own
+ * display code, so nothing collapses and the resolver renders it distinctly. (The former r5_forced_family
+ * interim — which force-rendered the last-picked face for a COLLAPSED code and so could not tell two
+ * injected faces apart or survive reload — is obsolete and was removed.) cdecl (arg1, reqcode, op, arg4). */
 static int (*r5_fontset_orig)(unsigned, unsigned, unsigned, unsigned);
 int retro5_fontset(unsigned a1, unsigned reqcode, unsigned op, unsigned a4) {
-    int r = r5_fontset_orig ? r5_fontset_orig(a1, reqcode, op, a4) : 0;
-    if (op == 0xbf && r5_allfonts) {                     /* 0xbf = set-font-face command */
-        const char *name = 0;
-        if (r5_code12_is_injected((reqcode >> 16) & 0xfff, &name) && name) {
-            strncpy(r5_forced_family, name, sizeof r5_forced_family - 1);
-            r5_forced_family[sizeof r5_forced_family - 1] = 0;
-            r5_forced_subcode12 = R5_SUB_PENDING;        /* resolver learns the collapsed code on next draw */
-            if (r5_trace) { char b[160]; int k = snprintf(b, sizeof b,
-                "retro5: injected pick '%s' code=0x%x (rendering as picked; collapse-prevention needs §17.1)\n",
-                name, (reqcode >> 16) & 0xfff); if (k > 0) write(2, b, (size_t)k); }
-        } else {
-            r5_forced_family[0] = 0;                      /* a real/printer face -> stop overriding */
-            r5_forced_subcode12 = -1;
-        }
-    }
-    return r;
+    if (!r5_membership_added) r5_fontres_add_members();   /* §17.1: ensure membership before the pick */
+    return r5_fontset_orig ? r5_fontset_orig(a1, reqcode, op, a4) : 0;
 }
 static void r5_install_fontset_hook(void) {
     static const unsigned char g[] = {0x55,0x89,0xe5,0x81,0xec,0x14,0x01,0x00,0x00};
@@ -3695,6 +3772,105 @@ static void r5_install_fontset_hook(void) {
     if (r5_fontset_orig)
         patch_entry(r5s.fontset_va, (const char *)g, sizeof g, (void *)retro5_fontset);
 }
+
+/* ---- §17.1 REAL FIX: base-space NAME->code rescue (render + reload) --------------------------
+ * ROOT CAUSE (live-verified, static-confirmed): the document stores the face NAME (not a code). On
+ * render AND on reopen, WP turns that stored name into a 12-bit DISPLAY code via the base name->code
+ * resolver FUN_085b7a20, which **bsearch()es** the display record table (fontrec_arr, count
+ * fontrec_snap 0x0880875c) by name using comparator 0x085b7b10. bsearch REQUIRES a table sorted by
+ * name; retro5 appends injected records at the END in fontconfig-enumeration order (UNSORTED), so
+ * bsearch never finds an injected face and the resolver falls through to the printer default
+ * (DAT_087bdfe4 -> 0xfff, or a fuzzy alias -> 0xff9). That collapsed code is what reaches the display
+ * resolver 0x085b7860 (retro5_resolver), so injected text renders the substitute and reverts on reload.
+ *
+ * FIX: hook FUN_085b7a20. Run the original first (base faces + genuine hits keep working, untouched);
+ * if it MISSES (returns 0 — it has just written the default to *out), convert the incoming UTF-16 name
+ * to ASCII and match it against the injected records' family names (+0x10). On a hit, overwrite *out
+ * with that record's own packed code (fontcode<<16) and return "found". Now every injected NAME resolves
+ * to its OWN display code on every render and every reload: the resolver renders the right family,
+ * multiple injected faces coexist (distinct codes), and it survives save/reload. Population of the
+ * base by_name (r5_fontres_add_members) was never consulted here because this path is a bsearch over the
+ * record TABLE, not a by_name walk — so this entry hook is the correct, targeted intercept. */
+static int (*r5_name_to_code_orig)(void *, int *, unsigned);
+
+/* UTF-16LE name -> ASCII (bounded, fault-free). Returns length, or -1 if unreadable. */
+static int r5_u16_to_ascii(const void *name_u16, char *out, int outsz) {
+    const unsigned short *u = (const unsigned short *)name_u16;
+    int n = 0;
+    if (!u) return -1;
+    while (n < outsz - 1) {
+        unsigned short w;
+        if (range_unmapped(u + n, 2)) break;
+        w = u[n];
+        if (!w) break;
+        out[n] = (w < 0x80) ? (char)w : '?';
+        n++;
+    }
+    out[n] = 0;
+    return n;
+}
+
+/* Match an ASCII name against the injected display records -> that record's packed code (fontcode<<16),
+ * or 0 if none. Exact (case-insensitive) first; then the longest injected family name that is a prefix
+ * of `name` at a space/end boundary (handles "Ubuntu Bold" -> "Ubuntu"). */
+static unsigned r5_injected_code_for_name(const char *name) {
+    uint32_t *arr; unsigned cnt, i; int best_len = -1, nlen; unsigned best_code = 0;
+    if (!name || !*name || r5_inj_base <= 0) return 0;
+    if (!r5s.fontrec_arr || !r5s.fontrec_cnt) return 0;
+    if (range_unmapped((void *)r5s.fontrec_arr, 4) || range_unmapped((void *)r5s.fontrec_cnt, 2)) return 0;
+    arr = *(uint32_t **)r5s.fontrec_arr;
+    cnt = *(unsigned short *)r5s.fontrec_cnt;
+    if (!arr || cnt > 8000 || cnt <= (unsigned)r5_inj_base) return 0;
+    nlen = (int)strlen(name);
+    for (i = (unsigned)r5_inj_base; i < cnt; i++) {         /* pass 1: exact */
+        unsigned char *rec = (unsigned char *)(uintptr_t)arr[i]; const char *rn;
+        if (!rec || range_unmapped(rec, 0x20)) continue;
+        rn = (const char *)(uintptr_t)(*(uint32_t *)(rec + 0x10));
+        if (!rn || range_unmapped(rn, 1)) continue;
+        if (!strcasecmp(name, rn)) return (unsigned)(*(unsigned short *)(rec + 0x06)) << 16;
+    }
+    for (i = (unsigned)r5_inj_base; i < cnt; i++) {         /* pass 2: longest boundary prefix */
+        unsigned char *rec = (unsigned char *)(uintptr_t)arr[i]; const char *rn; int rl;
+        if (!rec || range_unmapped(rec, 0x20)) continue;
+        rn = (const char *)(uintptr_t)(*(uint32_t *)(rec + 0x10));
+        if (!rn || range_unmapped(rn, 1)) continue;
+        rl = (int)strlen(rn);
+        if (rl < 1 || rl > nlen || rl <= best_len) continue;
+        if (strncasecmp(name, rn, (size_t)rl) == 0 && (name[rl] == 0 || name[rl] == ' ')) {
+            best_len = rl; best_code = (unsigned)(*(unsigned short *)(rec + 0x06)) << 16;
+        }
+    }
+    return best_code;
+}
+
+int retro5_name_to_code(void *name_u16, int *out_code, unsigned param_3) {
+    int r = r5_name_to_code_orig ? r5_name_to_code_orig(name_u16, out_code, param_3) : 0;
+    if (r == 0 && r5_allfonts && r5_inj_base > 0 && out_code && !range_unmapped(out_code, 4)) {
+        char asc[128];
+        if (r5_u16_to_ascii(name_u16, asc, (int)sizeof asc) > 0) {
+            unsigned code = r5_injected_code_for_name(asc);
+            if (code) {
+                *out_code = (int)code;
+                if (r5_trace) { char b[160]; int k = snprintf(b, sizeof b,
+                    "retro5: \xc2\xa7""17.1 name->code RESCUE '%s' -> 0x%x (was collapsed)\n",
+                    asc, (code >> 16) & 0xfff); if (k > 0) write(2, b, (size_t)k); }
+                return 1;
+            }
+        }
+    }
+    return r;
+}
+static void r5_install_name_to_code_hook(void) {
+    static const unsigned char g[] = {0x55,0x89,0xe5,0x81,0xec,0xc0,0x00,0x00,0x00};
+    if (!(r5_docfont || r5_docfont81) || !r5_allfonts || !r5s.name_to_code_va) return;
+    if (range_unmapped((void *)r5s.name_to_code_va, sizeof g)
+        || memcmp((void *)r5s.name_to_code_va, g, sizeof g)) return;
+    r5_name_to_code_orig = (int (*)(void *, int *, unsigned))
+                           r5_make_trampoline(r5s.name_to_code_va, 9);
+    if (r5_name_to_code_orig)
+        patch_entry(r5s.name_to_code_va, (const char *)g, sizeof g, (void *)retro5_name_to_code);
+}
+
 
 /* Font-selector takeover (RETRO5_ALLFONTS): the F9 "Font Face" list builder shows an entry only if
  * record+0x1e == 0 (a printer-available-vs-display-only category byte). Normal mode leaves only the
@@ -3778,6 +3954,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.fontcoll_build_va = 0x0852acd0;                  /* printer-font collection builder (pickers) */
     r5s.fontset_va = 0x080be820;                         /* font-set command handler (pre-collapse code) */
     r5s.font_state_ptr = 0x08812f74;                     /* -> font-state object; +0x98 = active packed code */
+    r5s.name_to_code_va = 0x085b7a20;                    /* §17.1 base-space name->code resolver (bsearch) */
     /* printer subsystem (RETRO5_CUPS) — FONT-RENDERING-MAP §15/§19 */
     r5s.printer_scan_va  = 0x0852cb40;
     r5s.printer_rich_arr = 0x08803140; r5s.printer_rich_cnt = 0x08803144;
@@ -3802,6 +3979,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_install_collection_injection();
     r5_install_resolver_hook();
     r5_install_fontset_hook();          /* capture injected pick -> resolver renders it (interim; §17.1 = full) */
+    r5_install_name_to_code_hook();     /* §17.1 REAL FIX: injected NAME->own code on render + reload */
     /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
      * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
      * interactive print path, so bypassing its spawn was both unnecessary and the cause of the
@@ -4067,6 +4245,7 @@ static void findBinaryFixes(void) {
       if (d && *d) { int v = atoi(d); r5_docfont = v <= 0 ? 0 : (v >= 2 ? 2 : 1); } }
     { const char *e = getenv("RETRO5_DOCFONT81"); if (e && *e && e[0] != '0') r5_docfont81 = 1; }  /* EXPERIMENTAL 8.1 canvas */
     { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
+    { const char *e = getenv("RETRO5_MEMBERS");   if (e && *e) r5_member_limit = atoi(e); }        /* §17.1 de-risk: cap appended member faces (0 = all) */
     { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */

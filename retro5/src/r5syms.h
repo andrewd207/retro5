@@ -62,16 +62,15 @@ typedef struct {
     uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
     uintptr_t fontcoll_build_va;  /* printer-font COLLECTION builder (detour: append system faces)  */
     /* ---- injected-font SELECTION survival (8.0; 0 on 8.1) --------------------------------------
-     * WP collapses a picked display face that is NOT a member of the active printer's font resource to
-     * the printer default BEFORE storing it, so every injected-only family (Ubuntu, Noto…) renders as
-     * that default. The clean "keep the injected code" fix (interpose the membership gate 0x08417900)
-     * CRASHES — WP's downstream name lookup then strlens a null name from the printer name pool, which
-     * also lacks injected faces; a full fix needs printer-resource + name-pool membership (§17.1). So we
-     * capture the pick one step upstream instead: fontset_va is the font-set command handler that
-     * receives the chosen 12-bit code PRE-substitution; hooking it lets us remember which injected family
-     * was picked (see retro5_fontset), and font_state_ptr -> the live font-state object (+0x98 = active
-     * packed code) lets the resolver render that family for the substituted runs. See §17.2 + names.txt. */
-    uintptr_t fontset_va;         /* font-set command handler (op 0xbf), pre-substitution requested code */
+     * WP collapses a picked face that is NOT a member of the active printer's font resource to the
+     * printer default BEFORE storing it. Keeping the injected code (forcing the membership gate
+     * 0x08417900) is not viable alone — WP then faults dereferencing the missing printer-font entry
+     * (NULL name strlen, then a memcpy from the packed name block 0x08812f80 at an offset injected faces
+     * lack); the real fix needs first-class printer-resource membership (§17.1). So we capture the pick
+     * at fontset_va (the font-set command handler, which sees the chosen code pre-collapse) and render
+     * that family via the resolver. font_state_ptr (+0x98 = active packed code) is kept for reference.
+     * See FONT-RENDERING-MAP §17.2 + names.txt (Xvfb :160 RE). */
+    uintptr_t fontset_va;         /* font-set command handler (op 0xbf), pre-collapse requested code */
     uintptr_t font_state_ptr;     /* -> current font-state object; +0x98 = active packed 12-bit font code */
     /* printer subsystem takeover (RETRO5_CUPS) — see FONT-RENDERING-MAP §15/§19. */
     uintptr_t printer_scan_va;    /* printer-list scan-core: int(void *ctx, int category) cdecl     */
@@ -118,6 +117,14 @@ typedef struct {
     void    (*real_removegrab)(Widget);
     void    (*real_managechild)(Widget);
     void    (*real_managechildren)(WidgetList, Cardinal);
+
+    /* ---- §17.1 REAL FIX: base-space NAME->code resolver (8.0; 0 on 8.1) -------------------------
+     * FUN_085b7a20 converts a stored font NAME to a 12-bit display code by bsearch()ing the display
+     * record table (fontrec_arr / fontrec_snap) — which is sorted by name. retro5 appends injected
+     * records unsorted at the end, so bsearch misses them and the name collapses to the printer
+     * default; hooked to rescue injected names to their own display code (render + save/reload).
+     * MUST STAY LAST (appending mid-struct shifts the Xt fn-ptr region and kills 8.0 startup). */
+    uintptr_t name_to_code_va;    /* base-space name->code resolver entry (8.0 0x085b7a20)          */
 } R5Syms;
 
 extern R5Syms r5s;                /* the one instance (def in r5core.c / patch5.c pre-split) */

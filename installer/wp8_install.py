@@ -1337,12 +1337,15 @@ export RETRO5_WPEXC_ID=$$
 # active settings obvious for debugging.
 # RETRO5_DOCFONT : 0 = WP's own 1-bit text; 1 = cairo-render the document canvas;
 #                  2 = also cairo-render the UI chrome (status bar + Font preview).
-# RETRO5_ALLFONTS: 1 = unfilter the font selector + merge system (fontconfig) fonts (WIP).
+# RETRO5_ALLFONTS: 1 = unfilter the font selector + merge system (fontconfig) fonts, and make an
+#                  injected face fully usable (renders, coexists, survives save/reload) via the
+#                  base name->code hook (§17.1). Default ON for 8.0 (verified); OFF for 8.1 until
+#                  the 8.1 name->code address is wired (there it would list fonts but re-collapse).
 # RETRO5_CUPS    : 1 = route printing through CUPS (printertocups.so) instead of xwpdest (WIP).
 # RETRO5_EWMH    : 1 = stamp _NET_WM hints (PID, client-machine, window-type) on WP's Motif
 #                  toplevels so modern window managers handle them properly (8.0; 8.1 no-op WIP).
 : "${{RETRO5_DOCFONT:=2}}";  export RETRO5_DOCFONT
-: "${{RETRO5_ALLFONTS:=0}}"; export RETRO5_ALLFONTS
+: "${{RETRO5_ALLFONTS:={allfonts}}}"; export RETRO5_ALLFONTS
 : "${{RETRO5_CUPS:=0}}";     export RETRO5_CUPS
 : "${{RETRO5_EWMH:=1}}";     export RETRO5_EWMH
 # RETRO5_PRINTER_ADMIN : command launched when WP's "Printer Control"/"Printer Create-Edit" actions
@@ -1408,8 +1411,12 @@ exec "$ROOT/wpbin/xwp" -fontSize "${{WPFONTSIZE:-17}}" "$@"
         if getattr(self, "_reskin_active", False) and getattr(self, "_reskin_preload", None):
             preload = ('# modern Motif reskin (retroXt); its MD5 guard no-ops on any other binary\n'
                        f'export LD_PRELOAD="$ROOT/shbin10/{self._reskin_preload}"\n')
+        # Injected-font usability (§17.1) is verified on 8.0; on 8.1 the base name->code
+        # hook isn't wired yet, so default it ON only for 8.0 (8.1 would re-collapse).
+        allfonts = "1" if self.version == "8.0" else "0"
         lp = bindir / f"xwp{vsuffix}"
-        lp.write_text(self.LAUNCHER.format(root=self.target, ldlib=ldlib, preload=preload))
+        lp.write_text(self.LAUNCHER.format(root=self.target, ldlib=ldlib, preload=preload,
+                                           allfonts=allfonts))
         os.chmod(lp, 0o755)
         self.launcher_path = lp
         out.append(f"launcher: {lp}")
