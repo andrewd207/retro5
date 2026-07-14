@@ -3041,18 +3041,69 @@ static double r5_ftadvance_em(const char *path, int idx, unsigned char ch) {
  * draw path consumes (line_render_dispatch -> ... -> draw_text_run param_5), so overriding the slot here
  * fixes on-screen pen (= our cairo glyph position) AND print together.
  *
- * We run WP's body, then if the current run is an injected TTF and WP actually appended a width slot
- * (index advanced by exactly one — skip line-flush/reset boundaries) for a single-byte Latin char in a
- * real document run, overwrite that slot with the REAL FT advance:
- *   width_1200 = round(em_fraction * r5_doc_pixsize() * 1200/96).
- * Non-injected / multi-byte / chrome (r5_doc_pixsize()==0) / not-measurable -> leave WP's value.
+ * We run WP's body, then if WP actually appended a width slot (index advanced by exactly one — skip
+ * line-flush/reset boundaries) for a single-byte Latin char, overwrite that slot with the REAL FT advance:
+ *   width_1200 = round(em_fraction * pixsize * 1200/96).
+ *
+ * WHY the naive "gate on r5_cur_injected + r5_doc_pixsize()" TOGGLED across insert/delete (proven live,
+ * gdb Xvfb :208, FreeSans 32pt 'O'): this detour fires on BOTH the keystroke/INSERT reformat AND the
+ * BACKSPACE/DELETE reformat, but the retro5 current-font globals are only fresh on INSERT. On INSERT the
+ * font resolver has just run for the typed char, so r5_cur_path is the real injected .ttf
+ * (…/FreeSans.ttf) and font_ctx is a live doc run (r5_doc_pixsize()>0) -> slot=418 (real). On DELETE the
+ * resolver does NOT re-run; the font-PREVIEW chrome (combo showing the WP substitute) has meanwhile
+ * clobbered r5_cur_path to the substitute .pfb (…/c0648bt_.pfb "Bitstream Charter") AND font_ctx to
+ * chrome (r5_doc_pixsize()==0) -> the naive gate no-ops -> WP's own placeholder (390) survives, so the
+ * whole line's widths, wrap and caret revert. FIX: key a tiny per-run cache on WP's OWN reformat font
+ * record (reformat_ctx+0x190 — distinct per font run, identical across insert/delete of that run, and
+ * immune to the chrome clobber). On the INSERT path (globals trustworthy) remember {path,idx,pixsize};
+ * on the DELETE path recover them from that cache so the override lands the real advance every time.
+ * (Hooking the innermost width leaf charwidth_lookup_lo/_hi 0x0837e6b0/0x0837e2d0 was rejected: it needs
+ * the same font identity + point-size, both of which are ALSO only cleanly available here, and neither is
+ * present as a clean field in the leaf's font-resource record — verified by decompile + live gdb.)
+ * Non-injected / multi-byte / never-seen-a-good-run / not-measurable -> leave WP's authentic value.
  * cdecl (int reformat_ctx, int char16); both forwarded to the trampoline (which runs WP's original). */
 #define R5_REFORMAT_WIDX 0x087a21d6u                 /* u16 line width-array index (chars appended so far) */
 #define R5_REFORMAT_WBUF 0x087fe9b8u                 /* u16[] line width array (WP design units, 1/1200 in) */
+#define R5_REFORMAT_RECOFF 0x190                     /* reformat_ctx + 0x190 = per-run font-record ptr (stable key) */
 static void (*r5_reformat_orig)(int, int);
+
+/* A path is a REAL injected scalable face (FreeType outline) vs the WP Type1 substitute (.pfb/.pfa) the
+ * preview chrome leaves in r5_cur_path. The substitute must never be treated as the run's true face. */
+static int r5_is_scalable_face(const char *p) {
+    size_t n = p ? strlen(p) : 0;
+    if (n < 4) return 0;
+    if (strcasecmp(p + n - 4, ".pfb") == 0 || strcasecmp(p + n - 4, ".pfa") == 0) return 0;
+    return 1;
+}
+
+/* Per-document-font-run recovery cache (see block comment above). Keyed by WP's reformat font record. */
+static struct { unsigned key; int idx; double px; char path[512]; } r5_ftm_run[16];
+static int r5_ftm_run_n;
+static void r5_ftm_run_put(unsigned key, const char *path, int idx, double px) {
+    int i;
+    if (!key || !path || !path[0]) return;
+    for (i = 0; i < r5_ftm_run_n; i++) if (r5_ftm_run[i].key == key) break;
+    if (i == r5_ftm_run_n) {
+        if (r5_ftm_run_n < (int)(sizeof r5_ftm_run / sizeof r5_ftm_run[0])) r5_ftm_run_n++;
+        else i = 0;                                  /* ring-evict oldest */
+    }
+    r5_ftm_run[i].key = key; r5_ftm_run[i].idx = idx; r5_ftm_run[i].px = px;
+    strncpy(r5_ftm_run[i].path, path, sizeof r5_ftm_run[i].path - 1);
+    r5_ftm_run[i].path[sizeof r5_ftm_run[i].path - 1] = 0;
+}
+static int r5_ftm_run_get(unsigned key, const char **path, int *idx, double *px) {
+    int i;
+    if (!key) return 0;
+    for (i = 0; i < r5_ftm_run_n; i++) if (r5_ftm_run[i].key == key) {
+        *path = r5_ftm_run[i].path; *idx = r5_ftm_run[i].idx; *px = r5_ftm_run[i].px; return 1;
+    }
+    return 0;
+}
+
 void retro5_reformat_char(int p1, int ch) {          /* non-static: patched target */
     unsigned short idx0, idx1; unsigned c; double em, sz; long w;
-    if (!r5_ftmetrics || !r5_cur_injected || !r5_cur_path[0]) { r5_reformat_orig(p1, ch); return; }
+    unsigned key; const char *path; int idx;
+    if (!r5_ftmetrics) { r5_reformat_orig(p1, ch); return; }
     r5_ftm_calls++;                                                             /* DIAG */
     idx0 = *(volatile unsigned short *)(uintptr_t)R5_REFORMAT_WIDX;
     r5_reformat_orig(p1, ch);                                                    /* WP writes width + bumps idx */
@@ -3061,9 +3112,19 @@ void retro5_reformat_char(int p1, int ch) {          /* non-static: patched targ
     r5_ftm_calls_inj++;                                                         /* DIAG */
     c = (unsigned)(ch & 0xffff);
     if (c > 0xff) return;                                                        /* multi-byte -> leave WP's */
+    /* Per-run key = WP's own font record for this reformat (survives the chrome clobber; unique/font). */
+    key = (p1 && !range_unmapped((void *)(uintptr_t)(p1 + R5_REFORMAT_RECOFF), 4))
+        ? *(unsigned *)(uintptr_t)(p1 + R5_REFORMAT_RECOFF) : 0;
     sz = r5_doc_pixsize();                                                       /* 0 unless a real doc run */
-    if (sz <= 0) return;
-    em = r5_ftadvance_em(r5_cur_path, r5_cur_idx, (unsigned char)c);
+    if (r5_cur_injected && r5_is_scalable_face(r5_cur_path) && sz > 0) {
+        /* INSERT path: resolver-fresh injected face + live doc run. Use them and remember for DELETE. */
+        path = r5_cur_path; idx = r5_cur_idx;
+        r5_ftm_run_put(key, r5_cur_path, r5_cur_idx, sz);
+    } else {
+        /* DELETE / chrome-clobbered path: recover the run's real face + point-size from the cache. */
+        if (!r5_ftm_run_get(key, &path, &idx, &sz)) return;                     /* no good run seen -> leave WP's */
+    }
+    em = r5_ftadvance_em(path, idx, (unsigned char)c);
     if (em < 0) return;                                                          /* not measurable -> leave WP's */
     w = (long)(em * sz * (1200.0 / 96.0) + 0.5);                                 /* em-fraction -> WP design units */
     if (w < 0) w = 0;
