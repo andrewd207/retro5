@@ -3440,8 +3440,8 @@ static void r5_fontres_add_members(void) {
 
     for (i = (unsigned)r5_inj_base; i < reccnt; i++) {
         unsigned char *rec = (unsigned char *)(uintptr_t)arr[i];
-        const char *name; unsigned short code, code_index, out[2]; unsigned short u16[128];
-        int j, entry_idx; unsigned short blen;
+        const char *name; unsigned short code, code_index, out[2]; unsigned short u16[160];
+        int entry_idx; unsigned short blen;
         if (r5_member_limit && added >= r5_member_limit) break;
         if (!rec || range_unmapped(rec, 0x20)) break;
         code       = *(unsigned short *)(rec + 0x06);
@@ -3450,10 +3450,25 @@ static void r5_fontres_add_members(void) {
         if (!name || range_unmapped(name, 1) || !name[0]) break;
         /* per-face alignment: the append must land exactly at code_index */
         if (code_index != r5_ctr_count(codemap)) break;
-        /* ASCII family -> UTF-16LE (WP names are 16-bit); NUL-terminated. */
-        for (j = 0; j < 126 && name[j]; j++) u16[j] = (unsigned char)name[j];
-        u16[j] = 0;
-        blen = (unsigned short)((j + 1) * 2);            /* bytes incl. terminator (== utf16len+2) */
+        /* A WP face name is stored in the pool as a blob of FOUR consecutive UTF-16LE NUL-terminated
+         * strings: the interner (printer_fontset_face_add 0x08416b10) measures the blob with FOUR
+         * utf16_strlen probes before namepool_add, and BOTH the reveal-codes reader (0x0841e4f0) and
+         * the property-bar name formatter (0x0841d040) walk all four the same way — copying the whole
+         * blob. In a genuine face only string 1 is the display name; strings 2-4 are EMPTY (a bare
+         * NUL each). Our §17.1 append had interned a SINGLE string + NUL: the readers then walked PAST
+         * our lone terminator into the ADJACENT pool record (over-read garble "Ubuntu Sans $Noto Serif
+         * CJK TC" — the '$'=0x24 was literally the next record's byte_len). Interning FOUR copies fixed
+         * the over-read but the property bar renders str1+str2 -> a DOUBLED name ("Garuda Garuda").
+         * The correct layout is str1 = family, strings 2-4 empty: the readers find every terminator
+         * they expect (no over-read) and the display shows the single clean name (no doubling).
+         * blen = (len+1)*2 + 2*3, bounded by the pool's 0xfc-byte cap (namepool_add: byte_len < 0xfd).
+         * Render is unaffected (it reads the full ASCII name at rec+0x10, not the pool). */
+        { int m; unsigned short *w = u16;
+          for (m = 0; m < 120 && name[m]; m++) *w++ = (unsigned char)name[m];
+          *w++ = 0;                                       /* str1 = family name, NUL-terminated  */
+          *w++ = 0; *w++ = 0; *w++ = 0;                   /* str2/str3/str4 = empty (bare NULs)   */
+          blen = (unsigned short)((w - u16) * 2);         /* bytes incl. all four terminators     */
+        }
         if (!R5_NAMEPOOL_ADD(u16, blen, out, 1)) break;
         /* append the metric entry, then the codemap entry that points at it */
         if (!R5_RES_APPEND(entries, fe)) break;
