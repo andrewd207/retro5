@@ -2651,20 +2651,31 @@ void *r5_make_trampoline(uintptr_t va, unsigned keep) {   /* non-static: takeove
  * and read its +0x10. That face string maps to a fontconfig generic (Serif/Sans/Monospace) so the
  * SYSTEM font engine supplies the real face; slant/weight are derived from the name. Cached by the
  * glyph-table value (the "current font" changes only when WP switches face/size/attr). */
-/* Constant device-pixel size for the whole run, from the font context ([0x08808798]->+0x04 high
- * word). Confirmed live: 12pt at the 100 resolution divisor -> 16 px, one value per font (so glyph
- * size no longer wobbles with each glyph's ink-box height). Returns 0 when there is NO reliable run
- * size: draw_text_run also renders the status bar / chrome, where the context size reads 0 — for
- * those we must NOT guess from the ink-box height (that is the size-wobble), so we return 0 and the
- * caller falls back to WP's own crisp 1-bit blit. RETRO5_DOCFONT_PX overrides. */
+/* Constant device-pixel size for the whole run, from the font context at [0x08808798] (8.0) /
+ * [0x08828204] (8.1). The context has TWO relevant words:
+ *   +0x00 high word = selected POINT SIZE * 50 (the scaled size — this is what tracks 12/25/46 pt).
+ *          Confirmed live on 8.0: 12pt->600, 25pt->1250, 46pt->2300 (exactly ptsize*50). WP's own
+ *          metric provider (font_metric_provider, width*ptsize/3600) draws its bitmap and advances
+ *          from THIS, so sizing cairo by it makes the glyph match WP's ink box + pen advance.
+ *   +0x04 high word = a fixed device marker (==16 for document runs; 0 for the status-bar / chrome
+ *          runs the same engine draws). We use it ONLY to tell doc runs from chrome — it does NOT
+ *          scale with point size, which is why the old code (which SIZED by it) drew every size at
+ *          the 12pt raster: tiny glyphs, correct spacing.
+ * device px = (+0x00 hi) / 37.5  ==  ptsize * 96/72  (96 dpi). Anchored so 12pt (600) -> 16 px,
+ * matching the previously-confirmed 12pt calibration exactly; 46pt -> 61.3 px, etc.
+ * Returns 0 when there is NO reliable run size (chrome: +0x04 hi not a doc marker) so the caller
+ * falls back to WP's own 1-bit blit / the DOCFONT=2 ink-box lock. RETRO5_DOCFONT_PX overrides. */
 static double r5_doc_pixsize(void) {
-    unsigned ctx, sz;
+    unsigned ctx, marker; double px;
     if (r5_doc_px > 0) return r5_doc_px;
     if (r5s.font_ctx && !range_unmapped((void *)r5s.font_ctx, 4)) {
         ctx = *(unsigned *)r5s.font_ctx;
-        if (ctx && !range_unmapped((void *)(uintptr_t)(ctx + 4), 4)) {
-            sz = (*(unsigned *)(uintptr_t)(ctx + 4)) >> 16;
-            if (sz >= 4 && sz <= 400) return (double)sz;
+        if (ctx && !range_unmapped((void *)(uintptr_t)ctx, 8)) {
+            marker = (*(unsigned *)(uintptr_t)(ctx + 4)) >> 16;         /* doc-run marker (16); 0=chrome */
+            if (marker >= 4 && marker <= 400) {                        /* a real document run */
+                px = (double)((*(unsigned *)(uintptr_t)ctx) >> 16) / 37.5;  /* ptsize*50 -> device px */
+                if (px >= 4 && px <= 400) return px;
+            }
         }
     }
     return 0.0;                                          /* no doc run size -> let WP draw it */
