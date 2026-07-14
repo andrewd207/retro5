@@ -2507,6 +2507,84 @@ static int r5_p2c_load(void) {
  * the spooler's PostScript and its suppression of the real `lpr` without duplicating the env parse. */
 int r5_cups_enabled(void) { return r5_cups; }
 
+/* RETRO5_PRINT_PDF: convert the captured PostScript to a font-embedded PDF (via Ghostscript) before
+ * spooling to CUPS. Default ON when CUPS routing is on; only an explicit "0" turns it off. Cached. */
+static int r5_print_pdf_enabled(void) {
+    static int v = -1;
+    if (v == -1) { const char *e = getenv("RETRO5_PRINT_PDF"); v = (e && e[0] == '0' && e[1] == 0) ? 0 : 1; }
+    return v;
+}
+
+extern int fork(void);
+extern int execv(const char *, char *const *);
+extern int waitpid(int, int *, int);
+extern void _exit(int);
+extern int unlink(const char *);
+
+/* Convert captured PostScript (ps/len) to a PDF with every font embedded, using Ghostscript.
+ *
+ * CRITICAL ordering: this runs in wppx BEFORE r5_p2c_load() starts any printertocups worker thread,
+ * so the fork+exec below happens while this process is still single-threaded — no libcups/glibc lock
+ * can be held across the fork, so gs cannot deadlock the child. (Forking AFTER the workers exist is
+ * the documented hazard; hence the caller invokes us first.)
+ *
+ * Returns a malloc'd PDF buffer (caller frees) with *outlen set, or NULL on ANY failure (gs missing,
+ * nonzero/failed run, or output that is not a real PDF) so the caller falls back to spooling the raw
+ * PS and never loses the job. The intermediate /tmp/r5_out_<pid>.pdf is KEPT under RETRO5_TRACE for
+ * inspection; otherwise both temps are unlinked before we return.
+ *
+ * Font handling (see STEP 1 findings): WP's spooler does NOT reference user fonts by name for the
+ * interpreter to supply — it rasterises each glyph itself into an inline Type 3 bitmap font and only
+ * the base-14 faces (Courier/Helvetica/Times) travel as named NeededFonts. So EmbedAllFonts makes the
+ * PDF fully self-contained, and -sFONTPATH lets gs resolve those base-14 names to system TTFs where
+ * possible; the user's picked face is preserved by NAME + as baked bitmaps, not as scalable outlines
+ * (recovering true TTF outlines would require overriding wppx's font emission — out of scope here). */
+static void *r5_ps_to_pdf(const void *ps, unsigned len, unsigned *outlen) {
+    char inps[64], outpdf[64], ofarg[96];
+    int pid = (int)getpid(), child, status = 0;
+    FILE *f;
+    unsigned char *pdf; size_t plen = 0;
+
+    *outlen = 0;
+    snprintf(inps,   sizeof inps,   "/tmp/r5_in_%d.ps",   pid);
+    snprintf(outpdf, sizeof outpdf, "/tmp/r5_out_%d.pdf",  pid);
+    snprintf(ofarg,  sizeof ofarg,  "-sOutputFile=%s",     outpdf);
+
+    /* 1. spill the in-memory PS to a temp file gs can read */
+    if (!(f = fopen(inps, "wb"))) return 0;
+    if (fwrite(ps, 1, len, f) != len) { fclose(f); unlink(inps); return 0; }
+    fclose(f);
+
+    /* 2. fork+exec gs (quiet; on success it writes only to the -sOutputFile, nothing to stdout, and
+     *    any error text on stderr lands in the trace log). */
+    child = fork();
+    if (child < 0) { unlink(inps); return 0; }
+    if (child == 0) {
+        char *argv[] = {
+            (char *)"/usr/bin/gs", (char *)"-q", (char *)"-dBATCH", (char *)"-dNOPAUSE",
+            (char *)"-dSAFER", (char *)"-sDEVICE=pdfwrite",
+            (char *)"-dEmbedAllFonts=true", (char *)"-dSubsetFonts=true",
+            (char *)"-dCompatibilityLevel=1.4", (char *)"-sFONTPATH=/usr/share/fonts",
+            ofarg, inps, 0
+        };
+        execv("/usr/bin/gs", argv);
+        _exit(127);                                   /* gs not found -> caller falls back to PS */
+    }
+    if (waitpid(child, &status, 0) < 0) { unlink(inps); unlink(outpdf); return 0; }
+    unlink(inps);                                     /* input temp no longer needed */
+
+    /* 3. read the PDF back; success == a non-empty file whose header is really "%PDF-". */
+    pdf = r5_read_file(outpdf, &plen);
+    if (!r5_trace) unlink(outpdf);                    /* keep under trace, else drop */
+    if (!pdf) return 0;
+    if (plen < 5 || pdf[0] != '%' || pdf[1] != 'P' || pdf[2] != 'D' || pdf[3] != 'F' || pdf[4] != '-') {
+        free(pdf);
+        return 0;                                     /* gs produced garbage/empty -> fall back to PS */
+    }
+    *outlen = (unsigned)plen;
+    return pdf;
+}
+
 /* Route ONE finished print job to CUPS instead of the legacy `lpr`. Called from the system()/execvp()
  * interpose in forward.c the moment wppx tries to spool `/tmp/_pp_<pid>_1` to <dest>. `ps`/`len` is
  * the captured `%!PS-Adobe` body. Returns 1 if we handled it (caller MUST then suppress the real lpr),
@@ -2517,18 +2595,37 @@ int r5_cups_enabled(void) { return r5_cups; }
  * before we return); if the bridge lacks wait_idle we fall back to shutdown(), which also drains. */
 int r5_cups_spool(const char *dest, const void *ps, unsigned len) {
     long job;
-    if (!r5_cups) return 0;                       /* gate off -> caller runs the real lpr */
-    if (!r5_p2c_load()) return 0;                 /* backend unavailable -> fall back to lpr */
-    job = r5p2c.submit((dest && *dest) ? dest : 0, "WordPerfect", "application/postscript",
-                       ps, (size_t)len, 0, 0);
+    const void *body = ps;                        /* what we actually submit... */
+    unsigned     blen = len;
+    const char  *fmt  = "application/postscript";  /* ...and its MIME type (PS by default) */
+    void        *pdf  = 0;
+    unsigned     pdflen = 0;
+    if (!r5_cups) return 0;                        /* gate off -> caller runs the real lpr */
+
+    /* PS -> font-embedded PDF, done HERE (before r5_p2c_load spins up worker threads, so the gs
+     * fork+exec is deadlock-free — see r5_ps_to_pdf). On any failure we keep the original PS. */
+    if (r5_print_pdf_enabled()) {
+        pdf = r5_ps_to_pdf(ps, len, &pdflen);
+        if (pdf) { body = pdf; blen = pdflen; fmt = "application/pdf"; }
+        if (r5_trace) {
+            char b[220]; int n = snprintf(b, sizeof b,
+                "retro5: print PS %u bytes -> PDF %u bytes (gs), embedded=%s -> submit as %s\n",
+                len, pdflen, pdf ? "yes" : "no (gs failed; PS fallback)", fmt);
+            if (n > 0) write(2, b, (size_t)n);
+        }
+    }
+
+    if (!r5_p2c_load()) { if (pdf) free(pdf); return 0; }  /* backend gone -> fall back to lpr */
+    job = r5p2c.submit((dest && *dest) ? dest : 0, "WordPerfect", fmt, body, (size_t)blen, 0, 0);
     if (r5p2c.wait_idle) r5p2c.wait_idle(-1);     /* drain before wppx exits */
     else                 r5p2c.shutdown();        /* older bridge: shutdown() also drains + joins */
     if (r5_trace) {
         char b[160]; int n = snprintf(b, sizeof b,
-            "retro5: p2c_submit dest=%s len=%u job=%ld (drained)\n",
-            (dest && *dest) ? dest : "(default)", len, job);
+            "retro5: p2c_submit dest=%s fmt=%s len=%u job=%ld (drained)\n",
+            (dest && *dest) ? dest : "(default)", fmt, blen, job);
         if (n > 0) write(2, b, (size_t)n);
     }
+    if (pdf) free(pdf);
     return 1;                                     /* handled: suppress the legacy lpr */
 }
 
