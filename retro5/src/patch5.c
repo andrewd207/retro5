@@ -854,6 +854,12 @@ static struct {
     int (*img_w)(cairo_surface_t *);
     int (*img_h)(cairo_surface_t *);
     cairo_status_t (*surface_status)(cairo_surface_t *);
+    /* cairo-FreeType face binding (Phase A: bind injected faces by their real .ttf, bypassing
+     * fontconfig name-matching). OPTIONAL — a miss only disables true-TTF face binding, never text. */
+    int ftface_ok;
+    void *(*ft_font_face_create)(void *ftface, int load_flags);   /* cairo_ft_font_face_create_for_ft_face */
+    void  (*set_font_face)(cairo_t *, void *face);                 /* cairo_set_font_face */
+    void  (*font_face_destroy)(void *face);                       /* cairo_font_face_destroy */
 } cz;
 
 /* Non-blocking check used by the draw/measure hot path: is cairo ready to use? We NEVER dlopen from
@@ -899,6 +905,13 @@ static int r5_cairo_load(void) {
 #undef CZ2
     cz.icons_ok = (cz.paint && cz.set_source_surface && cz.scale && cz.translate && cz.save &&
                    cz.restore && cz.png_create && cz.img_w && cz.img_h && cz.surface_status);
+    /* cairo-FreeType binding (Phase A). All three must be present to bind a face by its real .ttf. */
+#define CZ3(m, s) (*(void **)&cz.m = dlsym(h, s))
+    CZ3(ft_font_face_create, "cairo_ft_font_face_create_for_ft_face");
+    CZ3(set_font_face,       "cairo_set_font_face");
+    CZ3(font_face_destroy,   "cairo_font_face_destroy");
+#undef CZ3
+    cz.ftface_ok = (cz.ft_font_face_create && cz.set_font_face && cz.font_face_destroy);
     cz.ready = 1;
     return 1;
 }
@@ -2417,6 +2430,18 @@ static int r5_fontcoll;                                  /* RETRO5_FONTCOLL: app
                                                           * Defaults to ALLFONTS (set 0 to opt out). See
                                                           * r5_install_collection_injection — LIVE-VERIFIED
                                                           * working + teardown-safe (2026-07-13). */
+static int r5_ftface = 1;               /* RETRO5_FTFACE: bind injected faces by their real .ttf via cairo-FT
+                                         * (Phase A). Default ON; only ever active for an INJECTED face that
+                                         * has a stored path, so stock/WP fonts are untouched. 0 = off. */
+
+/* ---- Phase A: injected-face -> real .ttf side table -----------------------------------------------
+ * HARD CONSTRAINT: the font FILE PATH lives ONLY here (retro5-side), keyed by the injected family. It is
+ * NEVER written into the WP record / name pool / document — the .wpd still stores the portable font NAME.
+ * r5_fc_enumerate fills r5_fcpath[i]/r5_fcidx[i] alongside r5_fcfam[i] (same index) from fontconfig's
+ * FC_FILE / FC_INDEX. The resolver hook resolves the current run's family -> (path,index) into
+ * r5_cur_path/r5_cur_idx (once per font switch, not per glyph); r5_doc_render_glyph binds that exact face. */
+static char r5_cur_path[1024];          /* current run's injected face .ttf path, or "" (stock/WP) */
+static int  r5_cur_idx;                 /* current run's face index within the .ttf collection */
 
 /* Per-build symbol/address table. Filled once at load time by the detected build's takeover
  * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
@@ -2839,6 +2864,59 @@ static int r5_utf8(unsigned cp, char *o) {                       /* encode cp ->
     o[2] = (char)(0x80 | (cp & 0x3F)); return 3;
 }
 
+/* ---- Phase A: FreeType face binding (bind an injected face by its real .ttf) --------------------
+ * cz.select_font_face(name) hands the family name to fontconfig, which — on a 32-bit WP with a stale
+ * cache — mis-resolves *Sans names to one fallback face (the "collapse"). Binding the exact .ttf via
+ * cairo-FT bypasses name-matching entirely: deterministic, cache-independent. FreeType lives in the
+ * process already (cairo depends on it); we resolve its 3 syms via dlopen(NOLOAD). The (FT_Face,
+ * cairo_font_face) pair is cached per (path,index) so we load each face once, not per glyph. */
+static struct {
+    int ready;                                          /* 0 unknown, 1 ok, -1 failed */
+    void *lib;                                          /* FT_Library */
+    int (*Init_FreeType)(void **);
+    int (*New_Face)(void *lib, const char *path, long idx, void **face);
+    int (*Done_Face)(void *face);
+} ftz;
+static int r5_ft_init(void) {
+    void *h;
+    if (ftz.ready) return ftz.ready > 0;
+    ftz.ready = -1;
+    if (!(h = dlopen("libfreetype.so.6", RTLD_NOLOAD | RTLD_NOW)))
+        h = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_DEEPBIND);
+    if (!h) return 0;
+    *(void **)&ftz.Init_FreeType = dlsym(h, "FT_Init_FreeType");
+    *(void **)&ftz.New_Face      = dlsym(h, "FT_New_Face");
+    *(void **)&ftz.Done_Face     = dlsym(h, "FT_Done_Face");
+    if (!ftz.Init_FreeType || !ftz.New_Face || !ftz.Done_Face) return 0;
+    if (ftz.Init_FreeType(&ftz.lib) != 0 || !ftz.lib) return 0;
+    ftz.ready = 1;
+    return 1;
+}
+/* (FT_Face, cairo_font_face) cache keyed by (path,index). Bounded; on overflow we stop caching new
+ * faces (existing bound ones keep working) rather than churn. Never freed — WP runs one process. */
+static struct { char path[256]; int idx; void *ftface; void *cface; } r5_facecache[128];
+static int r5_facecache_n;
+static void *r5_ftface_for(const char *path, int idx) {   /* -> cairo_font_face_t*, or NULL */
+    int i; void *ft = 0, *cf;
+    if (!path || !path[0] || !cz.ftface_ok) return 0;
+    for (i = 0; i < r5_facecache_n; i++)
+        if (r5_facecache[i].idx == idx && !strcmp(r5_facecache[i].path, path))
+            return r5_facecache[i].cface;
+    if (!r5_ft_init()) return 0;
+    if (ftz.New_Face(ftz.lib, path, (long)idx, &ft) != 0 || !ft) return 0;
+    cf = cz.ft_font_face_create(ft, 0);                 /* load_flags 0: use the face as-is */
+    if (!cf) { ftz.Done_Face(ft); return 0; }
+    if (r5_facecache_n < (int)(sizeof r5_facecache / sizeof r5_facecache[0])) {
+        strncpy(r5_facecache[r5_facecache_n].path, path, sizeof r5_facecache[0].path - 1);
+        r5_facecache[r5_facecache_n].path[sizeof r5_facecache[0].path - 1] = 0;
+        r5_facecache[r5_facecache_n].idx = idx;
+        r5_facecache[r5_facecache_n].ftface = ft;
+        r5_facecache[r5_facecache_n].cface = cf;
+        r5_facecache_n++;
+    }
+    return cf;
+}
+
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
  * set the device pen for this glyph in the globals: origin x = [R5_PEN_X], baseline y = [R5_PEN_Y]
  * (dst_x/dst_y in the blit are the ink box, offset by the glyph's bearings — using the pen origin +
@@ -2878,7 +2956,11 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
     s[r5_utf8(cp, s)] = 0;                               /* Unicode -> UTF-8 (cairo's show_text wants it) */
     r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
-    cz.select_font_face(cr, fam, slant, weight);
+    /* Phase A: for an injected face with a stored .ttf, bind that EXACT face (cache-independent);
+     * otherwise fall back to fontconfig name matching (stock/WP fonts, or if FT load fails). */
+    { void *cface = (r5_ftface && r5_cur_path[0]) ? r5_ftface_for(r5_cur_path, r5_cur_idx) : 0;
+      if (cface) cz.set_font_face(cr, cface);
+      else       cz.select_font_face(cr, fam, slant, weight); }
     cz.set_font_size(cr, sz);
     cz.set_source_rgb(cr, cr_, cg, cb);
     cz.move_to(cr, (double)penx, (double)peny);          /* pen origin x, baseline y */
@@ -3257,6 +3339,10 @@ static int  r5_inj_base;                             /* table count just before 
  * calls bind to glibc, not our libc5 shims. Best-effort: 0 families on any failure -> nothing injected. */
 static char r5_fcfam[2048][64];
 static int  r5_fcfam_n;
+/* Phase A side table (retro5-only): the real .ttf path + face index for r5_fcfam[i], captured from
+ * fontconfig FC_FILE/FC_INDEX at enumerate time. NEVER stored in any WP record/pool/document. */
+static char r5_fcpath[2048][256];
+static short r5_fcidx[2048];
 /* A family name WP can actually store & reproduce: its .wpd font storage is a legacy
  * codepage, not UTF-8, so names with non-ASCII bytes (CJK, many localized names) would be mangled.
  * Skip anything outside printable ASCII until/unless we do a two-way codepage conversion. */
@@ -3267,9 +3353,12 @@ static int r5_wp_storable_name(const char *s) {
 }
 static void r5_fc_enumerate(void) {
     void *h; void *(*FcInitLoadConfigAndFonts)(void); void *(*FcPatternCreate)(void);
-    void *(*FcObjectSetBuild)(const char *, void *); void *(*FcFontList)(void *, void *, void *);
+    void *(*FcObjectSetBuild)(const char *, ...);
+    void *(*FcFontList)(void *, void *, void *);
     int (*FcPatternGetString)(void *, const char *, int, unsigned char **);
+    int (*FcPatternGetInteger)(void *, const char *, int, int *);
     void *cfg, *pat, *os, *fs; int nfont, i, j;
+    static int fcbest[2048];                            /* per-family regularness score (lower = better) */
     unsigned char **fonts;
     if (r5_fcfam_n) return;                              /* once */
     h = dlopen("libfontconfig.so.1", RTLD_NOLOAD | RTLD_NOW);
@@ -3279,11 +3368,12 @@ static void r5_fc_enumerate(void) {
      * the whole library — not the partial current config cairo warmed (which showed only ~230). */
     FcInitLoadConfigAndFonts = (void *(*)(void))dlsym(h, "FcInitLoadConfigAndFonts");
     FcPatternCreate    = (void *(*)(void))dlsym(h, "FcPatternCreate");
-    FcObjectSetBuild   = (void *(*)(const char *, void *))dlsym(h, "FcObjectSetBuild");
+    FcObjectSetBuild   = (void *(*)(const char *, ...))dlsym(h, "FcObjectSetBuild");
     FcFontList         = (void *(*)(void *, void *, void *))dlsym(h, "FcFontList");
     FcPatternGetString = (int (*)(void *, const char *, int, unsigned char **))dlsym(h, "FcPatternGetString");
+    FcPatternGetInteger= (int (*)(void *, const char *, int, int *))dlsym(h, "FcPatternGetInteger");
     if (!FcInitLoadConfigAndFonts || !FcPatternCreate || !FcObjectSetBuild || !FcFontList
-        || !FcPatternGetString) return;
+        || !FcPatternGetString || !FcPatternGetInteger) return;
     /* WP is 32-bit; the system fontconfig cache in ~/.cache/fontconfig is 64-bit (le64) only, so the
      * in-process 32-bit fontconfig can't use it and returns a stale partial set (~230 of 2446 fonts).
      * Point it at a retro5-owned cache dir so it builds its OWN full 32-bit cache: first launch scans
@@ -3295,7 +3385,7 @@ static void r5_fc_enumerate(void) {
         snprintf(xe, sizeof xe, "XDG_CACHE_HOME=%s", d); putenv(xe); } }
     cfg = FcInitLoadConfigAndFonts();
     pat = FcPatternCreate();
-    os  = FcObjectSetBuild("family", (void *)0);        /* variadic, NULL-terminated */
+    os  = FcObjectSetBuild("family", "file", "index", "weight", "slant", "width", (void *)0);   /* NULL-term */
     if (!cfg || !pat || !os) return;
     fs = FcFontList(cfg, pat, os);                      /* full config -> all font dirs */
     if (!fs) return;
@@ -3303,16 +3393,39 @@ static void r5_fc_enumerate(void) {
     fonts = *(unsigned char ***)((char *)fs + 8);
     if (r5_trace) { char b[80]; int k = snprintf(b, sizeof b, "retro5: fontconfig nfont=%d\n", nfont);
                     if (k > 0) write(2, b, (size_t)k); }
-    for (i = 0; i < nfont && r5_fcfam_n < (int)(sizeof r5_fcfam / sizeof r5_fcfam[0]); i++) {
-        unsigned char *fam = 0;
+    /* FcFontList returns one pattern per distinct face (all styles of a family, in arbitrary order).
+     * For each family we want the REGULAR face bound (cairo_set_font_face uses the exact .ttf, so a
+     * Bold/Italic/Condensed member would render every run of that family bold/italic — the "DejaVu Serif
+     * -> Condensed-BoldItalic" bug). Score each face by how far it is from Roman/Normal/Normal-width and
+     * keep the lowest-scoring member's (file,index) per family. weight normal=80, slant roman=0, width
+     * normal=100 (fontconfig constants); missing props default to regular. */
+    for (i = 0; i < nfont; i++) {
+        unsigned char *fam = 0, *file = 0; int idx = 0, weight = 80, slant = 0, width = 100, score;
         if (FcPatternGetString(fonts[i], "family", 0, &fam) != 0 || !fam || !fam[0]) continue;
         if (!r5_wp_storable_name((const char *)fam)) continue;   /* WP codepage can't store it */
+        if (FcPatternGetString(fonts[i], "file", 0, &file) != 0 || !file || !file[0]) continue;
+        FcPatternGetInteger(fonts[i], "index",  0, &idx);
+        FcPatternGetInteger(fonts[i], "weight", 0, &weight);
+        FcPatternGetInteger(fonts[i], "slant",  0, &slant);
+        FcPatternGetInteger(fonts[i], "width",  0, &width);
+        score = (slant != 0 ? 1000 : 0)                 /* italic/oblique: strongly avoid */
+              + (weight != 80 ? 500 : 0) + (weight > 80 ? weight - 80 : 80 - weight)
+              + (width  != 100 ? 200 : 0) + (width > 100 ? width - 100 : 100 - width);
         for (j = 0; j < r5_fcfam_n; j++)                /* dedup, case-insensitive */
             if (!strcasecmp(r5_fcfam[j], (const char *)fam)) break;
-        if (j < r5_fcfam_n) continue;
-        strncpy(r5_fcfam[r5_fcfam_n], (const char *)fam, sizeof r5_fcfam[0] - 1);
-        r5_fcfam[r5_fcfam_n][sizeof r5_fcfam[0] - 1] = 0;
-        r5_fcfam_n++;
+        if (j == r5_fcfam_n) {                          /* new family */
+            if (r5_fcfam_n >= (int)(sizeof r5_fcfam / sizeof r5_fcfam[0])) continue;
+            strncpy(r5_fcfam[j], (const char *)fam, sizeof r5_fcfam[0] - 1);
+            r5_fcfam[j][sizeof r5_fcfam[0] - 1] = 0;
+            r5_fcpath[j][0] = 0; r5_fcidx[j] = 0; fcbest[j] = 0x7fffffff;
+            r5_fcfam_n++;
+        }
+        if (score < fcbest[j]) {                         /* keep the most-regular face of this family */
+            fcbest[j] = score;
+            strncpy(r5_fcpath[j], (const char *)file, sizeof r5_fcpath[0] - 1);
+            r5_fcpath[j][sizeof r5_fcpath[0] - 1] = 0;
+            r5_fcidx[j] = (idx >= 0 && idx < 0x7fff) ? (short)idx : 0;
+        }
     }
 }
 
@@ -3763,9 +3876,32 @@ static void r5_install_collection_injection(void) {
  * then renders the cairo glyph in that family. Cleared for stock fonts so they keep metric-name
  * matching. Gated with the doc-font canvas (RETRO5_DOCFONT) + injection (RETRO5_ALLFONTS). */
 static int (*r5_resolver_orig)(unsigned);
+/* Phase A: resolve the current run's injected record -> its real .ttf (path,index) in the retro5 side
+ * table, into r5_cur_path/r5_cur_idx. Index-aligned lookup (arr[r5_inj_base+i] carries r5_fcfam[i]),
+ * verified by name; a name-search fallback keeps it correct even if the alignment assumption ever
+ * breaks. Sets nothing (clears) for stock/base faces. Runs once per font switch, never per glyph. */
+static void r5_resolve_cur_path(unsigned slot, const char *nm) {
+    int fi = -1, i;
+    r5_cur_path[0] = 0; r5_cur_idx = 0;
+    if (!r5_ftface || !nm || !nm[0] || r5_inj_base <= 0) return;
+    if (slot >= (unsigned)r5_inj_base) {                  /* injected range: try the aligned slot first */
+        int cand = (int)slot - r5_inj_base;
+        if (cand >= 0 && cand < r5_fcfam_n && !strcasecmp(r5_fcfam[cand], nm)) fi = cand;
+    }
+    if (fi < 0)                                           /* fallback: match the family by name */
+        for (i = 0; i < r5_fcfam_n; i++) if (!strcasecmp(r5_fcfam[i], nm)) { fi = i; break; }
+    if (fi < 0 || !r5_fcpath[fi][0]) return;
+    strncpy(r5_cur_path, r5_fcpath[fi], sizeof r5_cur_path - 1);
+    r5_cur_path[sizeof r5_cur_path - 1] = 0;
+    r5_cur_idx = r5_fcidx[fi];
+    if (r5_trace) { char b[320]; int k = snprintf(b, sizeof b,
+        "retro5: FTface '%s' -> %s [%d]\n", nm, r5_cur_path, r5_cur_idx);
+        if (k > 0) write(2, b, (size_t)k); }
+}
 int retro5_resolver(unsigned codeattr) {
     if (!r5_membership_added) r5_fontres_add_members();   /* §17.1 lazy safety net (cheap once done) */
     r5_cur_family[0] = 0;
+    r5_cur_path[0] = 0; r5_cur_idx = 0;
     /* §17.1 REAL FIX: the base name->code hook (retro5_name_to_code) now keeps an injected face's OWN
      * display code through render + reload, so by the time we get here `codeattr` already carries the
      * injected code — the block below reads that record's real family straight from the table. (The old
@@ -3788,6 +3924,7 @@ int retro5_resolver(unsigned codeattr) {
                 if (nm && !range_unmapped(nm, 1)) {
                     strncpy(r5_cur_family, nm, sizeof r5_cur_family - 1);
                     r5_cur_family[sizeof r5_cur_family - 1] = 0;
+                    r5_resolve_cur_path(slot, nm);        /* Phase A: bind the real .ttf for this face */
                 }
             }
         }
@@ -4307,6 +4444,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_ALLFONTS");  if (e && *e && e[0] != '0') r5_allfonts = 1; }   /* unfilter + inject system fonts */
     { const char *e = getenv("RETRO5_MEMBERS");   if (e && *e) r5_member_limit = atoi(e); }        /* §17.1 de-risk: cap appended member faces (0 = all) */
     { const char *e = getenv("RETRO5_FONTCOLL");  r5_fontcoll = e ? (*e && e[0] != '0') : r5_allfonts; }   /* append system faces to the printer-font collection (the picker list source); defaults to ALLFONTS, set 0 to opt out */
+    { const char *e = getenv("RETRO5_FTFACE");    if (e && e[0] == '0') r5_ftface = 0; }                  /* Phase A: bind injected faces by real .ttf via cairo-FT (default ON) */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *e = getenv("RETRO5_WHEEL");      if (e && e[0] == '0') r5_wheel = 0; }             /* mouse-wheel scrolling (default ON) */
