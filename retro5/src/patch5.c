@@ -3572,9 +3572,40 @@ static void r5_install_collection_injection(void) {
  * and if it is one we injected, stash its real fontconfig family in r5_cur_family. r5_doc_family()
  * then renders the cairo glyph in that family. Cleared for stock fonts so they keep metric-name
  * matching. Gated with the doc-font canvas (RETRO5_DOCFONT) + injection (RETRO5_ALLFONTS). */
+/* ---- injected-font SELECTION survival (render-side; see §17.2 + names.txt) ---------------------
+ * WP collapses a picked injected-only face to the printer default BEFORE storing it (the gate is the
+ * printer-resource membership test 0x08417900; on a miss the caller rewrites the code to the default
+ * *0x087bdfe4). Preventing the collapse (forcing membership) CRASHES — WP then strlens a null name from
+ * the printer name pool, which also lacks the face — so a persistent fix needs printer-resource AND
+ * name-pool membership (§17.1, resource 0x08812f90 / pool 0x08812f80; add-primitive not yet reversed).
+ * As a SAFE interim we capture the pick upstream (retro5_fontset, the font-set command handler, sees the
+ * chosen code pre-collapse) and, in the resolver, render that family for the substituted runs while the
+ * injected face is the active selection. Limitation: all injected faces collapse to the SAME default
+ * code in the document, so this renders only the *currently selected* injected face, and injected text
+ * reverts to the default once another face is picked; multi-injected-font docs and a true property-bar
+ * name need the §17.1 resource extension. Selecting any non-injected face clears the capture. */
+static char r5_forced_family[80];        /* injected family the user just picked, or "" */
+#define R5_SUB_PENDING (-2)              /* learn the collapsed code on the next resolve */
+static int  r5_forced_subcode12 = -1;    /* the 12-bit code the pick collapsed to; -1 none, -2 pending */
+static int r5_code12_is_injected(unsigned code12, const char **name_out);   /* fwd */
+
 static int (*r5_resolver_orig)(unsigned);
 int retro5_resolver(unsigned codeattr) {
+    unsigned c12 = (codeattr >> 16) & 0xfff;
     r5_cur_family[0] = 0;
+    /* Learn the collapsed (substitute) code on the first resolve after an injected pick, then render the
+     * picked family for every run carrying that code while this injected face stays selected. */
+    if (r5_forced_family[0]) {
+        if (r5_forced_subcode12 == R5_SUB_PENDING) {
+            if (r5_code12_is_injected(c12, 0)) { r5_forced_family[0] = 0; r5_forced_subcode12 = -1; }
+            else r5_forced_subcode12 = (int)c12;
+        }
+        if (r5_forced_family[0] && r5_forced_subcode12 >= 0 && (int)c12 == r5_forced_subcode12) {
+            strncpy(r5_cur_family, r5_forced_family, sizeof r5_cur_family - 1);
+            r5_cur_family[sizeof r5_cur_family - 1] = 0;
+            return r5_resolver_orig ? r5_resolver_orig(codeattr) : 0;
+        }
+    }
     /* Capture the SELECTED font's own record name (+0x10) — WP substitutes display/injected fonts to
      * a stock face for its Type1 engine (e.g. "DejaVu Sans" -> BroadwayEngraved metric), so the metric
      * name is wrong; the record name is what the user picked. r5_doc_family renders from this. */
@@ -3606,6 +3637,63 @@ static void r5_install_resolver_hook(void) {
     r5_resolver_orig = (int (*)(unsigned))r5_make_trampoline(r5s.resolver_va, 6);
     if (r5_resolver_orig)
         patch_entry(r5s.resolver_va, (const char *)g, sizeof g, (void *)retro5_resolver);
+}
+
+/* Does 12-bit display code `code12` name a font WE injected? (remap slot in [inj_base, cnt)) */
+static int r5_code12_is_injected(unsigned code12, const char **name_out) {
+    unsigned short *remap; uint32_t *arr; unsigned cnt, idx, slot;
+    if (name_out) *name_out = 0;
+    if (r5_inj_base <= 0 || !r5s.remap_arr || !r5s.fontrec_arr || !r5s.fontrec_cnt) return 0;
+    if (range_unmapped((void *)r5s.remap_arr, 4) || range_unmapped((void *)r5s.fontrec_arr, 4)) return 0;
+    remap = *(unsigned short **)r5s.remap_arr;
+    arr   = *(uint32_t **)r5s.fontrec_arr;
+    cnt   = *(unsigned short *)r5s.fontrec_cnt;
+    if (!remap || !arr) return 0;
+    idx = 0x0fff - (code12 & 0x0fff);
+    if (range_unmapped(&remap[idx], 2)) return 0;
+    slot = remap[idx];
+    if (slot < (unsigned)r5_inj_base || slot >= cnt || range_unmapped(&arr[slot], 4) || !arr[slot]) return 0;
+    if (name_out && !range_unmapped((void *)(uintptr_t)(arr[slot] + 0x10), 4)) {
+        const char *nm = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(arr[slot] + 0x10));
+        if (nm && !range_unmapped(nm, 1)) *name_out = nm;
+    }
+    return 1;
+}
+
+/* Font-set command handler capture (RETRO5_ALLFONTS + DOCFONT). WP's font-set handler receives the
+ * user's chosen packed code (arg2, 12-bit face in bits 16..27) BEFORE the display->printer collapse.
+ * We run the real handler (which collapses injected-only faces to the printer default and stores that),
+ * then, if the pick was one of ours, remember the family so the resolver renders it for the substituted
+ * runs (it learns the collapsed code on the first following draw). A non-injected pick clears the
+ * capture, leaving stock fonts exactly as before. cdecl (arg1, reqcode, op, arg4); op 0xbf = set face. */
+static int (*r5_fontset_orig)(unsigned, unsigned, unsigned, unsigned);
+int retro5_fontset(unsigned a1, unsigned reqcode, unsigned op, unsigned a4) {
+    int r = r5_fontset_orig ? r5_fontset_orig(a1, reqcode, op, a4) : 0;
+    if (op == 0xbf && r5_allfonts) {                     /* 0xbf = set-font-face command */
+        const char *name = 0;
+        if (r5_code12_is_injected((reqcode >> 16) & 0xfff, &name) && name) {
+            strncpy(r5_forced_family, name, sizeof r5_forced_family - 1);
+            r5_forced_family[sizeof r5_forced_family - 1] = 0;
+            r5_forced_subcode12 = R5_SUB_PENDING;        /* resolver learns the collapsed code on next draw */
+            if (r5_trace) { char b[160]; int k = snprintf(b, sizeof b,
+                "retro5: injected pick '%s' code=0x%x (rendering as picked; collapse-prevention needs §17.1)\n",
+                name, (reqcode >> 16) & 0xfff); if (k > 0) write(2, b, (size_t)k); }
+        } else {
+            r5_forced_family[0] = 0;                      /* a real/printer face -> stop overriding */
+            r5_forced_subcode12 = -1;
+        }
+    }
+    return r;
+}
+static void r5_install_fontset_hook(void) {
+    static const unsigned char g[] = {0x55,0x89,0xe5,0x81,0xec,0x14,0x01,0x00,0x00};
+    if (!(r5_docfont || r5_docfont81) || !r5_allfonts || !r5s.fontset_va) return;
+    if (range_unmapped((void *)r5s.fontset_va, sizeof g) || memcmp((void *)r5s.fontset_va, g, sizeof g))
+        return;
+    r5_fontset_orig = (int (*)(unsigned, unsigned, unsigned, unsigned))
+                      r5_make_trampoline(r5s.fontset_va, 9);
+    if (r5_fontset_orig)
+        patch_entry(r5s.fontset_va, (const char *)g, sizeof g, (void *)retro5_fontset);
 }
 
 /* Font-selector takeover (RETRO5_ALLFONTS): the F9 "Font Face" list builder shows an entry only if
@@ -3688,6 +3776,8 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5s.fontrec_cap = 0x08808758; r5s.remap_arr = 0x0880876c; r5s.remap_cap = 0x08808770;
     r5s.freecode = 0x087bdfe2; r5s.builder_va = 0x085b8500; r5s.resolver_va = 0x085b7860;
     r5s.fontcoll_build_va = 0x0852acd0;                  /* printer-font collection builder (pickers) */
+    r5s.fontset_va = 0x080be820;                         /* font-set command handler (pre-collapse code) */
+    r5s.font_state_ptr = 0x08812f74;                     /* -> font-state object; +0x98 = active packed code */
     /* printer subsystem (RETRO5_CUPS) — FONT-RENDERING-MAP §15/§19 */
     r5s.printer_scan_va  = 0x0852cb40;
     r5s.printer_rich_arr = 0x08803140; r5s.printer_rich_cnt = 0x08803144;
@@ -3711,6 +3801,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_install_injection();
     r5_install_collection_injection();
     r5_install_resolver_hook();
+    r5_install_fontset_hook();          /* capture injected pick -> resolver renders it (interim; §17.1 = full) */
     /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
      * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
      * interactive print path, so bypassing its spawn was both unnecessary and the cause of the

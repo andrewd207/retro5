@@ -61,6 +61,18 @@ typedef struct {
     uintptr_t builder_va;         /* font-table builder entry (detour: run original, then inject)  */
     uintptr_t resolver_va;        /* font resolver (code->record); hooked to track injected face   */
     uintptr_t fontcoll_build_va;  /* printer-font COLLECTION builder (detour: append system faces)  */
+    /* ---- injected-font SELECTION survival (8.0; 0 on 8.1) --------------------------------------
+     * WP collapses a picked display face that is NOT a member of the active printer's font resource to
+     * the printer default BEFORE storing it, so every injected-only family (Ubuntu, Noto…) renders as
+     * that default. The clean "keep the injected code" fix (interpose the membership gate 0x08417900)
+     * CRASHES — WP's downstream name lookup then strlens a null name from the printer name pool, which
+     * also lacks injected faces; a full fix needs printer-resource + name-pool membership (§17.1). So we
+     * capture the pick one step upstream instead: fontset_va is the font-set command handler that
+     * receives the chosen 12-bit code PRE-substitution; hooking it lets us remember which injected family
+     * was picked (see retro5_fontset), and font_state_ptr -> the live font-state object (+0x98 = active
+     * packed code) lets the resolver render that family for the substituted runs. See §17.2 + names.txt. */
+    uintptr_t fontset_va;         /* font-set command handler (op 0xbf), pre-substitution requested code */
+    uintptr_t font_state_ptr;     /* -> current font-state object; +0x98 = active packed 12-bit font code */
     /* printer subsystem takeover (RETRO5_CUPS) — see FONT-RENDERING-MAP §15/§19. */
     uintptr_t printer_scan_va;    /* printer-list scan-core: int(void *ctx, int category) cdecl     */
     uintptr_t printer_rich_arr, printer_rich_cnt;  /* rich entry buffer calloc(cnt,0x9c) + count u16 */
