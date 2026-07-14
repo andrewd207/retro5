@@ -2801,16 +2801,35 @@ static void r5_doc_text_color(Display *dpy, GC gc, double *r, double *g, double 
     *b = r5_chan(gv.foreground, v->blue_mask);
 }
 
-/* WP byte -> Unicode codepoint. WP's Latin text fonts are encoded ISO 8859-1 (Latin-1), where the
- * codepoint IS the byte value (0x00-0xFF), so the default table is the identity; this is a table
- * (not a formula) so a font/charset that turns out NOT to be 8859-1 can be remapped in one place.
- * cairo's show_text wants UTF-8, so a raw high byte (>=0x80) must be encoded as 2 bytes — emitting it
- * bare (as we did) is invalid UTF-8 and drew tofu for accented characters. */
+/* WP byte -> Unicode codepoint, for the LATIN text fonts (symbolic/pi/non-Latin faces never get here
+ * — r5_face_to_family flags them and the caller passes them through to WP's native 1-bit blit).
+ *
+ * The encoding is WINDOWS-1252, not ISO 8859-1. Traced live on 8.0 (RETRO5_TRACE=1, "docglyph byte="
+ * probe in r5_doc_render_glyph, which logs the index WP hands the glyph blit):
+ *     typed "  ->  0x93 / 0x94        (curly double quotes, via QuickCorrect smart quotes)
+ *     typed '  ->  0x91 / 0x92        (curly single quotes / apostrophe)
+ *     typed -- ->  0x96               (en dash)
+ *     typed é ü ñ ç ä -> 0xe9 0xfc 0xf1 0xe7 0xe4   (identical to Latin-1)
+ * So 0x20-0x7F is ASCII and 0xA0-0xFF IS genuine Latin-1; the ONLY divergence is 0x80-0x9F, which in
+ * ISO 8859-1 is the unprintable C1 control block but in cp1252 (and in WP's fonts) carries the
+ * typographic set. Handing cairo a C1 control drew NOTHING — that was the blank-quote bug.
+ *
+ * 0 means "no Unicode mapping" -> the caller falls back to WP's native glyph blit rather than drawing
+ * a wrong/blank character. That is the extension point: the WPCharSet-derived Greek/Cyrillic/symbol
+ * faces will get their own tables here, selected per-face, without touching the draw path. */
 static unsigned short r5_wp2uni[256];
 static int r5_wp2uni_ready;
+/* cp1252 0x80-0x9F -> Unicode. 0 = undefined in cp1252 (0x81/0x8D/0x8F/0x90/0x9D). */
+static const unsigned short r5_cp1252_c1[32] = {
+    0x20AC, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,  /* 80-87 € ‚ ƒ „ … † ‡ */
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x0000, 0x017D, 0x0000,  /* 88-8F ˆ ‰ Š ‹ Œ Ž    */
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,  /* 90-97 ' ' " " • – —  */
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0000, 0x017E, 0x0178   /* 98-9F ˜ ™ š › œ ž Ÿ  */
+};
 static void r5_wp2uni_init(void) {
     int i;
-    for (i = 0; i < 256; i++) r5_wp2uni[i] = (unsigned short)i;   /* ISO 8859-1: codepoint == byte */
+    for (i = 0; i < 256; i++) r5_wp2uni[i] = (unsigned short)i;   /* ASCII + 0xA0-0xFF: Latin-1 = byte */
+    for (i = 0x80; i <= 0x9F; i++) r5_wp2uni[i] = r5_cp1252_c1[i - 0x80];  /* the cp1252 divergence */
     r5_wp2uni_ready = 1;
 }
 static int r5_utf8(unsigned cp, char *o) {                       /* encode cp -> UTF-8, return length */
@@ -2832,7 +2851,16 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     const char *fam = r5_doc_family(&slant, &weight, &symbolic);
     int penx = *(int *)r5s.pen_x, peny = *(int *)r5s.pen_y;
     double sz = r5_doc_pixsize();
+    unsigned cp;
+    if (!r5_wp2uni_ready) r5_wp2uni_init();
+    cp = r5_wp2uni[c];                                    /* WP byte -> Unicode (cp1252 for Latin faces) */
+    if (r5_trace && c >= 0x80) {                          /* codepage probe: which byte is a high char? */
+        char m[160]; int k = snprintf(m, sizeof m, "retro5: docglyph byte=0x%02x -> U+%04X fam=%s%s\n",
+            c, cp, fam ? fam : "?", symbolic ? " [sym]" : "");
+        if (k > 0) write(2, m, (size_t)k);
+    }
     if (symbolic) return 0;                               /* symbol/pi/non-Latin -> WP's native glyph */
+    if (!cp) return 0;                                    /* no Unicode mapping -> WP's native glyph */
     if (sz <= 0) {
         /* No font-context run size => UI chrome drawn by the same engine (status bar, F9 preview).
          * RETRO5_DOCFONT=2 renders those with cairo too; use ONE size per run (locked from the first
@@ -2848,8 +2876,7 @@ static int r5_doc_render_glyph(Display *dpy, Drawable dst, GC gc, unsigned w, un
     if (!sf || cz.surface_status(sf)) { if (sf) cz.surface_destroy(sf); return 0; }
     cr = cz.create(sf);
     if (!cr || cz.status(cr)) { if (cr) cz.destroy(cr); cz.surface_destroy(sf); return 0; }
-    if (!r5_wp2uni_ready) r5_wp2uni_init();
-    s[r5_utf8(r5_wp2uni[c], s)] = 0;                     /* WP byte -> Unicode -> UTF-8 for cairo */
+    s[r5_utf8(cp, s)] = 0;                               /* Unicode -> UTF-8 (cairo's show_text wants it) */
     r5_doc_text_color(dpy, gc, &cr_, &cg, &cb);
     cz.select_font_face(cr, fam, slant, weight);
     cz.set_font_size(cr, sz);
@@ -2869,6 +2896,8 @@ void retro5_XCopyPlane(Display *dpy, Drawable src, Drawable dst, GC gc,
                        int sx, int sy, unsigned w, unsigned h, int dx, int dy, unsigned long plane) {
     if (r5_doc_active) {
         unsigned char c = r5_pixmap_to_char((unsigned)src);       /* recover char from glyph pixmap */
+        if (!c && r5_trace) { const char *m = "retro5: docglyph UNRESOLVED pixmap -> native\n";
+            write(2, m, strlen(m)); }
         if (c && r5_doc_render_glyph(dpy, dst, gc, w, h, c)) return; /* rendered via cairo */
     }
     if (!r5_real_CopyPlane_x) {
