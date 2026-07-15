@@ -7,7 +7,7 @@ tools/wpdecom2
 __pycache__/
 *.pyc
 
-# Retargeted / installed trees (may contain copyrighted Corel material) — NEVER commit
+# installed / retargeted trees — not distributed
 build/
 dist/
 install-root/
@@ -20,3 +20,21 @@ media/
 
 # release build artifacts (built shim + tarballs)
 release/dist/
+
+# local scratch
+local/
+
+# scratch tooling / generated data — not distributed
+ghidra_hl/
+names.txt
+wpp_names.txt
+*.syms
+*.java
+*.s
+*.nm
+*.tsv
+*.json
+*.map
+*.bak
+*.gdb
+decomp*.c
