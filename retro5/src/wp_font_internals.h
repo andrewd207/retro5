@@ -240,4 +240,208 @@ typedef struct WpFontRecord {        /* calloc(1,0x20) */
 /*              case needs one live read — see §17.1 recipe.)                 */
 /*  0x087bddfc  uint16_t        token paired with 0x087bddf8                   */
 
+/* ======================================================================== *
+ * 9. WpViewCursor — the document VIEW + text-CARET state                    *
+ *    (§17.2 caret-metric RE, 2026-07-14; Xvfb live + Ghidra ghidra_proj80)  *
+ *                                                                           *
+ *    This is the struct the DOCUMENT CARET (the blinking insertion bar) is  *
+ *    drawn from.  Recovered while chasing "injected-TTF caret lags the      *
+ *    glyphs": the committed §17.2 reformat fix makes the GLYPHS advance on   *
+ *    real FreeType widths (screen array DAT_087fe9b8), but the caret still   *
+ *    sits ON the last wide glyph / overshoots thin ones — because the caret  *
+ *    reads a DIFFERENT metric, the DOCUMENT cursor position, which is still  *
+ *    summed from the placeholder .prs widths.                               *
+ *                                                                           *
+ *    THE CARET DRAW (CONFIRMED, live bt on :241):                            *
+ *      caret_paint  0x08407170 (FUN_08407170) — draws the caret with        *
+ *        XDrawLine(dpy, win, gc, px, y, px, y+h) where                       *
+ *        px = doc_x_to_px(view, view->cursor_x - view->origin_x)             *
+ *           = FUN_08421030(view, cursor_x - origin_x).                        *
+ *      doc_x_to_px 0x08421030:  px = (docx + (view->px_div_x>>1)) /          *
+ *                                     view->px_div_x   (& 0xffff).           *
+ *      doc_y_to_px 0x08421110 (vertical twin; uses +0x4a / +0x4c).           *
+ *      The blink handler re-invokes caret_paint at the SAME cursor_x, so     *
+ *      caret movement (Home/End/arrows) does NOT recompute any width — it    *
+ *      just re-reads view->cursor_x.  cursor_x is (re)computed only at       *
+ *      REFORMAT: cursor_layout 0x0836faa0 (FUN_0836faa0) sums the per-char   *
+ *      DOCUMENT design width FUN_08387e50 (= charwidth_lookup_lo 0x0837e6b0, *
+ *      the placeholder .prs/.pfm width) over the run and stores the result   *
+ *      into cursor_x via caret_paint's tail (0x084072ee: view+0x54=arg).     *
+ *                                                                           *
+ *    => The caret's width source is the DOCUMENT width model (also drives    *
+ *       line-wrap, justification and the "Pos" readout), NOT the isolated    *
+ *       "caret node" the earlier handoff assumed.  font_widthcache_fill      *
+ *       0x0845bac0 / font_width_cachemgr 0x08456af0 / percharadvance_rd      *
+ *       0x080e4fa0 are the font-PREVIEW combo path (callers: FUN_0842c020    *
+ *       display metric provider; combo_preview_*), proven off the doc-caret  *
+ *       path by live breakpoints — do NOT hook them for the caret.           *
+ *                                                                           *
+ *    Units: cursor_x / origin_x / cursor_y / cursor_h are DOCUMENT design    *
+ *    units = 1/1200 inch, point size baked in (same unit as DAT_087fe9b8).   *
+ *    px_div_x = design units per screen pixel (~12 at ~100dpi; live: Home    *
+ *    cursor_x=1200 origin_x=0 -> px=100).                                    *
+ * ======================================================================== */
+typedef struct WpViewCursor {   /* size >= 0x70; only the caret-relevant fields pinned */
+    uint8_t  _r00[0x24];
+    uint16_t origin_x;    /* +0x24 view scroll origin X (doc units) — subtracted     */
+    uint8_t  _r26[0x28-0x26];
+    uint16_t origin_y;    /* +0x28 view scroll origin Y (doc units)                  */
+    uint8_t  _r2a[0x44-0x2a];
+    uint16_t px_div_x;    /* +0x44 doc units per pixel, horizontal (FUN_08421030 div)*/
+    uint8_t  _r46[0x4a-0x46];
+    uint16_t px_div_y;    /* +0x4a doc units per pixel, vertical  (FUN_08421110 div) */
+    uint16_t px_mul_y;    /* +0x4c vertical scale multiplier      (FUN_08421110 mul) */
+    uint8_t  _r4e[0x54-0x4e];
+    uint16_t cursor_x;    /* +0x54 CARET X in doc units  ★ the caret's x source      */
+    uint8_t  _r56[0x58-0x56];
+    uint16_t cursor_y;    /* +0x58 caret top Y in doc units                          */
+    uint8_t  _r5a[0x5c-0x5a];
+    uint16_t cursor_h;    /* +0x5c caret height in doc units                         */
+    uint8_t  _r5e[0x60-0x5e];
+    int16_t  hide_count;  /* +0x60 caret suppress counter (>0 => skip draw)          */
+    uint8_t  _r62[0x68-0x62];
+    int32_t  line_mul;    /* +0x68 line-height multiplier (guess; FUN_082ea3c0)      */
+    int16_t  valid_gate;  /* +0x6c must be >=0 to paint the caret                    */
+    uint16_t mode;        /* +0x6e mode word (0x11 special-cased in caret_paint)     */
+} WpViewCursor;
+
+/* ======================================================================== *
+ * 10. WpFontMetricObj — the per-(font,size) font-METRIC object              *
+ *    (§17.3 document-width RE, 2026-07-14; Ghidra ghidra_proj80 + live gdb) *
+ *                                                                           *
+ *    THE single shared per-char advance-width source for the WHOLE document *
+ *    layout.  Fetched per font code from the metric resource DAT_08812d64   *
+ *    (fontres_seek 0x0841eed0 -> fontmetric_obj_lock 0x0841ecf0); its widths *
+ *    are loaded from wp.drs (Display ReSource) lazily, per character-set     *
+ *    block (charset_block_lazyload 0x0841eda0 / charset_block_read           *
+ *    0x08405800), and built by fontmetric_obj_build 0x085b6120.             *
+ *                                                                           *
+ *    The +0x40 table is read at TWO different index regions (§17.3):        *
+ *    (A) SEGMENTED — the leaf width_primitive 0x0841eab0(obj,cs,char,&out):  *
+ *          idx = 0x80 + (char - first[charset]) + SUM(count[i], i<charset)   *
+ *        used by glyphs/charwidth_lookup/cursor_layout/wrap (Pipeline 1).    *
+ *    (B) FLAT — the doc-position accumulators read table[char] directly      *
+ *          (raw byte 0x20..0x7e for charset 0), inline, NOT via the leaf:    *
+ *          pos_scan_next_char 0x0837fc70 / pos_run_advance 0x08389e00 do     *
+ *          DAT_08810e02 += ((u16*)*(obj+0x48))[char] + DAT_08810e52          *
+ *        THIS builds the caret/Pos accumulator DAT_08810e02 (Pipeline 2).    *
+ *      out = width_bits==0 ? ((u8*)table)[idx] : ((u16*)table)[idx]         *
+ *    BOTH regions hold the SAME width for a char (table[0x4f]==table[0xaf]   *
+ *    for 'O'), so a caret fix MUST overwrite BOTH — the first §17.3 try      *
+ *    touched only (A) and the flat caret cell stayed placeholder.           *
+ *    Consumers: caret (cursor_layout 0x0836faa0 + pos_scan_next_char/        *
+ *    pos_run_advance -> DAT_08810e02 -> cursor_pos_read 0x083ce2e0),         *
+ *    wrap/justification/Pos/pagination (reformat_width_sum 0x0836e680), and  *
+ *    the screen glyph array (reformat_char_append 0x083fa990).              *
+ *                                                                           *
+ *    UPSTREAM (verified live; reconciled w/ af1d341): the table is FILLED by  *
+ *    fontmetric_widthblock_build 0x085b5cb0 from the PRINTER RESOURCE         *
+ *    default.prs (DAT_08812f90) keyed by the RESOLVED code — NOT from a .pfb  *
+ *    and NOT from record+0x08. A non-member injected code COLLAPSES to the    *
+ *    printer default DAT_087bdfe4 (0xfff=Bitstream Charter) [member test      *
+ *    font_printres_member 0x08417900: 0xd6f<(code>>16&0xfff)<0x1000]. That is *
+ *    why the table reads Charter (FreeSans 'O'=390=Charter WX731@32, '|'=267  *
+ *    =WX500) even though record+0x08 = wphv (‖ WX260≈139≠267). Both Pipelines *
+ *    share this one .prs upstream; the fix is a REAL-width .prs member entry  *
+ *    for the injected code (or a hook on the widthblock build/read), NOT a    *
+ *    synthetic-Type1 at record+0x08 (never read for widths).                  *
+ *                                                                           *
+ *    Value unit: WP DESIGN UNITS = 1/1200 inch, point size baked in (same   *
+ *    as DAT_087fe9b8).  Live: FreeSans 12pt O=146 W=186 I=65 space=56.      *
+ *                                                                           *
+ *    Injected (TrueType) faces get their OWN object, distinct from any base  *
+ *    font (live: Courier 0x97a8fd8 width_bits=0 first[0]=0; FreeSans        *
+ *    0x9b34fd8 width_bits=1 first[0]=32), so retro5 overwrites the injected  *
+ *    object's +0x40 table with real FreeType advances without touching base  *
+ *    fonts (§17.3).  reformat_ctx+0x190 == this object == charwidth's        *
+ *    DAT_088114d4 (all the same pointer — verified live).                    *
+ * ======================================================================== */
+typedef struct WpFontMetricObj {
+    uint16_t _r00;          /* +0x00                                              */
+    uint8_t  width_bits;    /* +0x02 0 => 8-bit width table; else 16-bit          */
+    uint8_t  is_bitmap;     /* +0x03 nonzero => bitmap path (width_primitive_bitmap)*/
+    uint16_t count[15];     /* +0x04 chars per character-set segment (…+0x04+cs*2)*/
+    uint16_t first[15];     /* +0x22 first char code of each segment (u8 read)    */
+    /* NB: WP reads first[] as *(char*)(obj+0x22+cs*2) — low byte only. count[15]  */
+    /* + first[15] = 60 bytes span +0x04..+0x40, so width_table follows at +0x40.  */
+    void    *width_table;   /* +0x40 THE per-char advance table (design units)    */
+    uint16_t res_index;     /* +0x44 metric-resource element index (set on lock)  */
+    uint16_t _r46;          /* +0x46                                              */
+    void    *width_table2;  /* +0x48 aliases +0x40 while locked                   */
+    int16_t  lock;          /* +0x4c lock/refcount; 0 => use +0x40 else +0x48     */
+    /* ... +0x76 i16 per-charset lazy-load block id (-2 = not loaded);            */
+    /*     +0x98 u8 flags (bit1 = space/remap path in charwidth_lookup) ...       */
+} WpFontMetricObj;
+
+/* Compute the width_table index the leaf width_primitive 0x0841eab0 uses for a
+ * (charset, char) pair.  charset 0 (ASCII) is the common case: idx = 0x80 +
+ * (char - first[0]).  Returns -1 if the char is outside the object's segment. */
+static inline int wp_fontmetric_idx(const WpFontMetricObj *o, unsigned charset, unsigned ch) {
+    unsigned base = 0x80, i;
+    const uint8_t *cnt = (const uint8_t *)o + 0x04;
+    const uint8_t *fst = (const uint8_t *)o + 0x22;
+    unsigned first_cs = fst[charset * 2];
+    unsigned rel = (ch - first_cs) & 0xff;
+    if (charset >= 15) return -1;
+    if (rel >= *(const uint16_t *)(cnt + charset * 2)) return -1;
+    for (i = 0; i < charset; i++) base += *(const uint16_t *)(cnt + i * 2);
+    return (int)(base + rel);
+}
+
+/* Pipeline-2 FLAT index: the doc-position accumulators (pos_scan_next_char 0x0837fc70,
+ * pos_run_advance 0x08389e00) read the width table by the RAW char byte, not the segmented
+ * width_primitive index.  For charset-0 chars, table[char] and table[wp_fontmetric_idx(o,0,char)]
+ * hold the SAME value; a caret/Pos fix that overwrites the table must write BOTH cells. */
+static inline int wp_fontmetric_flatidx(const WpFontMetricObj *o, unsigned ch) {
+    (void)o; return (int)(ch & 0xff);
+}
+
+/* ======================================================================== *
+ * 11. WpType1Font — the parsed Type1 OUTLINE object (record+0x08 .pfb)      *
+ *     (§18 TTF-native RE, 2026-07-14; ghidra_proj80/xwp80 89781a)           *
+ *                                                                           *
+ *     Built by t1_parse_pfb 0x085c8e60 (0x11c bytes) from the .pfb that     *
+ *     t1_pfb_load 0x085b9400 opens for record+0x08.  This is the DISPLAY/   *
+ *     GLYPH-OUTLINE object ONLY: its charstrings feed the outline engine    *
+ *     [0x08816110] via font_glyph_advance_get80 0x085c8540 -> glyphrec[0]   *
+ *     (the DRAW advance, which retro5's cairo path overrides).  It is NOT    *
+ *     the caret/layout width source (that is WpFontMetricObj from wp.drs,    *
+ *     keyed by the RESOLVED code — see §10 and the doc width-model).  The    *
+ *     .pfb NAME is used only to OPEN this file; it is never a wp.drs key.    *
+ *                                                                           *
+ *     Only the fields t1_parse_pfb touches are pinned (offsets confirmed     *
+ *     from the decompile; interior of the eexec dicts not fully mapped).     *
+ * ======================================================================== */
+typedef struct WpType1Font {     /* alloc 0x11c via t1_parse_pfb */
+    void    *priv;          /* +0x04 -> Private/blues sub-dict (0x1a0 B); count @+0x1c */
+    void    *charstrings;   /* +0x08 -> charstrings blob (DAT_08816124 B)          */
+    /* ... */
+    uint8_t  flags;         /* +0x20 bit0 = Encoding==StandardEncoding; bit1 parse-warn; bit6 cleared */
+    /* ... */
+    void    *notdef_tbl;    /* +0x38 = &DAT_087c86f4 default (.notdef fill)        */
+    int16_t  glyph_count;   /* +0x3c # charstrings/glyphs (0xe5=229 => full StdEnc fast-path) */
+    /* ... */
+    void   **charstr_by_gid;/* +0x40 charstring ptr per glyph index               */
+    /* +0x44 ... */
+    char   **name_by_gid;   /* +0x48 glyph-name ptr per glyph index (StandardEncoding order when full) */
+    /* ... */
+    void   **subrs;         /* +0x58 Subrs array; count @ (priv)+0x1c             */
+    void   **charstr_by_code;/*+0x5c code->charstring[256]: built by matching StdEnc
+                              *       names DAT_08733788 vs name_by_gid/charstr_by_gid */
+    /* ... +0x118 = 1 (init marker) */
+} WpType1Font;
+
+/* MINIMUM synthetic Type1 stub (record+0x08 = a .ttf, hand back a fake Type1):
+ *   t1_parse_pfb + t1_eexec_tokenize 0x085eaa50 must parse it (ret 0) and end with a
+ *   non-empty CharStrings dict.  A usable stub is a valid (minimal) Type1 font program:
+ *     clear header: %!PS-AdobeFont-1.0 ; /FontType 1 ; /FontMatrix [0.001 0 0 0.001 0 0] ;
+ *                   /FontName ; /Encoding (StandardEncoding def, or 256 dup i /n put) ;
+ *                   /FontBBox ; /PaintType 0 ;
+ *     eexec section: /Private { /lenIV 4 /BlueValues[] /MinFeature{16 16} /password ... } ;
+ *                    /CharStrings N dict dup begin  /.notdef {hsbw endchar} + one entry per
+ *                    needed code, each charstring at minimum "<sbx> <wx> hsbw endchar".
+ *   Missing/unparseable eexec or empty CharStrings -> t1_parse_pfb returns -3.  Because cairo
+ *   draws and the caret uses wp.drs (not this file), the charstrings need no real outline and
+ *   the hsbw width is cosmetic (it only reaches glyphrec[0], which retro5 overrides).            */
+
 #endif /* WP_FONT_INTERNALS_H */

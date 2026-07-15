@@ -2458,6 +2458,16 @@ static int r5_ftmetrics = 1;            /* RETRO5_FTMETRICS (§17.2 Phase B): ho
                                          * the REAL face's advances, not the placeholder Type1's. Default ON
                                          * (proven on Go Mono; matches RETRO5_FTFACE default ON — real face +
                                          * real metrics must travel together or spacing mismatches). */
+static int r5_ftmetrics2 = 0;           /* RETRO5_FTMETRICS2 (§17.3 option-b): the SINGLE-SOURCE load-path
+                                         * fix. Hook charset_block_lazyload 0x0841eda0 and, right after WP
+                                         * fills a freshly-locked injected metric object's width table with
+                                         * the collapsed Charter placeholder, overwrite BOTH the flat and the
+                                         * segmented ASCII cells of font_obj+0x40 with the REAL FreeType design
+                                         * widths. Because this fires ONCE at charset-load (before any consumer
+                                         * reads the table), it feeds glyphs + caret + wrap + Pos from one
+                                         * source with NO reformat race — and supersedes §17.2. When ON it
+                                         * forces r5_ftmetrics OFF so option-b is exercised alone. Default OFF
+                                         * (unset => HEAD behaviour, §17.2 only). */
 
 /* Per-build symbol/address table. Filled once at load time by the detected build's takeover
  * (takeoverWP80 / takeoverWP81) so the rest of the code carries NO per-build #ifdefs — every doc-font
@@ -2994,6 +3004,7 @@ static int r5_ftm_cache_n;
 volatile int r5_ftm_calls;                            /* DIAG: reformat hook entries with injected run active */
 volatile int r5_ftm_calls_inj;                        /* DIAG: entries where WP wrote a width slot */
 volatile int r5_ftm_writes;                           /* DIAG: width-slot overwrites performed */
+extern volatile int r5_ftm2_writes;                   /* DIAG: metric-object cells rewritten (defined below) */
 
 /* Real-face x_advance for one WP byte, in EM fractions (cairo font size 1.0). <0 => no override / not
  * measurable. Multiply by the run's device-pixel size to get the device-px advance WP lays out on.
@@ -3100,19 +3111,52 @@ static int r5_ftm_run_get(unsigned key, const char **path, int *idx, double *px)
     return 0;
 }
 
+/* §17.4 option-b (re-targeted): write ONE char's real FreeType advance into the active metric OBJECT's
+ * per-char width table, in BOTH the flat cell table[ch] (the caret/Pos accumulator's index) AND the
+ * segmented cell table[0x80+(ch-first[0])] (width_primitive's glyph/wrap index) — the two index regions
+ * of the one buffer (font_obj+0x48, which aliases +0x40 while locked). Writing here, per reformatted
+ * char, is idempotent and race-immune: WP re-runs this reformat after any re-fill/flatwidth-mirror, so we
+ * re-apply every time (no per-object cache to go stale). Honors width_bits @+0x02 (0=>u8 table, else u16)
+ * and the ASCII segment first[0]@+0x22 / count[0]@+0x04. Non-injected objects are never reached (the
+ * caller gates on the resolved injected identity), so WP-stock members stay untouched. font_obj is the
+ * SAME pointer WP hands width_primitive: *(reformat_ctx+0x190) == DAT_088114d4 (verified live). */
+static void r5_metricobj_write_char(void *font_obj, unsigned char ch, long w) {
+    unsigned char *o = (unsigned char *)font_obj;
+    unsigned wbits, cnt0, first0, seg;
+    void *tbl;
+    if (!o || range_unmapped(o, 0x4c)) return;
+    wbits  = *(unsigned char *)(o + 0x02);
+    cnt0   = *(unsigned short *)(o + 0x04);
+    first0 = *(unsigned char *)(o + 0x22);
+    tbl = (*(short *)(o + 0x4c) == 0) ? *(void **)(o + 0x40) : *(void **)(o + 0x48);   /* width_primitive's select */
+    if (!tbl || range_unmapped(tbl, 0x200)) return;
+    if (cnt0 == 0 || cnt0 > 0x100) return;
+    if (ch < first0 || ch >= (unsigned)(first0 + cnt0)) return;                 /* outside the ASCII segment */
+    seg = 0x80 + (ch - first0);                                                 /* Σcount[i<0]==0 for charset 0 */
+    if (w < 0) w = 0;
+    if (wbits == 0) {                                                           /* 8-bit table */
+        if (w > 0xff) w = 0xff;
+        ((unsigned char *)tbl)[ch] = (unsigned char)w;                          /* flat cell (caret/Pos) */
+        if (seg < 0x200) ((unsigned char *)tbl)[seg] = (unsigned char)w;        /* segmented cell (glyph/wrap) */
+    } else {                                                                    /* 16-bit table */
+        if (w > 0xffff) w = 0xffff;
+        ((unsigned short *)tbl)[ch]  = (unsigned short)w;                       /* flat cell (caret/Pos) */
+        ((unsigned short *)tbl)[seg] = (unsigned short)w;                       /* segmented cell (glyph/wrap) */
+    }
+}
+
 void retro5_reformat_char(int p1, int ch) {          /* non-static: patched target */
     unsigned short idx0, idx1; unsigned c; double em, sz; long w;
     unsigned key; const char *path; int idx;
-    if (!r5_ftmetrics) { r5_reformat_orig(p1, ch); return; }
+    if (!r5_ftmetrics && !r5_ftmetrics2) { r5_reformat_orig(p1, ch); return; }
     r5_ftm_calls++;                                                             /* DIAG */
     idx0 = *(volatile unsigned short *)(uintptr_t)R5_REFORMAT_WIDX;
     r5_reformat_orig(p1, ch);                                                    /* WP writes width + bumps idx */
     idx1 = *(volatile unsigned short *)(uintptr_t)R5_REFORMAT_WIDX;
-    if (idx1 != (unsigned short)(idx0 + 1)) return;                              /* no single slot appended */
-    r5_ftm_calls_inj++;                                                         /* DIAG */
     c = (unsigned)(ch & 0xffff);
     if (c > 0xff) return;                                                        /* multi-byte -> leave WP's */
-    /* Per-run key = WP's own font record for this reformat (survives the chrome clobber; unique/font). */
+    /* Per-run key = WP's own font record for this reformat (== the active metric object; survives the
+     * chrome clobber; unique per font run). Used both as the run cache key AND as the object to overwrite. */
     key = (p1 && !range_unmapped((void *)(uintptr_t)(p1 + R5_REFORMAT_RECOFF), 4))
         ? *(unsigned *)(uintptr_t)(p1 + R5_REFORMAT_RECOFF) : 0;
     sz = r5_doc_pixsize();                                                       /* 0 unless a real doc run */
@@ -3129,8 +3173,18 @@ void retro5_reformat_char(int p1, int ch) {          /* non-static: patched targ
     w = (long)(em * sz * (1200.0 / 96.0) + 0.5);                                 /* em-fraction -> WP design units */
     if (w < 0) w = 0;
     if (w > 0xffff) w = 0xffff;
-    ((volatile unsigned short *)(uintptr_t)R5_REFORMAT_WBUF)[idx0] = (unsigned short)w;
-    r5_ftm_writes++;                                                            /* DIAG */
+    r5_ftm_calls_inj++;                                                         /* DIAG */
+    /* §17.4 option-b: single-source fix — overwrite the metric OBJECT's width table so the caret/wrap/Pos
+     * (which read font_obj+0x48, NOT the screen array) also get the real advance. Per-char + idempotent. */
+    if (r5_ftmetrics2 && key) {
+        r5_metricobj_write_char((void *)(uintptr_t)key, (unsigned char)c, w);
+        r5_ftm2_writes++;                                                       /* DIAG */
+    }
+    /* §17.2: screen glyph-pen width array (only when a single slot was appended this call). */
+    if (r5_ftmetrics && idx1 == (unsigned short)(idx0 + 1)) {
+        ((volatile unsigned short *)(uintptr_t)R5_REFORMAT_WBUF)[idx0] = (unsigned short)w;
+        r5_ftm_writes++;                                                        /* DIAG */
+    }
 }
 
 /* Install the reformat width detour: jmp-patch FUN_083fa990's 8.0 entry (0x083fa990) to ours via a
@@ -3139,7 +3193,7 @@ void retro5_reformat_char(int p1, int ch) {          /* non-static: patched targ
 static void r5_install_reformat_hook(void) {
     static const unsigned char g[9] = {0x55,0x89,0xe5,0x81,0xec,0xbc,0x00,0x00,0x00};
     uintptr_t va = 0x083fa990;
-    if (!r5_ftmetrics) return;
+    if (!r5_ftmetrics && !r5_ftmetrics2) return;    /* §17.2 (screen array) OR §17.4 option-b (object table) */
     if (range_unmapped((void *)va, sizeof g) || memcmp((void *)va, g, sizeof g) != 0) {
         if (r5_trace) { const char *m = "retro5: FTMETRICS reformat hook SKIPPED (guard mismatch)\n";
                         write(2, m, strlen(m)); }
@@ -3150,6 +3204,199 @@ static void r5_install_reformat_hook(void) {
     patch_entry(va, (const char *)g, sizeof g, (void *)retro5_reformat_char);
     if (r5_trace) { const char *m = "retro5: FTMETRICS reformat width hook installed (0x083fa990)\n";
                     write(2, m, strlen(m)); }
+}
+
+/* fontconfig injected side-tables (defined below, near r5_fc_enumerate) — forward-declared so the
+ * §17.3 code-driven identity resolver can use them here. */
+static int  r5_inj_base;
+static char r5_fcfam[2048][64];
+static int  r5_fcfam_n;
+static char r5_fcpath[2048][256];
+static short r5_fcidx[2048];
+
+/* ---- §17.3 option-b: SINGLE-SOURCE injected width fix at charset-LOAD ------------------------------
+ * TARGET: charset_block_lazyload FUN_0841eda0 @ 0x0841eda0 (8.0). It loads ONE character-set width
+ * block into a metric object, gated on the per-charset block-id at font_obj+0x76+cs*2 (0xfffe = not
+ * loaded), so it fires exactly ONCE per (metric-object, charset) — never per keystroke (live-confirmed:
+ * resetting +0x76 to 0xfffe did NOT reload on the next keystroke; only a fresh (font,size) object lock
+ * triggers it). cdecl args (from the 8.0 disasm):
+ *     a1[ebp+8] a2[ebp+c]  font_obj[ebp+10]  charset[ebp+14]  a18[ebp+18]
+ * font_obj is the WpFontMetricObj carrying +0x02 width_bits, +0x04 count[15], +0x22 first[15],
+ * +0x40/+0x48 width_table (aliased), +0x76 block ids — the SAME object DAT_088114d4 that every layout
+ * consumer reads (glyphs via reformat_char_append, caret/Pos via pos_scan_next_char's FLAT index, wrap
+ * via reformat_width_sum's SEGMENTED index). Live-confirmed on 8.0: the active FreeSans-12pt object at
+ * 0x98fc5b8 held the collapsed Charter placeholder (bar=100=Charter WX500, NOT real FreeSans) at BOTH
+ * the flat cell table[ch] and the segmented cell table[0x80+ch-first[0]].
+ *
+ * IDENTITY (the load-path subtlety that defeats the §17.2 approach): at width-metric-load time the
+ * resolver-fresh globals are NOT usable — r5_cur_path holds the Charter SUBSTITUTE .pfb, not the
+ * injected .ttf (live-confirmed: at a FreeSans-12pt charset-0 load r5_cur_injected=1 but
+ * r5_cur_path=/usr/share/fonts/X11/Type1/c0648bt_.pfb, so the "injected && scalable" gate never fires).
+ * The width path resolves the font through the printer/substitute leaf, not the display resolver that
+ * sets r5_cur_path. The ROBUST identity is the font CODE itself: fontmetric_widthblock_build 0x085b5cb0
+ * receives the RESOLVED code at entry, BEFORE its collapse-to-printer-default. Thanks to the §17.1
+ * name->code fix that code is the injected face's OWN code (it no longer collapses), so we capture it in
+ * a tiny entry hook (retro5_widthblock_build -> r5_wbb_code) and, because lazyload -> charset_block_read
+ * -> fontmetric_charset_fill -> widthblock_build is ONE synchronous chain per charset, read it back in
+ * the lazyload hook after WP's original returns. Map code -> injected .ttf exactly as retro5_resolver
+ * does (remap[0xfff-hi12] -> display record -> family name +0x10 -> r5_fcpath), independent of the
+ * clobbered globals.
+ *
+ * MECHANISM: run WP's original (fills the block with Charter widths), then if the just-built charset's
+ * code maps to an injected face, overwrite the ASCII block (charset 0) of font_obj+0x40: for each code
+ * ch in first[0]..first[0]+count[0]-1 write the REAL FreeType design width w_1200 = round(em_fraction *
+ * pixsize * 1200/96) into BOTH the flat cell table[ch] AND the segmented cell table[0x80+(ch-first[0])],
+ * honouring width_bits (8- vs 16-bit). pixsize is r5_doc_pixsize() (doc-marker gated), falling back to
+ * the raw font-context size word (r5_doc_pixsize_raw) when the load fires outside a marked doc run
+ * (e.g. document-open builds the object before the first marked reformat). Writing at load, before any
+ * consumer reads the table, means there is NO reformat race (a late per-consumer overwrite was proven to
+ * lose it); one write feeds ALL consumers. Non-injected objects (WP-stock printer members:
+ * Courier/Liberation) are left untouched -> regression-safe. Only charset 0 (ASCII, where flat==raw WP
+ * byte and r5_wp2uni maps cleanly) is rewritten — same single-byte-Latin scope as §17.2; higher charsets
+ * keep WP's authentic value. Gated RETRO5_FTMETRICS2 (default OFF; ON forces §17.2's array override OFF
+ * so option-b is validated alone and the two never double-apply). */
+static int (*r5_lazyload_orig)(unsigned, unsigned, void *, unsigned, unsigned);
+static int (*r5_wbb_orig)(void *, unsigned *, void *, unsigned short, void *, unsigned char);
+volatile unsigned r5_wbb_code;  /* pre-collapse code captured at widthblock_build entry (this charset) */
+volatile int r5_wbb_valid;      /* set by the widthblock_build hook; cleared by lazyload before original */
+volatile int r5_ftm2_loads;     /* DIAG: lazyload entries with an injected code resolved */
+volatile int r5_ftm2_writes;    /* DIAG: metric-object ASCII blocks rewritten */
+
+/* Device px from the font context's SIZE word WITHOUT the doc-run marker gate (r5_doc_pixsize returns 0
+ * off a marked doc run). The high word of ctx+0x00 is ptsize*50; device px = that / 37.5 (== ptsize*96/72
+ * at 96 dpi). Used only as the load-time fallback when r5_doc_pixsize() is 0. */
+static double r5_doc_pixsize_raw(void) {
+    unsigned ctx; double px;
+    if (r5_doc_px > 0) return r5_doc_px;
+    if (r5s.font_ctx && !range_unmapped((void *)r5s.font_ctx, 4)) {
+        ctx = *(unsigned *)r5s.font_ctx;
+        if (ctx && !range_unmapped((void *)(uintptr_t)ctx, 4)) {
+            px = (double)((*(unsigned *)(uintptr_t)ctx) >> 16) / 37.5;
+            if (px >= 4 && px <= 400) return px;
+        }
+    }
+    return 0.0;
+}
+
+/* Resolve a packed display code -> injected face .ttf (path,index), mirroring retro5_resolver's
+ * remap[0xfff-hi12] -> record -> family(+0x10) -> r5_fcpath lookup. Returns 1 on an injected hit. */
+static int r5_injected_path_for_code(unsigned code, const char **path_out, int *idx_out) {
+    unsigned short *remap; uint32_t *arr; unsigned cnt, idx, slot; const char *nm; int i;
+    if (!r5_ftface || r5_inj_base <= 0) return 0;
+    if (!r5s.remap_arr || !r5s.fontrec_arr || !r5s.fontrec_cnt) return 0;
+    if (range_unmapped((void *)r5s.remap_arr, 4) || range_unmapped((void *)r5s.fontrec_arr, 4)
+        || range_unmapped((void *)r5s.fontrec_cnt, 2)) return 0;
+    remap = *(unsigned short **)r5s.remap_arr;
+    arr   = *(uint32_t **)r5s.fontrec_arr;
+    cnt   = *(unsigned short *)r5s.fontrec_cnt;
+    if (!remap || !arr || !cnt || cnt > 8000) return 0;
+    idx = 0x0fff - ((code >> 16) & 0x0fff);
+    if (range_unmapped(&remap[idx], 2)) return 0;
+    slot = remap[idx];
+    if (slot < (unsigned)r5_inj_base || slot >= cnt) return 0;   /* not an injected record */
+    if (range_unmapped(&arr[slot], 4) || !arr[slot]
+        || range_unmapped((void *)(uintptr_t)(arr[slot] + 0x10), 4)) return 0;
+    nm = (const char *)(uintptr_t)(*(unsigned *)(uintptr_t)(arr[slot] + 0x10));
+    if (!nm || range_unmapped(nm, 1)) return 0;
+    for (i = 0; i < r5_fcfam_n; i++) {
+        if (!strcasecmp(r5_fcfam[i], nm) && r5_fcpath[i][0]) {
+            *path_out = r5_fcpath[i]; *idx_out = r5_fcidx[i]; return 1;
+        }
+    }
+    return 0;
+}
+
+static void r5_metricobj_write_ascii(void *font_obj, double pixsize, const char *path, int idx) {
+    unsigned char *o = (unsigned char *)font_obj;
+    unsigned wbits, cnt0, first0, k;
+    void *tbl;
+    if (range_unmapped(o, 0x4c)) return;
+    wbits  = *(unsigned char *)(o + 0x02);           /* 0 => 8-bit table, else 16-bit */
+    cnt0   = *(unsigned short *)(o + 0x04);           /* count[0] (chars in ASCII segment) */
+    first0 = *(unsigned char *)(o + 0x22);            /* first[0] (low byte; usually 0x20) */
+    tbl = *(void **)(o + 0x40);
+    if (!tbl) tbl = *(void **)(o + 0x48);
+    if (!tbl || range_unmapped(tbl, 0x100 * (wbits ? 2 : 1))) return;
+    if (cnt0 == 0 || cnt0 > 0x100) return;
+    for (k = 0; k < cnt0; k++) {
+        unsigned ch = (first0 + k) & 0xff;
+        unsigned segidx = 0x80 + k;                   /* Sum(count[i<0])==0 for charset 0 */
+        double em;
+        long w;
+        if (ch > 0xff) continue;
+        em = r5_ftadvance_em(path, idx, (unsigned char)ch);
+        if (em < 0) continue;                         /* not measurable -> leave WP's Charter value */
+        w = (long)(em * pixsize * (1200.0 / 96.0) + 0.5);
+        if (w < 0) w = 0;
+        if (wbits == 0) {                             /* 8-bit table */
+            if (w > 0xff) w = 0xff;
+            if (ch < 0x100)    ((unsigned char *)tbl)[ch]     = (unsigned char)w;   /* flat cell (caret/Pos) */
+            if (segidx < 0x100)((unsigned char *)tbl)[segidx] = (unsigned char)w;   /* segmented cell (glyph/wrap) */
+        } else {                                      /* 16-bit table */
+            if (w > 0xffff) w = 0xffff;
+            ((unsigned short *)tbl)[ch]     = (unsigned short)w;                    /* flat cell (caret/Pos) */
+            ((unsigned short *)tbl)[segidx] = (unsigned short)w;                    /* segmented cell (glyph/wrap) */
+        }
+    }
+    r5_ftm2_writes++;
+}
+
+/* widthblock_build entry hook: capture the RESOLVED code (arg2 deref) BEFORE WP collapses it to the
+ * printer default, then run the original. cdecl (descriptor, code_ptr, header_out, sub, buf, flag). */
+int retro5_widthblock_build(void *a1, unsigned *code_ptr, void *a3, unsigned short a4,
+                            void *a5, unsigned char a6) {
+    if (r5_ftmetrics2 && code_ptr && !range_unmapped(code_ptr, 4)) {
+        r5_wbb_code = *code_ptr;
+        r5_wbb_valid = 1;
+    }
+    return r5_wbb_orig ? r5_wbb_orig(a1, code_ptr, a3, a4, a5, a6) : 0;
+}
+
+int retro5_charset_lazyload(unsigned a1, unsigned a2, void *font_obj, unsigned charset, unsigned a18) {
+    int r;
+    const char *path; int idx; double sz; unsigned code;
+    if (r5_ftmetrics2) r5_wbb_valid = 0;              /* tie the captured code to THIS load */
+    r = r5_lazyload_orig ? r5_lazyload_orig(a1, a2, font_obj, charset, a18) : 0;
+    if (!r5_ftmetrics2) return r;
+    if (charset != 0) return r;                       /* only the ASCII block (clean flat/unicode map) */
+    if (r == 0xffff || !font_obj) return r;           /* no block was loaded */
+    if (!r5_wbb_valid) return r;                      /* no code captured this load -> leave WP's */
+    code = r5_wbb_code;
+    if (!r5_injected_path_for_code(code, &path, &idx)) return r;   /* base/stock font -> untouched */
+    r5_ftm2_loads++;
+    sz = r5_doc_pixsize();
+    if (sz <= 0) sz = r5_doc_pixsize_raw();           /* load may fire outside a marked doc run */
+    if (sz > 0) {
+        r5_metricobj_write_ascii(font_obj, sz, path, idx);
+        if (r5_trace) { char b[240]; int k = snprintf(b, sizeof b,
+            "retro5: \xc2\xa7""17.3 metric-obj rewrite obj=%p cs=0 code=0x%x px=%.1f face=%s\n",
+            font_obj, (code >> 16) & 0xfff, sz, path); if (k > 0) write(2, b, (size_t)k); }
+    } else if (r5_trace) { char b[160]; int k = snprintf(b, sizeof b,
+        "retro5: \xc2\xa7""17.3 injected code=0x%x but NO pixsize at load -> skipped\n",
+        (code >> 16) & 0xfff); if (k > 0) write(2, b, (size_t)k); }
+    return r;
+}
+
+/* Install the §17.3 load-path hook: jmp-patch charset_block_lazyload's 8.0 entry (0x0841eda0) via a
+ * trampoline that runs WP's original body first. Byte-guarded on the exact 8-byte prologue
+ * (push ebp; mov ebp,esp; sub esp,0xc; push esi; push ebx); gated RETRO5_FTMETRICS2 (default OFF). */
+static void r5_install_lazyload_hook(void) {
+    /* §17.4 RE-TARGET (2026-07-14, live Xvfb :250): the original §17.3 hook sites — charset_block_lazyload
+     * 0x0841eda0 and fontmetric_widthblock_build 0x085b5cb0 — are DEAD for injected fonts. Live-confirmed:
+     * applying an injected face at a fresh (code,size) fires fontmetric_charset_fill 0x08404d40 with the
+     * pre-collapse injected code, but it takes its MEMBER branch (fontres_charset_fill_sub 0x08405670 ->
+     * memcpy + fontres_block_checksum_append), so widthblock_build and lazyload NEVER run (breakpoints
+     * armed from process start never hit through open+select+type). The metric object is also cached per
+     * (code,size), so no keystroke rebuilds it. Option-b is therefore driven from the reformat site
+     * (retro5_reformat_char / RETRO5_FTMETRICS2), which fires per reformatted char, has the active metric
+     * object (*(reformat_ctx+0x190) == DAT_088114d4) AND the resolved injected identity, and writes the
+     * object's flat+seg width cells there — idempotent and race-immune. This function is kept as a no-op so
+     * the two dead entry-point patches are never applied (they added risk with zero effect). */
+    (void)retro5_widthblock_build; (void)retro5_charset_lazyload; (void)r5_metricobj_write_ascii;
+    if (r5_ftmetrics2 && r5_trace) {
+        const char *m = "retro5: \xc2\xa7""17.4 option-b routed via reformat hook (0x083fa990); dead lazyload/widthblock hooks retired\n";
+        write(2, m, strlen(m));
+    }
 }
 
 /* Render one char with cairo where WP's XCopyPlane would have blitted its 1-bit glyph. WP has just
@@ -4486,6 +4733,7 @@ static void applyWp8_0_dynX_Fixes(void) {
     r5_install_fontset_hook();          /* capture injected pick -> resolver renders it (interim; §17.1 = full) */
     r5_install_name_to_code_hook();     /* §17.1 REAL FIX: injected NAME->own code on render + reload */
     r5_install_reformat_hook();         /* §17.2: FT advance override in reformat width array (injected-TTF spacing); gated OFF */
+    r5_install_lazyload_hook();         /* §17.3: single-source metric-object width fix at charset-load (RETRO5_FTMETRICS2) */
     /* CUPS job routing is done at the wppx PostScript-write stage (see the file-I/O interpose), NOT
      * by touching wpexc: the live-RE (§20) proved wpexc is an idle startup daemon that is NOT on the
      * interactive print path, so bypassing its spawn was both unnecessary and the cause of the
@@ -4756,6 +5004,7 @@ static void findBinaryFixes(void) {
     { const char *e = getenv("RETRO5_FTFACE");    if (e && e[0] == '0') r5_ftface = 0; }                  /* Phase A: bind injected faces by real .ttf via cairo-FT (default ON) */
     { const char *e = getenv("RETRO5_PFBFACE");   if (e && e[0] == '0') r5_pfbface = 0; }                 /* Phase B: bind WP-stock Type1 faces by real .pfb via cairo-FT (default ON) */
     { const char *e = getenv("RETRO5_FTMETRICS"); if (e && e[0] == '0') r5_ftmetrics = 0; }              /* §17.2: lay out injected TTFs on their REAL FT advances (default ON; matches FTFACE) */
+    { const char *e = getenv("RETRO5_FTMETRICS2"); if (e && *e && e[0] != '0') { r5_ftmetrics2 = 1; r5_ftmetrics = 0; } }  /* §17.3: single-source metric-object width fix at charset-load; forces §17.2 OFF so option-b runs alone (default OFF) */
     { const char *e = getenv("RETRO5_EWMH");       if (e && e[0] == '0') r5_ewmh = 0; }             /* _NET_WM hints on toplevels (default on) */
     { const char *e = getenv("RETRO5_CUPS");       if (e && *e && e[0] != '0') r5_cups = 1; }       /* back WP's printer subsystem with CUPS */
     { const char *e = getenv("RETRO5_WHEEL");      if (e && e[0] == '0') r5_wheel = 0; }             /* mouse-wheel scrolling (default ON) */
