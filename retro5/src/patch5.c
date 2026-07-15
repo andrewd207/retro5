@@ -3110,6 +3110,9 @@ static double r5_ftadvance_em(const char *path, int idx, unsigned char ch) {
 #define R5_REFORMAT_WIDX 0x087a21d6u                 /* u16 line width-array index (chars appended so far) */
 #define R5_REFORMAT_WBUF 0x087fe9b8u                 /* u16[] line width array (WP design units, 1/1200 in) */
 #define R5_REFORMAT_RECOFF 0x190                     /* reformat_ctx + 0x190 = per-run font-record ptr (stable key) */
+#define R5_CARET_HI_OBJ    0x088114d0u               /* §17.5: DAT_088114d0 — the PARALLEL metric object the wrap /
+                                                      * status-bar "Pos" / print path reads (pos_scan's e04 hi-accum +
+                                                      * charwidth_lookup_hi). Twin of the caret object DAT_088114d4. */
 static void (*r5_reformat_orig)(int, int);
 
 /* A path is a REAL injected scalable face (FreeType outline) vs the WP Type1 substitute (.pfb/.pfa) the
@@ -3213,6 +3216,24 @@ void retro5_reformat_char(int p1, int ch) {          /* non-static: patched targ
     if (r5_ftmetrics2 && key) {
         r5_metricobj_write_char((void *)(uintptr_t)key, (unsigned char)c, w);
         r5_ftm2_writes++;                                                       /* DIAG */
+        /* §17.5: the width model has TWO parallel metric objects, not one. The blinking CARET reads the
+         * LO object DAT_088114d4 (== key == *(reformat_ctx+0x190)); pos_scan_next_char 0x0837fc70 sums its
+         * flat cell into DAT_08810e02 (caret x). But WRAP / the status-bar "Pos" / the print path read a
+         * SECOND object DAT_088114d0 — pos_scan's HI accumulator DAT_08810e04 and reformat_width_sum's
+         * charwidth_lookup_hi 0x0837e2d0 leaf. Live-verified (Xvfb :260, FreeSans, gdb): after option-b's
+         * key-only write the LO object held the REAL advances (l=43,O=157 @12pt) but the HI object still
+         * held the Charter PLACEHOLDER (l=56,O=146) -> the visual caret sat at the glyph end yet text
+         * wrapped early (27 vs ~36 chars @60pt) and "Pos" read the placeholder length. Writing the same
+         * real advance into DAT_088114d0 too (validated live: e04 and the status Pos then matched the
+         * caret exactly, 17l+15O -> 4286 = Pos 3.57") makes caret+wrap+Pos+print agree from one source.
+         * Only reached for an injected run (gated above), so the HI object is this run's injected face;
+         * r5_metricobj_write_char self-guards (validates the object + ASCII segment). Skip if it aliases
+         * the LO object (already written). */
+        { void *hobj = *(void **)(uintptr_t)R5_CARET_HI_OBJ;
+          if (hobj && hobj != (void *)(uintptr_t)key) {
+              r5_metricobj_write_char(hobj, (unsigned char)c, w);
+              r5_ftm2_writes++;                                                 /* DIAG */
+          } }
     }
     /* §17.2: screen glyph-pen width array (only when a single slot was appended this call). */
     if (r5_ftmetrics && idx1 == (unsigned short)(idx0 + 1)) {
