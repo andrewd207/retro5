@@ -1001,6 +1001,7 @@ typedef struct {
     Font id;
     int  used;
     int  passthrough;                      /* symbol/dingbat/pi font: leave to X, wrong glyphs else */
+    int  ruler;                            /* WP's "wp60ruler" pi-font (font-type/printer-type indicators) */
     double size;                           /* cairo em size, from the X pixel height */
     const char *family;
     cairo_font_slant_t  slant;
@@ -1122,6 +1123,17 @@ static R5Font *r5_font_intern(Display *dpy, XFontStruct *fs, const char *xlfd_hi
         else family[0] = 0;
     }
 
+    /* WP's "wp60ruler" pi-font (the font-type Q/N and printer-type L/M cell indicators) is loaded by a
+     * bare X ALIAS name ("wp60ruler"), not a hyphenated XLFD, so r5_parse_xlfd — which bails on any name
+     * not starting with '-' — never reaches its "ruler" test and the font is treated as ordinary text
+     * (the indicator byte then cairo-renders as a literal 'Q'/'N'). Catch it directly on the raw name
+     * (hint or the resolved XA_FONT string), so its glyphs pass through to WP's native pi-font blit. */
+    {
+        const char *raw = (xlfd_hint && xlfd_hint[0]) ? xlfd_hint : xlfd;
+        if (raw && (strstr(raw, "ruler") || strstr(raw, "wp60") || strstr(raw, "wpicon"))) {
+            sym = 1; slot->ruler = 1;
+        } else slot->ruler = 0;
+    }
     slot->id = fid; slot->used = 1; slot->passthrough = sym;
     slot->family = r5_family_for(family, mono);
     slot->slant  = italic ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
@@ -1164,11 +1176,18 @@ static void r5_cairo_font(cairo_t *cr, const R5Font *fnt) {
  * "hibyte" log lists offending bytes to extend this from). 0xFE is WP's field-alignment fill: dialog
  * status lines pad columns with a RUN of it (e.g. "Files: 3<0xFE…>Dirs: 7"), so it must be a SPACE,
  * not Latin-1 'þ'. */
+static const unsigned short r5_cp1252_c1[32];            /* fwd decl; table defined with the doc-render map below */
 static unsigned r5_wp_codepoint(unsigned char c) {
-    switch (c) {
-        case 0xFE: return 0x20;                          /* WP fill / hard space -> space (not 'þ') */
-        default:   return c;                             /* Latin-1 fallback */
+    if (c == 0xFE) return 0x20;                          /* WP fill / hard space -> space (not 'þ') */
+    if (c >= 0x80 && c <= 0x9F) {                        /* cp1252 divergence: curly quotes ' ' " ", en/em dash,
+                                                          * bullet, ellipsis, dagger... the SAME map the document
+                                                          * path uses (r5_wp2uni), so chrome text — dialogs, menus,
+                                                          * font lists, previews — stops drawing them blank/garbled
+                                                          * (was the "quote pair -> space + upside-down ?" bug). */
+        unsigned short u = r5_cp1252_c1[c - 0x80];
+        return u ? u : c;                                /* undefined cp1252 slot -> raw byte (best-effort) */
     }
+    return c;                                            /* ASCII + 0xA0-0xFF: Latin-1 = byte */
 }
 
 /* X text is a WP codepage; cairo wants UTF-8. Convert so a high byte can't poison the context. This
@@ -1238,9 +1257,22 @@ typedef struct {
     char             buf[1100];
 } R5Text;
 
+/* ---- injected-font "TT" badge over WP's font-list pi-cell -------------------------------------
+ * A font-list row is drawn as two adjacent XDrawString calls on one drawable/baseline: first the
+ * leading type-indicator glyph (one byte, in the "wp60ruler" pi-font, at the cell's left ~x=5), then
+ * the font NAME (a text font, at ~x=18). We let the pi-glyph pass through to WP's native blit (correct
+ * pictogram for stock fonts) but remember its cell position here; when the very next draw is the
+ * paired NAME and that name is one of ours (injected TTF), we overpaint the pi cell with a small "TT"
+ * badge. Single pending slot — the two draws are strictly interleaved 1:1 and adjacent (verified live).
+ * r5_pi_note() records the pi cell (from the passthrough fallback); r5_pi_badge_paint() consumes it on
+ * the name draw. Defined below near r5_name_is_injected (needs the injected record tables). */
+static struct { Drawable d; int x, y, valid; } r5_pi_pending;
+static void r5_pi_note(R5Text *t, Drawable d, int x, int y, int len);
+static void r5_pi_badge_paint(R5Text *t, Drawable d, int name_x, int name_y, const char *s, int len);
+
 static int r5_text_setup(Display *dpy, Drawable d, GC gc, const char *s, int len, R5Text *t) {
     Window root; int gx, gy; unsigned gw, gh, gbw, gdep;
-    t->sf = 0; t->cr = 0;
+    t->sf = 0; t->cr = 0; t->fnt = 0;
     if (!r5_skin || !r5_text_active || len <= 0 || !dpy || !d) return 0;   /* inert until main window up */
     if (!r5_xlib() || !r5_cairo()) return 0;
     r5_dpy = dpy;                                        /* stash for the no-Display metrics calls */
@@ -1320,11 +1352,13 @@ void retro5_XDrawString(Display *dpy, Drawable d, GC gc, int x, int y, const cha
     R5_REDIR(d);
     if (r5_text_setup(dpy, d, gc, s, len, &t)) {
         r5_text_source(dpy, &t);
+        r5_pi_badge_paint(&t, d, x, y, s, len);          /* injected-font "TT" badge over the pi cell */
         cz.move_to(t.cr, x, y);                          /* X (x,y) is the glyph baseline */
         cz.show_text(t.cr, t.buf);
         r5_text_finish(&t);
         return;
     }
+    r5_pi_note(&t, d, x, y, len);                        /* remember a passthrough pi-glyph cell position */
     if (!r5_real_DrawString) *(void **)&r5_real_DrawString = r5_realsym("XDrawString");
     if (r5_real_DrawString) r5_real_DrawString(dpy, d, gc, x, y, s, len);
 }
@@ -4248,6 +4282,68 @@ static int r5_name_is_injected(const char *name, uint32_t *arr, unsigned inj_bas
         if (nm && !range_unmapped(nm, 1) && !strcasecmp(name, nm)) return 1;
     }
     return 0;
+}
+
+/* Is `name` a family WE injected? Safely fetches the live record table (same guarded reads as
+ * r5_inject_collection) and defers to r5_name_is_injected. 0 whenever injection isn't active. */
+static int r5_name_is_injected_now(const char *name) {
+    uint32_t *arr; unsigned reccnt;
+    if (!r5_allfonts || r5_inj_base <= 0 || !name || !name[0]) return 0;
+    if (!r5s.fontrec_arr || !r5s.fontrec_cnt
+        || range_unmapped((void *)r5s.fontrec_arr, 4) || range_unmapped((void *)r5s.fontrec_cnt, 2))
+        return 0;
+    arr    = *(uint32_t **)r5s.fontrec_arr;
+    reccnt = *(unsigned short *)r5s.fontrec_cnt;
+    if (!arr || range_unmapped(arr, 4) || reccnt <= (unsigned)r5_inj_base || reccnt > 8000) return 0;
+    return r5_name_is_injected(name, arr, (unsigned)r5_inj_base, reccnt);
+}
+
+/* Record a passthrough pi-glyph cell: a single byte in the "wp60ruler" indicator font. This is the
+ * font-list row's leading type badge; we let WP's native blit draw it, but stash its position so the
+ * paired NAME draw that follows can decide whether to overpaint it with our "TT" badge. */
+static void r5_pi_note(R5Text *t, Drawable d, int x, int y, int len) {
+    if (r5_allfonts && r5_inj_base > 0 && t->fnt && t->fnt->ruler && len == 1) {
+        r5_pi_pending.d = d; r5_pi_pending.x = x; r5_pi_pending.y = y; r5_pi_pending.valid = 1;
+    } else {
+        r5_pi_pending.valid = 0;                         /* any other passthrough clears a stale note */
+    }
+}
+
+/* If this NAME draw is the row paired with a pending pi-glyph AND names an injected TTF, overpaint the
+ * pi cell (already drawn natively) with a small "TT" badge in the name's own colors — reusing the name's
+ * cairo context, so it matches selected/unselected rows. Stock fonts keep WP's native pictogram. */
+static void r5_pi_badge_paint(R5Text *t, Drawable d, int name_x, int name_y, const char *s, int len) {
+    int px; double boxw, fr, fg, fb, br, bg, bb, sz; cairo_text_extents_t te; char nm[128];
+    if (!r5_pi_pending.valid) return;
+    px = r5_pi_pending.x;
+    /* pair test: same drawable, same baseline, name sits just right of the pi cell */
+    if (r5_pi_pending.d != d || name_x <= px || name_x - px > 48
+        || name_y < r5_pi_pending.y - 2 || name_y > r5_pi_pending.y + 2) { r5_pi_pending.valid = 0; return; }
+    r5_pi_pending.valid = 0;                             /* consume */
+    if (len <= 0 || len >= (int)sizeof nm) return;
+    memcpy(nm, s, (size_t)len); nm[len] = 0;
+    if (!r5_name_is_injected_now(nm)) return;            /* stock font -> keep native pictogram */
+    if (!t->cr) return;
+    boxw = name_x - px;
+    /* erase the native pi glyph with the cell background, then stamp "TT" in the text foreground */
+    r5_pixel_rgb(r5_dpy, t->gv.background, &br, &bg, &bb);
+    cz.set_source_rgb(t->cr, br, bg, bb);
+    cz.rectangle(t->cr, px - 1, name_y - t->fnt->size, boxw + 1, t->fnt->size * 1.35);
+    cz.fill(t->cr);
+    r5_pixel_rgb(r5_dpy, t->gv.foreground, &fr, &fg, &fb);
+    cz.set_source_rgb(t->cr, fr, fg, fb);
+    sz = t->fnt->size * 0.92;
+    cz.select_font_face(t->cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cz.set_font_size(t->cr, sz);
+    cz.text_extents(t->cr, "TT", &te);
+    if (te.x_advance > boxw * 0.94 && te.x_advance > 0) {   /* shrink to fit the cell width */
+        sz *= (boxw * 0.94) / te.x_advance;
+        cz.set_font_size(t->cr, sz);
+        cz.text_extents(t->cr, "TT", &te);
+    }
+    cz.move_to(t->cr, px + (boxw - te.x_advance) / 2.0, name_y);
+    cz.show_text(t->cr, "TT");
+    r5_cairo_font(t->cr, t->fnt);                        /* restore the name font for the caller's draw */
 }
 
 /* Free a base FaceEntry we are dropping, exactly as fontcoll_destroy 0x0852b7d0 would on dialog close —
